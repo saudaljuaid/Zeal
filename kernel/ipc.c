@@ -179,6 +179,37 @@ int z_broker_receive(struct z_broker *broker, unsigned receiver,
     return Z_AGAIN;
 }
 
+int z_broker_receive_checked(struct z_broker *broker, unsigned receiver,
+                             uint64_t destination, z_receive_copy_fn copy,
+                             void *context)
+{
+    if (broker == NULL || receiver >= Z_CELL_COUNT || copy == NULL)
+        return Z_INVALID;
+    if (!principal(broker, receiver))
+        return Z_AGAIN;
+    uint64_t generation = broker->policies[receiver].generation;
+    if (!copy(context, receiver, generation, destination, NULL))
+        return Z_BAD_ADDRESS;
+    struct z_queue *queue = &broker->queues[receiver];
+    while (queue->count) {
+        struct z_queued_message entry = queue->entries[queue->head];
+        if (delivery_valid(broker, &entry)) {
+            /* Checked copying precedes consumption: a bad destination cannot
+             * discard authorized work. The caller masks interrupts throughout. */
+            if (!copy(context, receiver, generation, destination, &entry.message))
+                return Z_BAD_ADDRESS;
+            queue->entries[queue->head] = (struct z_queued_message){0};
+            queue->head = (queue->head + 1) % Z_QUEUE_DEPTH;
+            --queue->count;
+            return Z_OK;
+        }
+        queue->entries[queue->head] = (struct z_queued_message){0};
+        queue->head = (queue->head + 1) % Z_QUEUE_DEPTH;
+        --queue->count;
+    }
+    return Z_AGAIN;
+}
+
 void z_broker_revoke(struct z_broker *broker, unsigned cell)
 {
     if (cell >= Z_CELL_COUNT)

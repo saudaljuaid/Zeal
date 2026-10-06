@@ -41,6 +41,9 @@ bool z_memory_user_range(const struct z_memory_layout *layout,
 bool z_memory_copy_in(struct z_memory_pool *pool, unsigned cell,
                       const struct z_memory_layout *layout, void *destination,
                       uint64_t source, size_t length);
+bool z_memory_copy_valid(struct z_memory_pool *pool, unsigned cell,
+                         const struct z_memory_layout *layout, uint64_t address,
+                         size_t length, bool write);
 bool z_memory_copy_out(struct z_memory_pool *pool, unsigned cell,
                        const struct z_memory_layout *layout, uint64_t destination,
                        const void *source, size_t length);

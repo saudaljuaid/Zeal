@@ -111,11 +111,11 @@ bool z_memory_user_range(const struct z_memory_layout *layout,
     return !write && z_region_contains(Z_IMAGE_BASE, layout->image_size, address, length);
 }
 
-static bool checked_copy(struct z_memory_pool *pool, unsigned cell,
+bool z_memory_copy_valid(struct z_memory_pool *pool, unsigned cell,
                          const struct z_memory_layout *layout, uint64_t address,
-                         void *buffer, size_t length, bool write)
+                         size_t length, bool write)
 {
-    if (pool == NULL || cell >= Z_MANIFEST_CELL_MAX || buffer == NULL ||
+    if (pool == NULL || cell >= Z_MANIFEST_CELL_MAX ||
         !z_memory_user_range(layout, address, length, write))
         return false;
     const struct z_memory_allocation *allocation = &pool->cells[cell];
@@ -125,14 +125,8 @@ static bool checked_copy(struct z_memory_pool *pool, unsigned cell,
         layout->image == NULL || layout->image_size == 0 ||
         layout->image_size > Z_MANIFEST_IMAGE_MAX)
         return false;
-    uint8_t *bytes = buffer;
     if (z_region_contains(Z_IMAGE_BASE, layout->image_size, address, length)) {
-        if (write)
-            return false;
-        size_t offset = (size_t)(address - Z_IMAGE_BASE);
-        for (size_t i = 0; i < length; ++i)
-            bytes[i] = layout->image[offset + i];
-        return true;
+        return !write;
     }
     uint64_t base = address >= Z_HEAP_BASE ? Z_HEAP_BASE : Z_STACK_BASE;
     unsigned first = base == Z_HEAP_BASE ? allocation->stack_pages : 0;
@@ -144,6 +138,25 @@ static bool checked_copy(struct z_memory_pool *pool, unsigned cell,
             if (z_memory_page(pool, cell, page) == NULL)
                 return false;
     }
+    return true;
+}
+
+static bool checked_copy(struct z_memory_pool *pool, unsigned cell,
+                         const struct z_memory_layout *layout, uint64_t address,
+                         void *buffer, size_t length, bool write)
+{
+    if (buffer == NULL || !z_memory_copy_valid(pool, cell, layout, address, length, write))
+        return false;
+    uint8_t *bytes = buffer;
+    if (z_region_contains(Z_IMAGE_BASE, layout->image_size, address, length)) {
+        size_t offset = (size_t)(address - Z_IMAGE_BASE);
+        for (size_t i = 0; i < length; ++i)
+            bytes[i] = layout->image[offset + i];
+        return true;
+    }
+    uint64_t base = address >= Z_HEAP_BASE ? Z_HEAP_BASE : Z_STACK_BASE;
+    unsigned first = base == Z_HEAP_BASE ? pool->cells[cell].stack_pages : 0;
+    size_t offset = (size_t)(address - base);
     for (size_t i = 0; i < length; ++i) {
         unsigned page = first + (unsigned)((offset + i) / Z_MANIFEST_PAGE_SIZE);
         uint8_t *backing = z_memory_page(pool, cell, page);

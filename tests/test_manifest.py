@@ -38,12 +38,17 @@ class ManifestCompilerTests(unittest.TestCase):
     def test_fixed_format_round_trip_size_and_solo_mask(self):
         artifact = self.compile(scenario=18)
         header = manifest.struct.unpack_from("<IIIIIIII", artifact)
-        self.assertEqual(header, (0x4C41455A, 1, len(artifact), 4, 5, 0, 0, 0))
-        self.assertEqual(len(artifact), 32 + 4 * 64 + 5 * 16)
+        self.assertEqual(header, (0x4C41455A, 1, len(artifact), 4, 6, 0, 0, 0))
+        self.assertEqual(len(artifact), 32 + 4 * 64 + 6 * 16)
         self.assertEqual(manifest.struct.unpack_from("<I", artifact, 32 + 3 * 64 + 36)[0], 18)
         solo = self.compile(solo=2)
         flags = [manifest.struct.unpack_from("<I", solo, 32 + n * 64 + 12)[0] for n in range(4)]
         self.assertEqual(flags, [0, 0, 1, 0])
+        waiting = self.compile(scenario=19)
+        configs = [manifest.struct.unpack_from("<I", waiting, 32 + n * 64 + 36)[0] for n in range(4)]
+        self.assertEqual(configs, [0, 0, 19, 19])
+        self.assertEqual(manifest.struct.unpack_from("<IIII", waiting, 32 + 4 * 64 + 5 * 16),
+                         (300, 400, 16, 0))
 
     def test_rejects_bad_versions_ids_names_images_entries_and_widths(self):
         for old, new in (("version = 1", "version = 2"),
@@ -75,7 +80,7 @@ class ManifestCompilerTests(unittest.TestCase):
         self.images[0].write_bytes(b"x" * 65537)
         with self.assertRaises(ValueError):
             self.compile()
-        for kwargs in ({"scenario": 19}, {"solo": 4}):
+        for kwargs in ({"scenario": 20}, {"solo": 4}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.compile(**kwargs)
 

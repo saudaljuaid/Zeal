@@ -279,6 +279,23 @@ void arch_user_copy_out(uint64_t destination, const void *source, size_t length)
         arch_finish(0x7d);
 }
 
+/* Deferred completion addresses the owner's backing directly; it must not
+ * depend on whichever cell's CR3 is currently active. */
+bool arch_cell_copy_valid(unsigned cell, uint64_t destination, size_t length)
+{
+    return cell < Z_CELL_COUNT && spaces[cell].ready &&
+        z_memory_copy_valid(&memory_pool, cell, &spaces[cell].layout,
+                             destination, length, true);
+}
+
+bool arch_cell_copy_out(unsigned cell, uint64_t destination,
+                        const void *source, size_t length)
+{
+    return cell < Z_CELL_COUNT && spaces[cell].ready &&
+        z_memory_copy_out(&memory_pool, cell, &spaces[cell].layout,
+                           destination, source, length);
+}
+
 void arch_frame_init(struct z_frame *frame, unsigned cell)
 {
     if (cell >= Z_CELL_COUNT || !spaces[cell].ready)

@@ -1,6 +1,7 @@
 #ifndef ZEAL_IPC_H
 #define ZEAL_IPC_H
 
+#include <stdbool.h>
 #include <zeal/abi.h>
 #include <zeal/policy.h>
 
@@ -30,6 +31,12 @@ int z_broker_send(struct z_broker *broker, unsigned source, uint64_t endpoint,
                   uint64_t capability, const struct z_message *message);
 int z_broker_receive(struct z_broker *broker, unsigned receiver,
                      struct z_message *message);
+typedef bool (*z_receive_copy_fn)(void *context, unsigned cell,
+                                  uint64_t generation, uint64_t destination,
+                                  const struct z_message *message);
+int z_broker_receive_checked(struct z_broker *broker, unsigned receiver,
+                             uint64_t destination, z_receive_copy_fn copy,
+                             void *context);
 int64_t z_broker_lookup(const struct z_broker *broker, unsigned source,
                         unsigned target);
 void z_broker_revoke(struct z_broker *broker, unsigned cell);

@@ -28,6 +28,14 @@ pub fn receive(message: *abi.Message) i64 {
     return raw(@intFromEnum(abi.Call.recv), @intFromPtr(message), 0, 0);
 }
 
+pub fn sleep(duration: u64) i64 {
+    return raw(@intFromEnum(abi.Call.sleep), duration, 0, 0);
+}
+
+pub fn receiveWait(message: *abi.Message, timeout: u64) i64 {
+    return raw(@intFromEnum(abi.Call.recv_wait), @intFromPtr(message), timeout, 0);
+}
+
 pub fn lookup(role: abi.Role) u64 {
     const result = raw(@intFromEnum(abi.Call.lookup), (@as(u64, @intFromEnum(role)) + 1) * 100, 0, 0);
     return if (result > 0) @intCast(result) else 0;

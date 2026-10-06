@@ -3,7 +3,8 @@
 Run `make test`. The command uses bounded subprocess timeouts, fails if any
 layer fails, preserves emulator serial traces, and writes a machine-readable
 summary under `build/research/results.json`. GitHub Actions runs the same
-`make test` target and retains logs and the boot image on failure.
+`make test` target and retains the complete test transcript, emulator logs,
+results, and the boot image on both success and failure.
 
 ## Host checks
 
@@ -14,9 +15,9 @@ policy is also compared with an independent model over 299,593 bounded trace
 nodes and 65,536 deterministic adversarial steps. These checks are bounded,
 not a proof over all executions.
 
-Production C IPC, allocation, checked-copy, manifest validation, queue
-compaction, and cleanup paths run under AddressSanitizer and UndefinedBehavior
-Sanitizer. Tests cover exact memory budgets, exhaustion without partial claims,
+Production C IPC, finite waits, allocation, checked-copy, manifest validation,
+queue compaction, and cleanup paths run under AddressSanitizer and
+UndefinedBehaviorSanitizer. Tests cover exact memory budgets, exhaustion without partial claims,
 page reuse, 1,000 cold clears, independent cell backing, readable images,
 unwritable images, and guards. Capability tests cover allowed and forbidden
 operations, delegation without permission, rights amplification, ancestor
@@ -24,6 +25,15 @@ revocation, stale endpoint generations, table pressure, stale slot reuse, and
 messages queued before revocation while preserving unrelated queue entries.
 The broker test also compares 50,000 deterministic generated queue/capability
 operations using seed `0x6d2b79f5` against a separate bounded queue model.
+
+Wait tests exercise immediate delivery, zero durations, exact deadline
+boundaries, arithmetic overflow, arrivals around wait publication, expiry
+versus arrival ordering, queued-message revocation, deferred destination
+failures without consuming messages, stale generations, fault/restart
+cancellation, unrelated-state preservation, round-robin runnable selection,
+and idle followed by later wakeup. Another 50,000 deterministic generated
+operations, using seed `0x5a17e39b`, compare production C wait and scheduling
+paths with a separate bounded model.
 
 The manifest validator tests header truncation, unsupported versions,
 count/size boundaries, every cell and grant field, duplicate identities and
@@ -46,6 +56,15 @@ rebind, resumed verified reads, restart delays, quarantine, and unchanged
 application memory. The demo restarts both the RAM block service and the
 filesystem while the application remains in its original generation.
 
+Scenario 19 verifies that an empty-queue receiver suspends while another cell
+completes a verified file read, then wakes for an application message with the
+expected sender and payload. It checks a two-tick receive timeout, a three-tick
+sleep, and cancellation of a pending service receive before dependency restart.
+A standalone wait probe proves idle entry and later PIT wakeup when its only
+cell is waiting. The oracle pairs each traced wait with its original identity,
+generation, kind, and deadline, verifies wake reasons and signed results,
+rejects early or stale completions, and requires the expected emulator exit.
+
 Fault scenarios cover invalid instructions, supervisor memory writes,
 immutable code writes, NX stack execution, interrupt masking, port I/O,
 non-cooperating loops, invalid syscall addresses, forged endpoints, null and
@@ -58,8 +77,11 @@ twice by default; `RESEARCH_REPEAT` may be set from 1 to 20.
 
 The oracle's unit tests reject marker-only traces, missing boot and recovery
 events, forged generations, altered rights, missing app reads, counterfeit
-recovery, and incorrect emulator exits. Emulator logs and `results.json` remain
-available under `build/research/`.
+recovery, incorrect emulator exits, missing or counterfeit wakeups, altered
+deadlines, early timeout/sleep completion, stale-generation delivery, missing
+wait cancellation, counterfeit application progress, and missing or forged
+idle timer wakes. Emulator logs and `results.json` remain available under
+`build/research/`.
 
 These tests do not establish real-hardware correctness, DMA containment,
 NVMe reset safety, SMP correctness, persistent-data integrity, extended CPU

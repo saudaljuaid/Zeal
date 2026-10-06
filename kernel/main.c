@@ -2,6 +2,7 @@
 #include <zeal/arch.h>
 #include <zeal/ipc.h>
 #include <zeal/memory.h>
+#include <zeal/wait.h>
 
 #ifndef Z_SCENARIO
 #define Z_SCENARIO 0
@@ -20,6 +21,7 @@ extern const unsigned char _binary_probe_bin_start[], _binary_probe_bin_end[];
 extern const unsigned char _binary_manifest_bin_start[], _binary_manifest_bin_end[];
 
 static struct z_broker broker;
+static struct z_wait_table waits;
 static struct z_manifest manifest;
 static struct z_frame frames[Z_CELL_COUNT];
 static const unsigned char *images[Z_CELL_COUNT];
@@ -29,6 +31,8 @@ static uint64_t ticks, reads;
 static uint64_t sends[Z_CELL_COUNT], fault_sends[2], fault_reads[2];
 static unsigned run_ticks[Z_CELL_COUNT], boots[Z_CELL_COUNT], reset_reports, recovered;
 static bool contract_ok, finished;
+static unsigned wait_events[Z_CELL_COUNT], idle_events;
+static bool wait_traced[Z_CELL_COUNT];
 
 static void field(const char *name, uint64_t value)
 {
@@ -42,10 +46,77 @@ static void event(const char *name, unsigned cell)
     field("generation", broker.policies[cell].generation); field("tick", ticks);
 }
 
+static void wait_event(const char *name, unsigned cell,
+                        const struct z_wait_entry *entry)
+{
+    serial_puts("EVENT "); serial_puts(name);
+    field("cell", cell); field("identity", manifest.cells[cell].identity);
+    field("generation", entry->generation); field("tick", ticks);
+    field("kind", entry->kind); field("deadline", entry->deadline);
+}
+
+static void trace_wait(unsigned cell)
+{
+    /* Trace whole pairs and cap volume independently of hostile syscall rates. */
+    wait_traced[cell] = wait_events[cell] < 256;
+    if (wait_traced[cell]) {
+        ++wait_events[cell]; wait_event("wait-arm", cell, &waits.entries[cell]);
+        serial_puts("\n");
+    }
+}
+
+static void cancel_wait(unsigned cell, uint64_t reason)
+{
+    if (waits.entries[cell].kind != Z_WAIT_NONE && wait_traced[cell]) {
+        wait_event("wait-cancel", cell, &waits.entries[cell]);
+        field("reason", reason); serial_puts("\n");
+    }
+    z_wait_cancel(&waits, cell); wait_traced[cell] = false;
+}
+
+static bool receive_copy(void *context, unsigned cell, uint64_t generation,
+                          uint64_t destination, const struct z_message *message)
+{
+    (void)context;
+    if (cell >= manifest.cell_count || broker.policies[cell].phase != Z_POLICY_READY ||
+        broker.policies[cell].generation != generation)
+        return false;
+    return message == NULL ? arch_cell_copy_valid(cell, destination, sizeof(*message)) :
+        arch_cell_copy_out(cell, destination, message, sizeof(*message));
+}
+
+static void complete_waits(void)
+{
+    for (unsigned cell = 0; cell < manifest.cell_count; ++cell) {
+        struct z_wait_entry owned = waits.entries[cell];
+        int result;
+        enum z_wake_reason reason;
+        enum z_wait_status status = z_wait_poll(&waits, &broker, cell, ticks,
+                                                receive_copy, NULL, &result, &reason);
+        if (status == Z_WAIT_PENDING) continue;
+        if (status == Z_WAIT_DONE) {
+            frames[cell].rax = (uint64_t)(int64_t)result;
+            run_ticks[cell] = 0;
+        }
+        if (wait_traced[cell]) {
+            wait_event(status == Z_WAIT_DONE ? "wake" : "wait-cancel", cell, &owned);
+            field("reason", reason); field("result", (uint64_t)(int64_t)result);
+            serial_puts("\n");
+        }
+        wait_traced[cell] = false;
+    }
+}
+
 static void panic(const char *reason) __attribute__((noreturn));
 static void panic(const char *reason)
 {
     serial_puts("PANIC "); serial_puts(reason); serial_puts("\n"); arch_finish(2);
+}
+
+static void advance_tick(void)
+{
+    if (ticks == UINT64_MAX) panic("scheduler tick overflow");
+    ++ticks;
 }
 
 static void load_manifest(void)
@@ -85,6 +156,7 @@ static unsigned role_slot(unsigned role)
 
 static void cold_boot(unsigned cell)
 {
+    cancel_wait(cell, 68);
     const struct z_manifest_cell *config = &manifest.cells[cell];
     unsigned image = config->image - 1;
     if (!arch_space_reset(cell, images[image], image_lengths[image], config))
@@ -101,6 +173,7 @@ static void cold_boot(unsigned cell)
 
 static void fail_cell(unsigned cell, uint64_t reason, uint64_t error, uint64_t address)
 {
+    cancel_wait(cell, reason);
     event("fault", cell); field("reason", reason); field("error", error);
     field("address", address); serial_puts("\n");
     if (cell < 2) { fault_sends[cell] = sends[cell]; fault_reads[cell] = reads; }
@@ -137,7 +210,7 @@ static void observe_read(void)
 {
     ++reads;
     unsigned client = role_slot(Z_CLIENT);
-    if (client < manifest.cell_count) {
+    if (client < manifest.cell_count && reads <= 128) {
         event("read-verified", client); field("reads", reads); serial_puts("\n");
     }
     if (reads == 1 && client < manifest.cell_count) {
@@ -160,6 +233,18 @@ static int64_t syscall(struct z_frame *frame)
     uint64_t argument = frame->rdi;
     switch (frame->rax) {
     case Z_YIELD: return Z_OK;
+    case Z_SLEEP: {
+        int result = z_wait_sleep(&waits, &broker, current, ticks, argument);
+        if (result == Z_OK && argument) trace_wait(current);
+        return result;
+    }
+    case Z_RECV_WAIT: {
+        bool blocked;
+        int result = z_wait_receive(&waits, &broker, current, ticks, frame->rsi,
+                                     argument, receive_copy, NULL, &blocked);
+        if (blocked) trace_wait(current);
+        return result;
+    }
     case Z_SEND:
         if (!arch_user_range(frame->rsi, sizeof(message), false)) return Z_BAD_ADDRESS;
         arch_user_copy_in(&message, frame->rsi, sizeof(message));
@@ -169,10 +254,7 @@ static int64_t syscall(struct z_frame *frame)
             return result;
         }
     case Z_RECV:
-        if (!arch_user_range(argument, sizeof(message), true)) return Z_BAD_ADDRESS;
-        { int result = z_broker_receive(&broker, current, &message);
-          if (result == Z_OK) arch_user_copy_out(argument, &message, sizeof(message));
-          return result; }
+        return z_broker_receive_checked(&broker, current, argument, receive_copy, NULL);
     case Z_LOOKUP: {
         int target = z_manifest_slot(&manifest, (uint32_t)argument);
         if (target < 0 || manifest.cells[target].identity != argument) return Z_INVALID;
@@ -249,15 +331,34 @@ static int64_t syscall(struct z_frame *frame)
         if (argument == 13 && manifest.cells[current].image == 3) {
             event("demo-resumed", current); field("reads", reads); serial_puts("\n"); return Z_OK;
         }
+        if (Z_SCENARIO == 19 && argument == 14 && manifest.cells[current].image == 3) {
+            event("wait-progress", current); field("reads", reads); serial_puts("\n"); return Z_OK;
+        }
+        if (Z_SCENARIO == 19 && argument == 15 && manifest.cells[current].image == 4) {
+            event("wait-delivered", current); field("sender", frame->rsi);
+            field("value", frame->rdx); serial_puts("\n"); return Z_OK;
+        }
+        if (Z_SCENARIO == 19 && argument == 16 && manifest.cells[current].image == 4) {
+            contract_ok = frame->rsi == 7 && frame->rdx == 3;
+            event("wait-contract", current); field("checks", frame->rsi);
+            field("duration", frame->rdx); serial_puts("\n"); return Z_OK;
+        }
         if (argument == (uint64_t)manifest.cells[current].image + 2) {
             event("entry", current); serial_puts("\n"); return Z_OK;
         }
         event("bad-report", current); field("code", argument); serial_puts("\n");
         fail_cell(current, 66, 0, 0); return Z_INVALID;
     case Z_EXIT:
+        cancel_wait(current, 67);
         z_broker_revoke(&broker, current); z_policy_stop(&broker.policies[current]);
         arch_space_release(current);
-        event("exit", current); serial_puts("\n"); return Z_OK;
+        event("exit", current); serial_puts("\n");
+        if (Z_SCENARIO == 19 && Z_SOLO == 3 && Z_TEST) {
+            serial_puts(contract_ok ? "RESEARCH_PASS" : "RESEARCH_FAIL");
+            field("scenario", Z_SCENARIO); field("reads", reads); field("tick", ticks);
+            serial_puts("\n"); arch_finish(contract_ok ? 0 : 1);
+        }
+        return Z_OK;
     default: return Z_INVALID;
     }
 }
@@ -269,7 +370,7 @@ static void research_check(void)
     unsigned probe = role_slot(Z_PROBE);
     bool probe_ok = probe < manifest.cell_count &&
         broker.policies[probe].phase == Z_POLICY_QUARANTINED;
-    if (probe < manifest.cell_count && (Z_SCENARIO == 7 || Z_SCENARIO == 8 || Z_SCENARIO == 15))
+    if (probe < manifest.cell_count && (Z_SCENARIO == 7 || Z_SCENARIO == 8 || Z_SCENARIO == 15 || Z_SCENARIO == 19))
         probe_ok = broker.policies[probe].phase == Z_POLICY_STOPPED && contract_ok;
     else if (probe < manifest.cell_count)
         probe_ok = probe_ok && broker.policies[probe].faults == 4 && boots[probe] == 4;
@@ -287,32 +388,41 @@ static void research_check(void)
 static struct z_frame *schedule(void)
 {
     for (;;) {
-        for (unsigned offset = 1; offset <= manifest.cell_count; ++offset) {
-            unsigned next = (current + offset) % manifest.cell_count;
-            if (broker.policies[next].phase == Z_POLICY_READY) {
-                current = next; arch_activate(current); return &frames[current];
-            }
+        complete_waits();
+        int next = z_wait_next(&waits, &broker, current);
+        if (next >= 0) {
+            current = (unsigned)next; arch_activate(current); return &frames[current];
         }
-        __asm__ volatile("sti; hlt; cli" ::: "memory"); supervisor_tick(); research_check();
+        uint64_t entered = ticks;
+        bool traced = idle_events < 16;
+        if (traced) { ++idle_events; event("idle-enter", current); serial_puts("\n"); }
+        /* No runnable test and HLT are serialized with interrupts masked.
+         * STI's interrupt shadow closes the enable-to-halt lost interrupt gap. */
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+        if (traced) {
+            event("idle-wake", current); field("entered", entered); field("reason", 6);
+            serial_puts("\n");
+        }
+        supervisor_tick(); research_check();
     }
 }
 
 struct z_frame *kernel_trap(struct z_frame *frame)
 {
     if ((frame->cs & 3) != 3) {
-        if (frame->vector == 32) { ++ticks; arch_eoi(); return frame; }
+        if (frame->vector == 32) { advance_tick(); arch_eoi(); return frame; }
         serial_puts("KERNEL_FAULT"); field("vector", frame->vector);
         field("rip", frame->rip); serial_puts("\n"); panic("trusted kernel fault");
     }
     frames[current] = *frame;
     if (frame->cs != 0x1b || frame->ss != 0x23 ||
         !z_canonical_address(frame->rip) || !z_canonical_address(frame->rsp)) {
-        if (frame->vector == 32) { ++ticks; arch_eoi(); supervisor_tick(); }
+        if (frame->vector == 32) { advance_tick(); arch_eoi(); supervisor_tick(); }
         fail_cell(current, 69, 0, frame->rsp); return schedule();
     }
     frames[current].flags = (frame->flags | UINT64_C(0x202)) & ~UINT64_C(0x27000);
     if (frame->vector == 32) {
-        ++ticks; arch_eoi(); if (++run_ticks[current] >= 5) fail_cell(current, 65, 0, 0);
+        advance_tick(); arch_eoi(); if (++run_ticks[current] >= 5) fail_cell(current, 65, 0, 0);
         supervisor_tick(); research_check();
     } else if (frame->vector == 128) {
         run_ticks[current] = 0; frames[current].rax = (uint64_t)syscall(frame);
@@ -327,6 +437,9 @@ void kernel_main(void)
 {
     serial_init(); serial_puts("ZEAL boot abi=2 x86_64\n");
     arch_init(); load_manifest(); z_broker_init(&broker);
+    z_wait_init(&waits);
+    for (unsigned i = manifest.cell_count; i < Z_CELL_COUNT; ++i)
+        broker.policies[i] = (struct z_policy_state){ .phase = Z_POLICY_DORMANT };
     struct z_boot_grant grants[Z_MANIFEST_GRANT_MAX];
     for (unsigned i = 0; i < manifest.grant_count; ++i) {
         int holder = z_manifest_slot(&manifest, manifest.grants[i].holder);

@@ -92,7 +92,7 @@ static void cell_field_boundaries(void)
     reject_at(cell + 24, 0); reject_at(cell + 24, 63); reject_at(cell + 24, UINT32_MAX);
     reject_at(cell + 28, 0); reject_at(cell + 28, 4095); reject_at(cell + 28, 16385);
     reject_at(cell + 32, 0); reject_at(cell + 32, 4095); reject_at(cell + 32, 81921);
-    reject_at(cell + 36, 19); reject_at(cell + 40, 2); reject_at(cell + 44, UINT32_MAX);
+    reject_at(cell + 36, 20); reject_at(cell + 40, 2); reject_at(cell + 44, UINT32_MAX);
     base_manifest(); artifact[cell + 48] = 0; assert(!validate());
     base_manifest(); artifact[cell + 48] = 'x'; artifact[cell + 49] = 0; artifact[cell + 50] = 'y'; assert(!validate());
     base_manifest(); memset(&artifact[cell + 48], 'a', 16); assert(!validate());

@@ -4,14 +4,15 @@
 
 # Zeal
 
-Zeal is a research operating system exploring a fractal architecture: drivers,
-filesystems, and applications are sealed systems that boot, fail, and restart
-independently.
+Zeal is an operating system under development exploring a fractal architecture:
+drivers, filesystems, and applications are sealed systems that boot, fail, and
+restart independently.
 
 Zeal runs isolated x86-64 cells configured by a versioned boot manifest. Each
 cell has private budgeted memory, a lifecycle, and revocable IPC capabilities
-with operation rights. A fault cold-boots that cell while healthy cells keep
-running. Recursive hosting remains future work.
+with operation rights. Cells can sleep and receive messages with finite tick
+deadlines. A fault cold-boots that cell while healthy cells keep running.
+Recursive hosting remains future work.
 
 ## Build and run
 
@@ -24,8 +25,8 @@ make run
 make test
 ```
 
-See [building](docs/building.md), [architecture](docs/architecture.md), and
-[research tests](docs/testing.md).
+See [building](docs/building.md), [architecture](docs/architecture.md),
+[wait contracts](docs/waits.md), and [research tests](docs/testing.md).
 
 ## Status
 

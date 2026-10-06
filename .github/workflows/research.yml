@@ -16,12 +16,16 @@ jobs:
           sh tools/fetch-zig.sh
           echo "$PWD/build/tools/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
       - name: Build and validate
-        run: make test
+        run: |
+          set -o pipefail
+          mkdir -p build
+          make test 2>&1 | tee build/test.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: research-evidence
           path: |
+            build/test.log
             build/research/**/*.log
             build/research/results.json
             build/default/zeal.img

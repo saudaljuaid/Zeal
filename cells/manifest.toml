@@ -76,3 +76,8 @@ rights = ["file_reply", "cap_offer"]
 holder = 300
 target = 200
 rights = ["file_read", "cap_ack"]
+
+[[grant]]
+holder = 300
+target = 400
+rights = ["cap_offer"]

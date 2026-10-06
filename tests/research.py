@@ -20,7 +20,8 @@ NAMES = ["invalid instruction", "supervisor memory", "immutable code", "NX stack
          "interrupt masking", "port I/O", "infinite loop", "syscall addresses",
          "capability forgery", "null dereference", "stack guard", "unmapped memory",
          "trusted kernel fault", "x87 state isolation", "SSE state isolation", "direction flag",
-         "noncanonical return stack", "disabled SYSCALL entry", "disabled SYSENTER entry"]
+         "noncanonical return stack", "disabled SYSCALL entry", "disabled SYSENTER entry",
+         "blocking receive and timed sleep"]
 
 
 def require(condition, message):
@@ -40,6 +41,132 @@ def records(output):
 
 def select(events, name, cell):
     return [fields for kind, fields in events if kind == name and fields["cell"] == cell]
+
+
+def verify_waits(events, standalone=False, demonstration=True):
+    """Independently pair supervisor records with the current boot generation."""
+    pending, generations, unavailable = {}, {}, set()
+    completed, cancelled, idle = [], [], []
+    entered = None
+    identities = {0: 100, 1: 200, 2: 300, 3: 400}
+    for index, (name, fields) in enumerate(events):
+        if name in ("boot", "wait-arm", "wake", "wait-cancel", "idle-enter", "idle-wake"):
+            require(all(key in fields for key in ("cell", "identity", "generation", "tick")),
+                    "structured wait event lacks ownership fields")
+        if "cell" in fields:
+            cell = fields["cell"]
+            require(cell in identities and fields.get("identity") == identities[cell],
+                    "wait trace contains an invalid cell identity")
+        if name == "boot":
+            require(cell not in pending, "restart inherited an uncancelled wait")
+            generations[cell] = fields["generation"]
+            unavailable.discard(cell)
+        elif name in ("fault", "exit", "quarantine"):
+            require(cell not in pending, "failed or stopped cell retained a pending wait")
+            unavailable.add(cell)
+        elif name == "wait-arm":
+            require(cell not in pending, "cell armed overlapping waits")
+            require(cell not in unavailable and fields["generation"] == generations.get(cell),
+                    "wait armed for an unavailable generation")
+            require(fields.get("kind") in (1, 2), "unknown wait kind")
+            require(fields["tick"] < fields.get("deadline", 0) <= fields["tick"] + 1000,
+                    "unbounded, zero, or overflowing wait deadline")
+            pending[cell] = (index, fields)
+        elif name in ("wake", "wait-cancel"):
+            require(cell in pending, "completion has no pending wait")
+            arm_index, arm = pending.pop(cell)
+            require(all(fields.get(key) == arm[key] for key in ("generation", "kind", "deadline")),
+                    "completion changed pending wait ownership or deadline")
+            require(fields["generation"] == generations.get(cell) and fields["tick"] >= arm["tick"],
+                    "completion belongs to a stale generation or precedes arming")
+            if name == "wait-cancel":
+                require(fields.get("reason", 0) != 0, "cancellation lacks its cause")
+                cancelled.append((arm_index, index, arm, fields))
+                continue
+            require(cell not in unavailable, "completion revived a failed or stopped cell")
+            reason, result = fields.get("reason"), fields.get("result")
+            if arm["kind"] == 1:
+                require(reason == 1 and result == 0 and fields["tick"] >= arm["deadline"],
+                        "sleep completed before its deadline or with the wrong result")
+            elif reason == 3:
+                require(result == 0xfffffffffffffff8 and fields["tick"] >= arm["deadline"],
+                        "receive timeout completed early or with the wrong result")
+            elif reason in (2, 4):
+                require(fields["tick"] < arm["deadline"] and
+                        result == (0 if reason == 2 else 0xfffffffffffffffb),
+                        "message completion lost deadline ordering or checked-copy result")
+            else:
+                require(False, "receive has an unknown wake reason")
+            completed.append((arm_index, index, arm, fields))
+        elif name == "idle-enter":
+            require(entered is None, "supervisor entered idle twice without a timer wake")
+            require(all(cell in pending or cell in unavailable for cell in generations),
+                    "supervisor idled with a runnable cell")
+            entered = (index, fields)
+        elif name == "idle-wake":
+            require(entered is not None, "timer idle wake has no idle entry")
+            enter_index, entry = entered
+            require(fields.get("reason") == 6 and fields.get("entered") == entry["tick"] and
+                    fields["tick"] > entry["tick"] and
+                    all(fields[key] == entry[key] for key in ("cell", "identity", "generation")),
+                    "idle did not wake on a later timer interrupt with the original identity")
+            idle.append((enter_index, index, entry, fields))
+            entered = None
+
+    if not demonstration:
+        return
+    probe = [item for item in completed if item[2]["cell"] == 3]
+    timed = [item for item in probe if item[2]["kind"] == 2 and item[3]["reason"] == 3 and
+             item[2]["deadline"] - item[2]["tick"] == 2]
+    slept = [item for item in probe if item[2]["kind"] == 1 and
+             item[2]["deadline"] - item[2]["tick"] == 3]
+    require(len(timed) == len(slept) == 1, "probe timeout or timed sleep demonstration missing")
+    contracts = [(index, fields) for index, (name, fields) in enumerate(events)
+                 if name == "wait-contract" and fields["cell"] == 3]
+    require(len(contracts) == 1 and contracts[0][1].get("checks") == 7 and
+            contracts[0][1].get("duration") == 3 and contracts[0][1]["generation"] == 1,
+            "probe did not verify zero timeout, finite timeout, and sleep results")
+    require(timed[0][1] < slept[0][0] < slept[0][1] < contracts[0][0],
+            "probe wait verification is out of order")
+    if standalone:
+        require(idle and any(item[0] < timed[0][1] for item in idle) and
+                any(slept[0][0] < item[0] < item[1] <= slept[0][1] for item in idle),
+                "idle supervisor did not wake while the only cell was waiting")
+        require(not select(events, "wait-delivered", 3), "standalone probe fabricated a sender")
+        require(len(select(events, "exit", 3)) == 1 and not select(events, "fault", 3),
+                "standalone wait probe did not exit cleanly")
+        return
+
+    messages = [item for item in probe if item[2]["kind"] == 2 and item[3]["reason"] == 2 and
+                item[2]["deadline"] - item[2]["tick"] == 100]
+    require(len(messages) == 1, "empty-queue receiver never woke for the later message")
+    received = [(index, fields) for index, (name, fields) in enumerate(events)
+                if name == "wait-delivered" and fields["cell"] == 3]
+    require(len(received) == 1 and received[0][1].get("sender") == 0x103 and
+            received[0][1].get("value") == 0x7a65616c77616b65 and
+            received[0][1]["generation"] == 1, "probe did not verify the later application message")
+    progress = [(index, fields) for index, (name, fields) in enumerate(events)
+                if name == "wait-progress" and fields["cell"] == 2]
+    require(len(progress) == 1 and progress[0][1].get("reads", 0) >= 1 and
+            progress[0][1]["generation"] == 1 and
+            messages[0][0] < progress[0][0] < messages[0][1] < received[0][0] < timed[0][0],
+            "another cell did not make verified progress while the receiver was suspended")
+    observed_reads = [fields for index, (name, fields) in enumerate(events)
+                      if name == "read-verified" and fields["cell"] == 2 and
+                      fields["generation"] == 1 and messages[0][0] < index < progress[0][0]]
+    require(len(observed_reads) == 1 and observed_reads[0].get("reads") == progress[0][1]["reads"],
+            "wait progress lacks its unique verified application read")
+    restarted_waits = [item for item in cancelled if item[2]["cell"] in (0, 1) and
+                       item[2]["kind"] == 2 and item[2]["generation"] == 1 and
+                       any(name == "fault" and fields["cell"] == item[2]["cell"] and
+                           fields["generation"] == item[2]["generation"] and
+                           fields["tick"] == item[3]["tick"] and
+                           fields["reason"] == item[3]["reason"] and index > item[1]
+                           for index, (name, fields) in enumerate(events)) and
+                       any(name == "boot" and fields["cell"] == item[2]["cell"] and
+                           fields["generation"] == 2 and index > item[1]
+                           for index, (name, fields) in enumerate(events))]
+    require(restarted_waits, "dependency restart did not cancel a pending receive")
 
 
 def verify(output, code, scenario):
@@ -123,8 +250,9 @@ def verify(output, code, scenario):
     reset_reports = select(events, "reset-memory", 3)
     require([r["generation"] for r in reset_reports] == [b["generation"] for b in boots],
             "cold boot did not clear prior stack memory")
-    if scenario in (7, 8, 15):
-        require(not faults and len(boots) == 1 and len(select(events, "contract", 3)) == 1 and
+    if scenario in (7, 8, 15, 19):
+        contract = "wait-contract" if scenario == 19 else "contract"
+        require(not faults and len(boots) == 1 and len(select(events, contract, 3)) == 1 and
                 len(select(events, "exit", 3)) == 1, "syscall probe did not exit cleanly")
     else:
         require(len(faults) == 4 and len(boots) == 4 and
@@ -145,6 +273,10 @@ def verify(output, code, scenario):
         if scenario == 3:
             require(all(0x40020000 <= f["address"] < 0x40024000 for f in faults),
                     "NX probe faulted outside its stack")
+    if scenario == 19:
+        verify_waits(events)
+    else:
+        verify_waits(events, demonstration=False)
 
 
 def build(scenario, solo=-1):
@@ -241,6 +373,21 @@ def main():
                         "idle supervisor did not preserve stopped state")
             results.append({"case": label, "seconds": duration, "passed": True})
             print(f"PASS {label}", flush=True)
+        image = build(19, 3)
+        label = "idle-supervisor-waits"
+        output, code, duration = emulate(image, label)
+        events = records(output)
+        require(code == 1 and output.count("ZEAL boot abi=2 x86_64") == 1 and
+                output.count("MANIFEST_ACCEPT version=1") == 1 and
+                output.count("RESEARCH_PASS scenario=0x0000000000000013") == 1 and
+                not any(word in output for word in ("PANIC", "RESEARCH_FAIL", "bad-report")),
+                "standalone waiting supervisor did not complete with the expected emulator exit")
+        require(sum(name == "boot" for name, _ in events) == 1 and
+                len(select(events, "entry", 3)) == len(select(events, "reset-memory", 3)) == 1,
+                "standalone wait probe boot mismatch")
+        verify_waits(events, standalone=True)
+        results.append({"case": label, "seconds": duration, "exit": code, "passed": True})
+        print(f"PASS {label}", flush=True)
     except (AssertionError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         results.append({"passed": False, "error": str(exc)})
         print(f"FAIL {exc}\nInspect {LOGS}", file=sys.stderr)

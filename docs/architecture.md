@@ -1,7 +1,8 @@
-# The first substrate
+# Zeal's current substrate
 
-Zeal's long-term unit of composition is a sealed system called a cell. A cell
-has an immutable boot image, private memory, a lifecycle, and explicit
+Zeal is an operating system under development. Its long-term unit of
+composition is a sealed system called a cell. A cell has an immutable boot
+image, private memory, a lifecycle, and explicit
 communication authority. This milestone implements manifest-configured leaf
 cells. A cell cannot host child systems yet, so this is not recursive
 supervision.
@@ -94,7 +95,8 @@ each restart.
 
 ## Communication authority
 
-ABI v2 uses `int 0x80`. `include/zeal/abi.h`, Rust FFI layouts, and Zig's
+ABI v2 uses `int 0x80`, including the additive finite `sleep` and `recv_wait`
+calls. `include/zeal/abi.h`, Rust FFI layouts, and Zig's
 `cells/abi.zig` define the same call numbers, message layout, capability
 records, and result codes; tests compare the compiled C and Zig layout reports.
 Endpoint lookup uses stable manifest identities. Endpoints identify a cell
@@ -137,13 +139,22 @@ clients must look up the new endpoint and obtain fresh authority before sending.
 
 ## Scheduling, failure, and recovery
 
-The PIT supplies 100 Hz interrupts and the supervisor rotates ready cells.
+The PIT supplies 100 Hz interrupts and the supervisor rotates runnable cells.
+Each live cell can own one generation-bound finite sleep or receive wait.
+Waiting cells remain ready endpoints but consume no runnable turns; timer
+deadlines or valid messages make them runnable again. The supervisor checks
+receive authority and private destination memory before deferred delivery.
+If no cell is runnable, it enables interrupts and halts until a timer wakes it
+to process waits and lifecycle deadlines. See [wait contracts](waits.md) for
+zero-duration behavior, ordering, cancellation, and the 1000-tick bound.
+
 A cell that makes no syscall for five charged ticks is failed; this bounds the
 infinite-loop probe but is not a real-time guarantee. A looping cell that
-continues making syscalls may continue receiving its fair share.
+continues making syscalls may continue receiving its fair share. Sleeping,
+receiving, and supervisor idle time do not charge the execution watchdog.
 
-Cell exceptions and watchdog failures revoke authority, clear the failed
-cell's queue, discard messages from the failed generation, and leave unrelated
+Cell exceptions and watchdog failures cancel pending waits, revoke authority,
+clear the failed cell's queue, discard messages from the failed generation, and leave unrelated
 queues and address spaces intact. Rust policy restarts after 4, 8, and 16
 ticks. Three restarts are allowed per cell lifetime; a fourth fault quarantines
 the cell. Generation and deadline overflow fail closed. Intentional exit is a

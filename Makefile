@@ -20,7 +20,7 @@ ZFLAGS := -target x86_64-freestanding-none -mcpu=baseline-sse-sse2 -mno-red-zone
           -fno-entry -T cells/cell.ld
 CELLS := block filesystem client probe
 COBJS := $(COMMON)/ipc.o $(COMMON)/runtime.o $(COMMON)/arch.o \
-         $(COMMON)/manifest.o $(COMMON)/memory.o
+         $(COMMON)/manifest.o $(COMMON)/memory.o $(COMMON)/wait.o
 AOBJS := $(COMMON)/entry.o $(COMMON)/traps.o
 BOBJS := $(addprefix $(COMMON)/,$(addsuffix .o,$(CELLS)))
 HEADERS := $(wildcard include/zeal/*.h)
@@ -32,6 +32,8 @@ $(COMMON) $(BUILD):
 	mkdir -p $@
 
 $(COMMON)/ipc.o: kernel/ipc.c $(HEADERS) | $(COMMON)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(COMMON)/wait.o: kernel/wait.c $(HEADERS) | $(COMMON)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(COMMON)/manifest.o: kernel/manifest.c $(HEADERS) | $(COMMON)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -94,6 +96,11 @@ $(COMMON)/ipc-tests: tests/ipc.c tests/rust_shim.c kernel/ipc.c $(HEADERS) $(COM
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
 	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude tests/ipc.c tests/rust_shim.c kernel/ipc.c \
 	  $(COMMON)/libpolicy-host.a -lpthread -ldl -lm -o $@
+$(COMMON)/wait-tests: tests/wait.c tests/rust_shim.c kernel/wait.c kernel/ipc.c kernel/memory.c kernel/manifest.c $(HEADERS) $(COMMON)/libpolicy-host.a
+	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
+	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude \
+	  tests/wait.c tests/rust_shim.c kernel/wait.c kernel/ipc.c kernel/memory.c kernel/manifest.c \
+	  $(COMMON)/libpolicy-host.a -lpthread -ldl -lm -o $@
 $(COMMON)/memory-tests: tests/memory.c kernel/memory.c kernel/manifest.c $(HEADERS)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
 	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude \
@@ -101,9 +108,10 @@ $(COMMON)/memory-tests: tests/memory.c kernel/memory.c kernel/manifest.c $(HEADE
 $(COMMON)/manifest-tests: tests/manifest.c kernel/manifest.c $(HEADERS)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
 	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude tests/manifest.c kernel/manifest.c -o $@
-test-host: $(COMMON)/policy-tests $(COMMON)/ipc-tests $(COMMON)/memory-tests $(COMMON)/manifest-tests
+test-host: $(COMMON)/policy-tests $(COMMON)/ipc-tests $(COMMON)/wait-tests $(COMMON)/memory-tests $(COMMON)/manifest-tests
 	timeout 60s $(COMMON)/policy-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/ipc-tests
+	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/wait-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/memory-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/manifest-tests
 	timeout 60s $(ZIG) test cells/protocol.zig

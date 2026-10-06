@@ -22,6 +22,9 @@ void arch_activate(unsigned cell);
 bool arch_user_range(uint64_t address, size_t length, bool write);
 void arch_user_copy_in(void *destination, uint64_t source, size_t length);
 void arch_user_copy_out(uint64_t destination, const void *source, size_t length);
+bool arch_cell_copy_valid(unsigned cell, uint64_t destination, size_t length);
+bool arch_cell_copy_out(unsigned cell, uint64_t destination,
+                        const void *source, size_t length);
 void arch_frame_init(struct z_frame *frame, unsigned cell);
 void arch_enter(struct z_frame *frame) __attribute__((noreturn));
 struct z_frame *kernel_trap(struct z_frame *frame);

@@ -31,7 +31,7 @@ pub fn run(comptime role: abi.Role) noreturn {
     switch (role) {
         .block => block(),
         .filesystem => filesystem(info.generation),
-        .client => client(),
+        .client => client(info.scenario),
         .probe => @import("probe_runtime.zig").run(info.scenario),
     }
 }
@@ -47,8 +47,8 @@ fn block() noreturn {
             if (result == 0 or result == @intFromEnum(abi.Error.stale)) destination = 0;
         } else {
             var request: abi.Message = undefined;
-            if (syscall.receive(&request) == 0 and
-                protocol.validBlockRequest(&request, filesystem_handle)) destination = request.sender;
+            if (syscall.receiveWait(&request, 10) == 0 and
+                protocol.validBlockRequest(&request, syscall.lookup(.filesystem))) destination = request.sender;
         }
         syscall.yield();
     }
@@ -97,11 +97,15 @@ fn filesystem(generation: u64) noreturn {
             if (syscall.sendGranted(state.block, &request, .read) == 0) state.requestSent();
         }
         var received: abi.Message = undefined;
-        if (syscall.receive(&received) == 0) {
-            if (protocol.capabilityOffer(&received, client_handle, .cap_ack)) |ack| {
+        if (syscall.receiveWait(&received, 10) == 0) {
+            // A dependency can restart while this receive is suspended.
+            state.rebindBlock(syscall.lookup(.block));
+            const receiving_client = syscall.lookup(.client);
+            state.rebindClient(receiving_client);
+            if (protocol.capabilityOffer(&received, receiving_client, .cap_ack)) |ack| {
                 if (demo_phase == 5 and ack.phase == 1 and ack.handle == child and ack.parent == parent)
                     demo_phase = 2;
-            } else if (!state.acceptReply(&received)) _ = state.acceptRequest(&received, client_handle);
+            } else if (!state.acceptReply(&received)) _ = state.acceptRequest(&received, receiving_client);
         }
         syscall.yield();
     }
@@ -117,7 +121,7 @@ fn observeMemory() void {
     syscall.reportValues(8, stack.*, writable.*);
 }
 
-fn client() noreturn {
+fn client(scenario: u64) noreturn {
     const stack: *volatile u64 = @ptrFromInt(abi.stack_base + 128);
     const writable: *volatile u64 = @ptrFromInt(abi.memory_base);
     require(stack.* == 0 and writable.* == 0);
@@ -130,6 +134,7 @@ fn client() noreturn {
     var parent: u64 = 0;
     var last_endpoint: u64 = 0;
     var normal_cap: u64 = 0;
+    var wait_message_sent = false;
     while (true) {
         const endpoint = syscall.lookup(.filesystem);
         if (endpoint != 0 and last_endpoint != 0 and endpoint != last_endpoint) {
@@ -192,10 +197,21 @@ fn client() noreturn {
                 }
             } else if (state.acceptReply(&reply)) {
                 syscall.report(1);
+                if (scenario == 19 and !wait_message_sent) {
+                    require(syscall.sleep(3) == 0);
+                    syscall.report(14);
+                    var wake_message = abi.Message.empty(.cap_offer);
+                    wake_message.length = 8;
+                    const value: u64 = 0x7a65616c77616b65;
+                    @memcpy(wake_message.payload[0..8], @as([*]const u8, @ptrCast(&value))[0..8]);
+                    require(syscall.sendGranted(syscall.lookup(.probe), &wake_message, .cap_offer) == 0);
+                    wait_message_sent = true;
+                }
                 if (demo_phase == 1) {
                     syscall.reportValues(9, child, parent);
                     demo_phase = 2;
                 }
+                require(syscall.sleep(1) == 0);
             }
         }
         syscall.yield();

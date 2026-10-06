@@ -112,7 +112,7 @@ def compile_manifest(source, output, image_paths, scenario=0, solo=-1):
         image_budget = u(item.get("image_budget"), 32, "image_budget")
         stack = u(item.get("stack_budget"), 32, "stack_budget")
         writable = u(item.get("writable_budget"), 32, "writable_budget")
-        config = scenario if image == 4 else u(item.get("boot_config"), 32, "boot_config")
+        config = scenario if image == 4 or (image == 3 and scenario == 19) else u(item.get("boot_config"), 32, "boot_config")
         restart_limit = u(item.get("restart_limit"), 32, "restart_limit")
         restart_delay = u(item.get("restart_delay"), 32, "restart_delay")
         if image not in images or entry != images[image][1] or image_budget < images[image][0] or image_budget > 65536:

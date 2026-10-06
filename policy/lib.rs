@@ -4,6 +4,13 @@ use core::ptr;
 
 mod capability;
 
+// Additive syscall ABI v2 constants shared with C and isolated Zig cells.
+pub const Z_ABI_VERSION: u32 = 2;
+pub const Z_SLEEP: u64 = 11;
+pub const Z_RECV_WAIT: u64 = 12;
+pub const Z_TIMEOUT: i64 = -8;
+pub const Z_WAIT_MAX_TICKS: u64 = 1000;
+
 const CELLS: u32 = 4;
 const RESTART_LIMIT: u32 = 3;
 const GENERATION_MAX: u64 = (i64::MAX as u64) >> 8;
@@ -236,6 +243,8 @@ mod tests {
 
     #[test]
     fn c_abi_layout_is_fixed() {
+        assert_eq!((Z_ABI_VERSION, Z_SLEEP, Z_RECV_WAIT, Z_TIMEOUT, Z_WAIT_MAX_TICKS),
+                   (2, 11, 12, -8, 1000));
         assert_eq!(size_of::<State>(), 32);
         assert_eq!(align_of::<State>(), 8);
         assert_eq!(offset_of!(State, generation), 0);

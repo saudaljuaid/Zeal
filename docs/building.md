@@ -43,9 +43,13 @@ make BUILD=build/block SOLO=0 run
 make BUILD=build/filesystem SOLO=1 run
 make BUILD=build/client SOLO=2 run
 make BUILD=build/probe SOLO=3 SCENARIO=7 run
+make BUILD=build/waits SCENARIO=19 run
+make BUILD=build/idle-waits SOLO=3 SCENARIO=19 run
 ```
 
-A standalone filesystem or client waits for its absent dependencies. These are
+A standalone filesystem or client waits for its absent dependencies. The wait
+scenario verifies blocking receive, later message delivery, timeout, and sleep;
+its standalone probe verifies timer wakeups while the supervisor idles. These are
 independent cell boots inside the supervisor, rather than firmware images with
 separate hardware kernels. The `SCENARIO` option selects a fault probe; `TEST=1`
 exits QEMU after checking recovery. The research runner creates separate build

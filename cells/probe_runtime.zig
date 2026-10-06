@@ -46,6 +46,38 @@ fn capabilityChecks() noreturn {
     syscall.exit();
 }
 
+fn waitChecks() noreturn {
+    expect(syscall.sleep(0), .ok);
+    expect(syscall.sleep(abi.wait_max_ticks + 1), .invalid);
+    expect(syscall.sleep(0xffffffffffffffff), .invalid);
+    var message = abi.Message.empty(.cap_offer);
+    expect(syscall.receiveWait(&message, abi.wait_max_ticks + 1), .invalid);
+    expect(syscall.raw(@intFromEnum(abi.Call.recv_wait), abi.image_base, 2, 0), .bad_address);
+    expect(syscall.receiveWait(&message, 0), .again);
+    const client = syscall.lookup(.client);
+    if (client != 0) {
+        expect(syscall.receiveWait(&message, 100), .ok);
+        const value = @as(*align(1) const u64, @ptrCast(&message.payload)).*;
+        if (message.sender != client or message.operation != @intFromEnum(abi.Operation.cap_offer) or
+            message.length != 8 or value != 0x7a65616c77616b65) {
+            syscall.report(255);
+            syscall.exit();
+        }
+        syscall.reportValues(15, message.sender, value);
+    }
+    expect(syscall.receive(&message), .again);
+    expect(syscall.receiveWait(&message, 0), .again);
+    message.sender = 0x55aa55aa55aa55aa;
+    expect(syscall.receiveWait(&message, 2), .timeout);
+    if (message.sender != 0x55aa55aa55aa55aa) {
+        syscall.report(255);
+        syscall.exit();
+    }
+    expect(syscall.sleep(3), .ok);
+    syscall.reportValues(16, 7, 3);
+    syscall.exit();
+}
+
 pub fn run(scenario: u64) noreturn {
     switch (scenario) {
         0 => asm volatile ("ud2"),
@@ -75,6 +107,7 @@ pub fn run(scenario: u64) noreturn {
         6 => while (true) asm volatile ("pause"),
         7 => addressChecks(),
         8 => capabilityChecks(),
+        19 => waitChecks(),
         9 => {
             const pointer: *allowzero const volatile u8 = @ptrFromInt(0);
             _ = pointer.*;
