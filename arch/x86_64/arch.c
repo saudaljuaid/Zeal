@@ -40,7 +40,11 @@ struct cell_space {
     _Alignas(PAGE_SIZE) uint64_t directory[512];
     _Alignas(PAGE_SIZE) uint64_t pages[512];
     _Alignas(PAGE_SIZE) uint8_t image[Z_IMAGE_SIZE];
-    _Alignas(PAGE_SIZE) uint8_t stack[Z_STACK_SIZE];
+    struct z_memory_layout layout;
+    uint64_t entry;
+    uint32_t image_budget;
+    uint32_t stack_budget;
+    uint32_t writable_budget;
     bool ready;
 };
 
@@ -67,6 +71,8 @@ static struct interrupt_gate idt[256] __attribute__((aligned(16)));
 static uint8_t double_fault_stack[16384] __attribute__((aligned(16)));
 static uint64_t low_directory[512] __attribute__((aligned(PAGE_SIZE)));
 static struct cell_space spaces[Z_CELL_COUNT];
+static struct z_memory_pool memory_pool;
+static unsigned active_cell = Z_CELL_COUNT;
 
 static inline void out8(uint16_t port, uint8_t value)
 {
@@ -117,6 +123,8 @@ static void set_gate(unsigned vector, void *handler, unsigned privilege,
 void arch_init(void)
 {
     __asm__ volatile("cli" : : : "memory");
+    if (!z_memory_init(&memory_pool, Z_MANIFEST_POOL_PAGES))
+        arch_finish(0x7d);
     gdt[0] = 0;
     gdt[1] = UINT64_C(0x00af9a000000ffff);
     gdt[2] = UINT64_C(0x00cf92000000ffff);
@@ -170,9 +178,13 @@ void arch_init(void)
     out8(0x40, (uint8_t)((1193182 / 100) >> 8));
 }
 
-bool arch_space_init(unsigned cell, const void *image, size_t length)
+bool arch_space_init(unsigned cell, const void *image, size_t length,
+                     const struct z_manifest_cell *config)
 {
-    if (cell >= Z_CELL_COUNT || image == NULL || length == 0 || length > Z_IMAGE_SIZE)
+    if (cell >= Z_CELL_COUNT || spaces[cell].ready || image == NULL || config == NULL ||
+        length == 0 || config->image_budget == 0 || config->image_budget > Z_IMAGE_SIZE ||
+        length > config->image_budget || config->entry != Z_IMAGE_BASE ||
+        !z_memory_allocate(&memory_pool, cell, config->stack_budget, config->writable_budget))
         return false;
     struct cell_space *space = &spaces[cell];
     clear(space, sizeof(*space));
@@ -181,26 +193,59 @@ bool arch_space_init(unsigned cell, const void *image, size_t length)
     space->pdpt[0] = (uintptr_t)low_directory | PTE_PRESENT | PTE_WRITE;
     space->pdpt[1] = (uintptr_t)space->directory | user_table;
     space->directory[0] = (uintptr_t)space->pages | user_table;
-    for (unsigned page = 0; page < Z_IMAGE_SIZE / PAGE_SIZE; ++page)
+    unsigned image_pages = (config->image_budget + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (unsigned page = 0; page < image_pages; ++page)
         space->pages[page] = (uintptr_t)(space->image + page * PAGE_SIZE)
             | PTE_PRESENT | PTE_USER;
     unsigned stack_page = (Z_STACK_BASE - Z_IMAGE_BASE) / PAGE_SIZE;
-    for (unsigned page = 0; page < Z_STACK_SIZE / PAGE_SIZE; ++page)
-        space->pages[stack_page + page] = (uintptr_t)(space->stack + page * PAGE_SIZE)
+    const struct z_memory_allocation *allocation = &memory_pool.cells[cell];
+    for (unsigned page = 0; page < allocation->stack_pages; ++page)
+        space->pages[stack_page + page] = (uintptr_t)z_memory_page(&memory_pool, cell, page)
+            | PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX;
+    unsigned heap_page = (Z_HEAP_BASE - Z_IMAGE_BASE) / PAGE_SIZE;
+    for (unsigned page = 0; page < allocation->heap_pages; ++page)
+        space->pages[heap_page + page] = (uintptr_t)z_memory_page(
+            &memory_pool, cell, allocation->stack_pages + page)
             | PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX;
     copy(space->image, image, length);
+    space->layout = (struct z_memory_layout) {
+        space->image, image_pages * PAGE_SIZE,
+        allocation->stack_pages * PAGE_SIZE, allocation->heap_pages * PAGE_SIZE
+    };
+    space->entry = config->entry;
+    space->image_budget = config->image_budget;
+    space->stack_budget = config->stack_budget;
+    space->writable_budget = config->writable_budget;
     space->ready = true;
     return true;
 }
 
-void arch_space_reset(unsigned cell, const void *image, size_t length)
+bool arch_space_reset(unsigned cell, const void *image, size_t length,
+                      const struct z_manifest_cell *config)
 {
-    if (cell >= Z_CELL_COUNT || !spaces[cell].ready || image == NULL
-            || length == 0 || length > Z_IMAGE_SIZE)
-        arch_finish(0x7d);
+    if (cell >= Z_CELL_COUNT || image == NULL || config == NULL)
+        return false;
+    if (!spaces[cell].ready)
+        return arch_space_init(cell, image, length, config);
+    if (length == 0 || length > spaces[cell].image_budget ||
+        spaces[cell].image_budget != config->image_budget ||
+        spaces[cell].stack_budget != config->stack_budget ||
+        spaces[cell].writable_budget != config->writable_budget ||
+        spaces[cell].entry != config->entry || !z_memory_reset(&memory_pool, cell))
+        return false;
     clear(spaces[cell].image, sizeof(spaces[cell].image));
-    clear(spaces[cell].stack, sizeof(spaces[cell].stack));
     copy(spaces[cell].image, image, length);
+    return true;
+}
+
+void arch_space_release(unsigned cell)
+{
+    if (cell >= Z_CELL_COUNT || !spaces[cell].ready)
+        return;
+    if (!z_memory_release(&memory_pool, cell))
+        arch_finish(0x7d);
+    clear(spaces[cell].pages, sizeof(spaces[cell].pages));
+    spaces[cell].ready = false;
 }
 
 void arch_activate(unsigned cell)
@@ -208,35 +253,41 @@ void arch_activate(unsigned cell)
     if (cell >= Z_CELL_COUNT || !spaces[cell].ready)
         arch_finish(0x7d);
     uintptr_t root = (uintptr_t)spaces[cell].pml4;
+    active_cell = cell;
     __asm__ volatile("mov %0, %%cr3" : : "r"(root) : "memory");
 }
 
 bool arch_user_range(uint64_t address, size_t length, bool write)
 {
-    return z_user_range(address, length, write);
+    return active_cell < Z_CELL_COUNT && spaces[active_cell].ready &&
+        z_memory_user_range(&spaces[active_cell].layout, address, length, write);
 }
 
 void arch_user_copy_in(void *destination, uint64_t source, size_t length)
 {
-    if (!arch_user_range(source, length, false))
+    if (active_cell >= Z_CELL_COUNT || !spaces[active_cell].ready ||
+        !z_memory_copy_in(&memory_pool, active_cell, &spaces[active_cell].layout,
+                           destination, source, length))
         arch_finish(0x7d);
-    copy(destination, (const void *)(uintptr_t)source, length);
 }
 
 void arch_user_copy_out(uint64_t destination, const void *source, size_t length)
 {
-    if (!arch_user_range(destination, length, true))
+    if (active_cell >= Z_CELL_COUNT || !spaces[active_cell].ready ||
+        !z_memory_copy_out(&memory_pool, active_cell, &spaces[active_cell].layout,
+                            destination, source, length))
         arch_finish(0x7d);
-    copy((void *)(uintptr_t)destination, source, length);
 }
 
-void arch_frame_init(struct z_frame *frame)
+void arch_frame_init(struct z_frame *frame, unsigned cell)
 {
+    if (cell >= Z_CELL_COUNT || !spaces[cell].ready)
+        arch_finish(0x7d);
     clear(frame, sizeof(*frame));
-    frame->rip = Z_IMAGE_BASE;
+    frame->rip = spaces[cell].entry;
     frame->cs = 0x1b;
     frame->flags = 0x202;
-    frame->rsp = Z_STACK_BASE + Z_STACK_SIZE - sizeof(uint64_t);
+    frame->rsp = Z_STACK_BASE + spaces[cell].layout.stack_size - sizeof(uint64_t);
     frame->ss = 0x23;
 }
 

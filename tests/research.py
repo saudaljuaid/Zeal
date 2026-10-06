@@ -49,12 +49,19 @@ def verify(output, code, scenario):
                 "kernel-fault negative control failed")
         return
     require(code == 1, f"unexpected emulator exit {code}")
-    require(output.count("ZEAL boot abi=1 x86_64") == 1, "kernel rebooted or never booted")
+    require(output.count("ZEAL boot abi=2 x86_64") == 1, "kernel rebooted or never booted")
+    require(output.count("MANIFEST_ACCEPT version=1") == 1, "privileged manifest validation missing")
     require(output.count("RESEARCH_PASS") == 1, "missing unique research completion")
     require(f"RESEARCH_PASS scenario=0x{scenario:016x}" in output, "wrong boot configuration")
     require(not any(word in output for word in ("PANIC", "RESEARCH_FAIL", "bad-report")),
             "failure appeared in serial output")
     events = records(output)
+    expected_identities = {0: 100, 1: 200, 2: 300, 3: 400}
+    for cell, identity in expected_identities.items():
+        for boot in select(events, "boot", cell):
+            require(boot.get("identity") == identity, "boot identity differs from manifest")
+            require(boot.get("abi") == 2 and boot.get("entry") == 0x40000000,
+                    "boot image contract differs from manifest")
     for cell in (0, 1):
         boots = select(events, "boot", cell)
         faults = select(events, "fault", cell)
@@ -67,6 +74,50 @@ def verify(output, code, scenario):
     require(len(select(events, "boot", 2)) == 1 and not select(events, "fault", 2),
             "healthy application was restarted")
     require(len(select(events, "read", 2)) == 1, "initial verified file read missing")
+    delegated = select(events, "cap-delegate", 1)
+    allowed = select(events, "demo-allowed", 2)
+    forbidden = select(events, "demo-forbidden", 2)
+    revoked = select(events, "cap-revoke", 1)
+    stale = select(events, "demo-revoked", 2)
+    rebind = select(events, "demo-rebind", 2)
+    require(len(delegated) == 1 and delegated[0]["rights"] == 4 and
+            delegated[0]["holder"] == 0x103 and delegated[0]["target"] == 0x102,
+            "runtime delegation identity or rights mismatch")
+    require(len(allowed) == 1 and allowed[0]["cap"] == delegated[0]["cap"] and
+            allowed[0]["parent"] == delegated[0]["parent"],
+            "restricted capability did not complete the allowed file operation")
+    require(len(forbidden) == 1 and forbidden[0]["rights"] == 1 and
+            forbidden[0]["result"] == 0xfffffffffffffffe,
+            "supervisor did not reject the forbidden operation")
+    require(len(revoked) == 1 and revoked[0]["cap"] == delegated[0]["cap"] and
+            len(stale) == 1 and stale[0]["cap"] == delegated[0]["cap"],
+            "revocation or stale-handle rejection missing")
+    require(len(rebind) == 1 and rebind[0]["old"] == 0x102 and rebind[0]["endpoint"] == 0x202,
+            "filesystem endpoint generation was not rebound")
+    def event_index(name, cell):
+        return next((i for i, (kind, fields) in enumerate(events)
+                     if kind == name and fields["cell"] == cell), -1)
+    delegate_at = event_index("cap-delegate", 1)
+    forbidden_at = event_index("demo-forbidden", 2)
+    allowed_at = event_index("demo-allowed", 2)
+    revoke_at = event_index("cap-revoke", 1)
+    stale_at = event_index("demo-revoked", 2)
+    rebind_at = event_index("demo-rebind", 2)
+    fs_restart_at = next(i for i, (kind, fields) in enumerate(events)
+                         if kind == "boot" and fields["cell"] == 1 and fields["generation"] == 2)
+    require(0 <= delegate_at < forbidden_at < allowed_at < revoke_at < stale_at < fs_restart_at < rebind_at,
+            "capability and dependency recovery events are out of order")
+    resumed = select(events, "demo-resumed", 2)
+    require(len(resumed) >= 2, "application did not resume after explicit and generation revocation")
+    healthy_memory = select(events, "healthy-memory", 2)
+    require(len(healthy_memory) >= 2 and all(e["stack"] == 0x710bf391ad42c865 and
+            e["writable"] == 0x38d126ef8a905b47 for e in healthy_memory),
+            "unrelated application memory changed during recovery")
+    reads_after_restart = [fields for i, (kind, fields) in enumerate(events)
+                           if i > rebind_at and kind == "read-verified" and fields["cell"] == 2
+                           and fields["generation"] == 1]
+    require(reads_after_restart and reads_after_restart[-1]["reads"] >= 3,
+            "verified application reads did not resume after filesystem restart")
     faults = select(events, "fault", 3)
     boots = select(events, "boot", 3)
     reset_reports = select(events, "reset-memory", 3)
@@ -160,8 +211,9 @@ def main():
                     "unsupported CPU did not fail before launching cells")
             results.append({"case": label, "seconds": duration, "passed": True})
             print(f"PASS {label}", flush=True)
-        for solo in range(3):
-            image = build(0, solo)
+        for solo in range(4):
+            scenario = 7 if solo == 3 else 0
+            image = build(scenario, solo)
             output, code, duration = emulate(image, f"solo-{solo}", timeout=1)
             events = records(output)
             require(code is None and len(select(events, "boot", solo)) == 1 and

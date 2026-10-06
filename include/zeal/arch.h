@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <zeal/manifest.h>
 
 struct z_frame {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
@@ -12,13 +13,16 @@ struct z_frame {
 };
 
 void arch_init(void);
-bool arch_space_init(unsigned cell, const void *image, size_t length);
-void arch_space_reset(unsigned cell, const void *image, size_t length);
+bool arch_space_init(unsigned cell, const void *image, size_t length,
+                     const struct z_manifest_cell *config);
+bool arch_space_reset(unsigned cell, const void *image, size_t length,
+                      const struct z_manifest_cell *config);
+void arch_space_release(unsigned cell);
 void arch_activate(unsigned cell);
 bool arch_user_range(uint64_t address, size_t length, bool write);
 void arch_user_copy_in(void *destination, uint64_t source, size_t length);
 void arch_user_copy_out(uint64_t destination, const void *source, size_t length);
-void arch_frame_init(struct z_frame *frame);
+void arch_frame_init(struct z_frame *frame, unsigned cell);
 void arch_enter(struct z_frame *frame) __attribute__((noreturn));
 struct z_frame *kernel_trap(struct z_frame *frame);
 void arch_eoi(void);

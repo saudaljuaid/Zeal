@@ -14,8 +14,14 @@ pub fn yield() void {
     _ = raw(@intFromEnum(abi.Call.yield), 0, 0, 0);
 }
 
-pub fn send(handle: u64, message: *const abi.Message) i64 {
-    return raw(@intFromEnum(abi.Call.send), handle, @intFromPtr(message), 0);
+pub fn send(endpoint: u64, message: *const abi.Message, capability: u64) i64 {
+    return raw(@intFromEnum(abi.Call.send), endpoint, @intFromPtr(message), capability);
+}
+
+pub fn sendGranted(endpoint: u64, message: *const abi.Message, operation: abi.Operation) i64 {
+    const capability = find(endpoint, abi.right(operation));
+    if (capability <= 0) return capability;
+    return send(endpoint, message, @intCast(capability));
 }
 
 pub fn receive(message: *abi.Message) i64 {
@@ -23,12 +29,32 @@ pub fn receive(message: *abi.Message) i64 {
 }
 
 pub fn lookup(role: abi.Role) u64 {
-    const result = raw(@intFromEnum(abi.Call.lookup), @intFromEnum(role), 0, 0);
+    const result = raw(@intFromEnum(abi.Call.lookup), (@as(u64, @intFromEnum(role)) + 1) * 100, 0, 0);
     return if (result > 0) @intCast(result) else 0;
 }
 
+pub fn find(endpoint: u64, rights: u32) i64 {
+    return raw(@intFromEnum(abi.Call.find), endpoint, rights, 0);
+}
+
+pub fn delegate(request: *const abi.DelegateRequest) i64 {
+    return raw(@intFromEnum(abi.Call.delegate), @intFromPtr(request), 0, 0);
+}
+
+pub fn query(capability: u64, info: *abi.CapabilityInfo) i64 {
+    return raw(@intFromEnum(abi.Call.query), capability, @intFromPtr(info), 0);
+}
+
+pub fn revoke(capability: u64) i64 {
+    return raw(@intFromEnum(abi.Call.revoke), capability, 0, 0);
+}
+
 pub fn report(code: u64) void {
-    _ = raw(@intFromEnum(abi.Call.report), code, 0, 0);
+    reportValues(code, 0, 0);
+}
+
+pub fn reportValues(code: u64, value: u64, extra: u64) void {
+    _ = raw(@intFromEnum(abi.Call.report), code, value, extra);
 }
 
 pub fn boot(info: *abi.BootInfo) i64 {

@@ -16,7 +16,7 @@ jobs:
           sh tools/fetch-zig.sh
           echo "$PWD/build/tools/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
       - name: Build and validate
-        run: make -j4 test
+        run: make test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

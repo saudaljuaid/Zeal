@@ -2,6 +2,43 @@ pub const abi = @import("abi.zig");
 pub const file_path = "/hello";
 pub const file_data = "Zeal survives.";
 
+pub const CapabilityOffer = struct {
+    phase: u64,
+    handle: u64,
+    parent: u64,
+};
+
+fn putWord(payload: *[abi.payload_size]u8, index: usize, value: u64) void {
+    for (0..8) |byte| payload[index + byte] = @truncate(value >> @intCast(byte * 8));
+}
+
+fn getWord(payload: *const [abi.payload_size]u8, index: usize) u64 {
+    var value: u64 = 0;
+    for (0..8) |byte| value |= @as(u64, payload[index + byte]) << @intCast(byte * 8);
+    return value;
+}
+
+pub fn capabilityMessage(operation: abi.Operation, offer: CapabilityOffer) abi.Message {
+    var message = abi.Message.empty(operation);
+    message.length = 24;
+    putWord(&message.payload, 0, offer.phase);
+    putWord(&message.payload, 8, offer.handle);
+    putWord(&message.payload, 16, offer.parent);
+    return message;
+}
+
+pub fn capabilityOffer(message: *const abi.Message, sender: u64, operation: abi.Operation) ?CapabilityOffer {
+    if (sender == 0 or message.sender != sender or message.operation != @intFromEnum(operation) or
+        message.length != 24) return null;
+    const offer: CapabilityOffer = .{
+        .phase = getWord(&message.payload, 0),
+        .handle = getWord(&message.payload, 8),
+        .parent = getWord(&message.payload, 16),
+    };
+    if ((offer.phase != 1 and offer.phase != 2) or offer.handle == 0 or offer.parent == 0) return null;
+    return offer;
+}
+
 pub fn payloadEquals(message: *const abi.Message, expected: []const u8) bool {
     if (message.length != expected.len or expected.len > abi.payload_size) return false;
     for (expected, 0..) |value, index| {
@@ -137,13 +174,52 @@ fn delivered(message: abi.Message, sender: u64) abi.Message {
     return copy;
 }
 
-test "wire layout and constants match the version one C contract" {
+test "wire layout and constants match the version two C contract" {
     try testing.expectEqual(@as(usize, 48), @sizeOf(abi.Message));
     try testing.expectEqual(@as(usize, 8), @alignOf(abi.Message));
     try testing.expectEqual(@as(usize, 16), @offsetOf(abi.Message, "payload"));
     try testing.expectEqual(@as(usize, 24), @sizeOf(abi.BootInfo));
     try testing.expectEqual(@as(u64, 6), @intFromEnum(abi.Call.exit));
     try testing.expectEqual(@as(i64, -5), @intFromEnum(abi.Error.bad_address));
+    try testing.expectEqual(@as(usize, 24), @sizeOf(abi.DelegateRequest));
+    try testing.expectEqual(@as(usize, 32), @sizeOf(abi.CapabilityInfo));
+    try testing.expectEqual(@as(usize, 24), @offsetOf(abi.CapabilityInfo, "parent"));
+    try testing.expectEqual(@as(u64, 7), @intFromEnum(abi.Call.find));
+    try testing.expectEqual(@as(u64, 10), @intFromEnum(abi.Call.revoke));
+    try testing.expectEqual(@as(u32, 4), abi.right(.file_read));
+    try testing.expectEqual(@as(u32, 32), abi.right(.cap_ack));
+    try testing.expectEqual(@as(i64, -7), @intFromEnum(abi.Error.no_space));
+}
+
+test "capability handoff authenticates identities and bounded wire fields" {
+    const original = delivered(capabilityMessage(.cap_offer, .{
+        .phase = 1, .handle = 0x109, .parent = 0x104,
+    }), 0x102);
+    const offer = capabilityOffer(&original, 0x102, .cap_offer).?;
+    try testing.expectEqual(@as(u64, 1), offer.phase);
+    try testing.expectEqual(@as(u64, 0x109), offer.handle);
+    try testing.expectEqual(@as(u64, 0x104), offer.parent);
+    try testing.expect(capabilityOffer(&original, 0, .cap_offer) == null);
+    try testing.expect(capabilityOffer(&original, 0x202, .cap_offer) == null);
+    try testing.expect(capabilityOffer(&original, 0x102, .cap_ack) == null);
+    for ([_]u32{ 0, 1, 23, 25, 32, 33, 0xffffffff }) |length| {
+        var malformed = original;
+        malformed.length = length;
+        try testing.expect(capabilityOffer(&malformed, 0x102, .cap_offer) == null);
+    }
+    for ([_]u64{ 0, 3, 0xffffffffffffffff }) |phase| {
+        const malformed = delivered(capabilityMessage(.cap_offer, .{
+            .phase = phase, .handle = 1, .parent = 2,
+        }), 0x102);
+        try testing.expect(capabilityOffer(&malformed, 0x102, .cap_offer) == null);
+    }
+    for (0..2) |which| {
+        const malformed = delivered(capabilityMessage(.cap_offer, .{
+            .phase = 1, .handle = if (which == 0) 0 else 1,
+            .parent = if (which == 1) 0 else 2,
+        }), 0x102);
+        try testing.expect(capabilityOffer(&malformed, 0x102, .cap_offer) == null);
+    }
 }
 
 test "RAM block service only exposes sector zero to the current filesystem" {

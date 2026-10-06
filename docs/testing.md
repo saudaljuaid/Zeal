@@ -1,60 +1,66 @@
 # Research validation
 
-Run `make test`. Failure in any layer returns a nonzero result. The suite keeps
-serial traces and a machine-readable result file under `build/research/`.
-GitHub Actions runs the same targets and retains these artifacts on failure.
+Run `make test`. The command uses bounded subprocess timeouts, fails if any
+layer fails, preserves emulator serial traces, and writes a machine-readable
+summary under `build/research/results.json`. GitHub Actions runs the same
+`make test` target and retains logs and the boot image on failure.
 
 ## Host checks
 
-The Rust policy tests exercise ABI layout, all directed authority edges,
-generation exhaustion, deadline overflow, repeated faults, restart limits,
-stale endpoints, intentional exit, and malformed states. An independent
-lifecycle model checks 299,593 bounded trace nodes and 65,536 deterministic
-adversarial steps. These are bounded checks, not a proof over all executions.
+Rust tests exercise lifecycle transitions and capability grant, delegation,
+attenuation, revocation, ancestry, stale handles, restart reconstruction,
+table pressure, slot reuse, and cross-language structure sizes. The lifecycle
+policy is also compared with an independent model over 299,593 bounded trace
+nodes and 65,536 deterministic adversarial steps. These checks are bounded,
+not a proof over all executions.
 
-The production C broker runs under AddressSanitizer and UndefinedBehaviorSanitizer.
-Checks cover queue saturation, wraparound FIFO order, copying instead of aliasing,
-forged sender replacement, payload zeroing, authority rejection, stale senders,
-and revocation that preserves unrelated messages. A separate list-based model
-checks 100,000 deterministic broker operations. Pointer checks compare production
-range validation with a separate arithmetic oracle at boundaries and over
-100,000 generated address/length pairs.
+Production C IPC, allocation, checked-copy, manifest validation, queue
+compaction, and cleanup paths run under AddressSanitizer and UndefinedBehavior
+Sanitizer. Tests cover exact memory budgets, exhaustion without partial claims,
+page reuse, 1,000 cold clears, independent cell backing, readable images,
+unwritable images, and guards. Capability tests cover allowed and forbidden
+operations, delegation without permission, rights amplification, ancestor
+revocation, stale endpoint generations, table pressure, stale slot reuse, and
+messages queued before revocation while preserving unrelated queue entries.
+The broker test also compares 50,000 deterministic generated queue/capability
+operations using seed `0x6d2b79f5` against a separate bounded queue model.
 
-Zig tests cover service protocol state, exact byte lengths, malformed operations,
-wrong senders, oversized requests, and rebinding during outstanding work. Artifact
-tests reject corrupt boot sectors, overlarge payloads, invalid ELF identities,
-writable cell segments, and truncated or out-of-bounds headers.
+The manifest validator tests header truncation, unsupported versions,
+count/size boundaries, every cell and grant field, duplicate identities and
+grants, name encoding, image catalogs, entries, lifecycle settings, rights,
+and page rounding. Build-compiler tests independently reject malformed source
+records and overlarge images. C and Zig emit their ABI layouts for direct
+comparison; Rust validates its policy FFI layouts. Zig protocol tests check
+message authentication, malformed lengths, backpressure, rebinding, and
+deterministic storage-chain recovery. Artifact tests reject malformed boot
+sectors, corrupt ELF headers, writable cell segments, and out-of-bounds images.
 
 ## Emulator checks
 
-The runner boots a real raw image under TCG and checks CPU exception vectors,
-error bits, fault addresses, generation changes, restart delays, quarantine,
-application survival, and resumed verified reads after storage and filesystem
-fault injection. A `RESEARCH_PASS` line alone is insufficient: the external
-runner validates the event trace and emulator exit status independently.
+The test runner boots the raw disk under QEMU TCG and validates structured
+serial records plus the emulator exit status. It does not accept the
+`RESEARCH_PASS` marker alone. It checks manifest acceptance, cell identities,
+ABI and entry data, event ordering, endpoint generations, operation rights,
+delegation, forbidden-operation denial, revocation, stale-handle rejection,
+rebind, resumed verified reads, restart delays, quarantine, and unchanged
+application memory. The demo restarts both the RAM block service and the
+filesystem while the application remains in its original generation.
 
-Cases include invalid instructions, supervisor memory writes, code writes,
-execution from an NX stack, CLI, port I/O, a non-cooperating loop, invalid syscall
-pointers, forged endpoints, null reads, stack guards, unmapped reads, disabled x87
-and SSE instructions, and direction-flag preservation across a syscall. A probe
-writes a stack sentinel before faulting and checks that each cold boot cleared it. The
-suite also rejects noncanonical return stacks and checks that unconfigured
-SYSCALL/SYSENTER entry paths fault inside the cell on AMD and Intel models. The
-kernel-fault control must produce a kernel diagnostic and a failure exit, never
-a successful recovery. CPUs without long mode or NX must fail before cell boot.
+Fault scenarios cover invalid instructions, supervisor memory writes,
+immutable code writes, NX stack execution, interrupt masking, port I/O,
+non-cooperating loops, invalid syscall addresses, forged endpoints, null and
+guard accesses, disabled x87/SSE instructions, direction-flag preservation,
+noncanonical return stacks, disabled SYSCALL/SYSENTER paths, and a trusted
+kernel fault. The suite tests CPU models with 32–128 MiB RAM, boot images for
+each standalone service/application/probe, no-runnable-cell scheduling,
+unsupported CPU failures, and an Intel SYSENTER control. Most scenarios run
+twice by default; `RESEARCH_REPEAT` may be set from 1 to 20.
 
-All scenarios run twice by default. Platform checks cover `max` and `qemu64`
-CPUs with 32–128 MiB RAM. Separate images boot block, filesystem, and application
-cells alone. Their absent dependencies must cause waiting, not a kernel failure.
-Two additional probe-only boots check supervisor timer progress while every cell
-is either backing off, quarantined, stopped, or dormant.
+The oracle's unit tests reject marker-only traces, missing boot and recovery
+events, forged generations, altered rights, missing app reads, counterfeit
+recovery, and incorrect emulator exits. Emulator logs and `results.json` remain
+available under `build/research/`.
 
-The demo injects a RAM driver failure at tick 20 and a filesystem failure at tick
-40. It requires fresh service generations and new IPC activity before marking
-each recovery. The application must remain in its original generation. At tick
-120, it checks that the failed probe exhausted its restart budget or exited after
-successful syscall checks, and that healthy cells remain ready.
-
-These checks do not establish real-hardware correctness, DMA containment, NVMe
-reset safety, SMP correctness, persistent data integrity, or side-channel
-isolation. Those require their own future test campaigns.
+These tests do not establish real-hardware correctness, DMA containment,
+NVMe reset safety, SMP correctness, persistent-data integrity, extended CPU
+state preservation, or side-channel isolation.

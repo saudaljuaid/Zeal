@@ -2,6 +2,8 @@
 
 use core::ptr;
 
+mod capability;
+
 const CELLS: u32 = 4;
 const RESTART_LIMIT: u32 = 3;
 const GENERATION_MAX: u64 = (i64::MAX as u64) >> 8;
@@ -190,11 +192,6 @@ pub unsafe extern "C" fn z_policy_resolve(
         return UNAVAILABLE;
     }
     slot as i32
-}
-
-#[no_mangle]
-pub extern "C" fn z_policy_allow(sender: u32, target: u32) -> i32 {
-    i32::from(matches!((sender, target), (0, 1) | (1, 0) | (1, 2) | (2, 1)))
 }
 
 #[no_mangle]
@@ -464,39 +461,6 @@ mod tests {
             assert_eq!(states[0], dormant());
         }
         assert!(states[0].valid());
-    }
-
-    #[test]
-    fn directed_permission_graph_has_exactly_four_edges() {
-        let expected = [
-            [false, true, false, false],
-            [true, false, true, false],
-            [false, true, false, false],
-            [false, false, false, false],
-        ];
-        let mut edges = 0;
-        for sender in 0..4 {
-            for target in 0..4 {
-                let allowed = z_policy_allow(sender, target) != 0;
-                assert_eq!(allowed, expected[sender as usize][target as usize]);
-                edges += usize::from(allowed);
-            }
-        }
-        assert_eq!(edges, 4);
-    }
-
-    #[test]
-    fn invalid_principals_and_probe_have_no_authority() {
-        for sender in [3, 4, 255, 256, u32::MAX] {
-            for target in [0, 1, 2, 3, 4, 255, u32::MAX] {
-                assert_eq!(z_policy_allow(sender, target), 0);
-            }
-        }
-        for sender in 0..4 {
-            for target in [3, 4, 255, 256, u32::MAX] {
-                assert_eq!(z_policy_allow(sender, target), 0);
-            }
-        }
     }
 
     #[test]

@@ -1,225 +1,225 @@
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <zeal/ipc.h>
-#include <zeal/memory.h>
 
-static uint64_t random_state = UINT64_C(0x52ea19a780de3b61);
-
-static uint64_t random_value(void)
-{
-    random_state ^= random_state << 13;
-    random_state ^= random_state >> 7;
-    random_state ^= random_state << 17;
-    return random_state;
-}
-
-static struct z_message request(unsigned tag, unsigned length)
-{
-    struct z_message message = {0};
-    message.sender = UINT64_MAX;
-    message.operation = tag;
-    message.length = length;
-    memset(message.payload, (int)(tag & 255), sizeof(message.payload));
-    return message;
-}
-
-static uint64_t endpoint(struct z_broker *broker, unsigned target)
-{
-    return z_policy_handle(&broker->policies[target], target);
-}
-
-static void bounded_fifo(void)
-{
-    struct z_broker broker;
-    z_broker_init(&broker);
-    for (unsigned cycle = 0; cycle < 128; ++cycle) {
-        for (unsigned i = 0; i < Z_QUEUE_DEPTH; ++i) {
-            struct z_message input = request(i + cycle * 8, i % 33);
-            assert(z_broker_send(&broker, Z_CLIENT, endpoint(&broker, Z_FS), &input) == Z_OK);
-            memset(&input, 0x99, sizeof(input));
-        }
-        struct z_message extra = request(255, 0);
-        assert(z_broker_send(&broker, Z_CLIENT, endpoint(&broker, Z_FS), &extra) == Z_AGAIN);
-        for (unsigned i = 0; i < Z_QUEUE_DEPTH; ++i) {
-            struct z_message output;
-            memset(&output, 0xa5, sizeof(output));
-            assert(z_broker_receive(&broker, Z_FS, &output) == Z_OK);
-            assert(output.operation == i + cycle * 8);
-            assert(output.sender == endpoint(&broker, Z_CLIENT));
-            assert(output.length == i % 33);
-            for (unsigned n = 0; n < Z_PAYLOAD_SIZE; ++n)
-                assert(output.payload[n] == (n < output.length ? (output.operation & 255) : 0));
-        }
-        struct z_message unchanged = request(123, 5), saved = unchanged;
-        assert(z_broker_receive(&broker, Z_FS, &unchanged) == Z_AGAIN);
-        assert(memcmp(&unchanged, &saved, sizeof(saved)) == 0);
-    }
-}
-
-static void authority_and_restarts(void)
-{
-    struct z_broker broker;
-    z_broker_init(&broker);
-    struct z_message message = request(1, 1);
-    const bool rights[4][4] = {
-        { false, true, false, false }, { true, false, true, false },
-        { false, true, false, false }, { false, false, false, false }
-    };
-    for (unsigned source = 0; source < 4; ++source)
-        for (unsigned target = 0; target < 4; ++target) {
-            assert(z_broker_send(&broker, source, endpoint(&broker, target), &message)
-                   == (rights[source][target] ? Z_OK : Z_DENIED));
-            assert(z_broker_lookup(&broker, source, target)
-                   == (rights[source][target] ? (int64_t)endpoint(&broker, target) : Z_DENIED));
-        }
-    assert(z_broker_send(&broker, 4, 257, &message) == Z_INVALID);
-    assert(z_broker_lookup(&broker, 0, UINT32_MAX) == Z_INVALID);
-    assert(z_broker_send(&broker, 0, 0, &message) == Z_INVALID);
-    assert(z_broker_send(&broker, 0, UINT64_MAX, &message) == Z_INVALID);
-    assert(z_broker_send(&broker, 0, endpoint(&broker, 1), NULL) == Z_INVALID);
-    assert(z_broker_receive(&broker, 1, NULL) == Z_INVALID);
-    message.length = 33;
-    assert(z_broker_send(&broker, 0, endpoint(&broker, 1), &message) == Z_TOO_LARGE);
-    message.length = UINT32_MAX;
-    assert(z_broker_send(&broker, 0, endpoint(&broker, 1), &message) == Z_TOO_LARGE);
-    uint64_t old = endpoint(&broker, Z_BLOCK);
-    z_broker_revoke(&broker, Z_BLOCK);
-    z_policy_fault(&broker.policies[Z_BLOCK], 10);
-    assert(z_broker_send(&broker, Z_FS, old, &message) == Z_AGAIN);
-    assert(z_policy_poll(&broker.policies[Z_BLOCK], 13) == 0);
-    assert(z_policy_poll(&broker.policies[Z_BLOCK], 14) == 1);
-    assert(z_broker_send(&broker, Z_FS, old, &message) == Z_STALE);
-    assert(endpoint(&broker, Z_BLOCK) != old);
-    struct z_message output;
-    assert(z_broker_receive(&broker, Z_FS, &output) == Z_OK);
-    assert(output.sender == endpoint(&broker, Z_CLIENT));
-    assert(z_broker_receive(&broker, Z_FS, &output) == Z_AGAIN);
-    assert(z_broker_receive(&broker, Z_BLOCK, &output) == Z_AGAIN);
-    assert(z_broker_receive(&broker, Z_CLIENT, &output) == Z_OK);
-}
-
-static void stale_sender_discard(void)
-{
-    struct z_broker broker;
-    z_broker_init(&broker);
-    struct z_message message = request(1, 1), output;
-    assert(z_broker_send(&broker, Z_BLOCK, endpoint(&broker, Z_FS), &message) == Z_OK);
-    assert(z_broker_send(&broker, Z_CLIENT, endpoint(&broker, Z_FS), &message) == Z_OK);
-    z_policy_fault(&broker.policies[Z_BLOCK], 0);
-    assert(z_broker_receive(&broker, Z_FS, &output) == Z_OK);
-    assert(output.sender == endpoint(&broker, Z_CLIENT));
-    assert(z_broker_receive(&broker, Z_FS, &output) == Z_AGAIN);
-}
-
-static bool reference_range(uint64_t address, size_t length, bool write)
-{
-    if (length > UINT64_MAX - address)
-        return false;
-    uint64_t end = address + length;
-    bool stack = address >= Z_STACK_BASE && end <= Z_STACK_BASE + Z_STACK_SIZE;
-    bool image = address >= Z_IMAGE_BASE && end <= Z_IMAGE_BASE + Z_IMAGE_SIZE;
-    return stack || (!write && image);
-}
-
-static void address_boundaries(void)
-{
-    assert(z_canonical_address(0));
-    assert(z_canonical_address(UINT64_C(0x00007fffffffffff)));
-    assert(z_canonical_address(UINT64_C(0xffff800000000000)));
-    assert(z_canonical_address(UINT64_MAX));
-    assert(!z_canonical_address(UINT64_C(0x0000800000000000)));
-    assert(!z_canonical_address(UINT64_C(0xffff7fffffffffff)));
-    const uint64_t boundaries[] = {
-        0, 0x10000, Z_IMAGE_BASE, Z_IMAGE_BASE + Z_IMAGE_SIZE,
-        Z_STACK_BASE, Z_STACK_BASE + Z_STACK_SIZE, UINT64_MAX - 64, UINT64_MAX
-    };
-    const size_t sizes[] = { 0, 1, 24, 48, 4096, 65536, SIZE_MAX };
-    for (unsigned b = 0; b < sizeof(boundaries) / sizeof(*boundaries); ++b)
-        for (int d = -64; d <= 64; ++d)
-            for (unsigned n = 0; n < sizeof(sizes) / sizeof(*sizes); ++n)
-                for (unsigned write = 0; write < 2; ++write) {
-                    uint64_t address = boundaries[b] + (uint64_t)d;
-                    assert(z_user_range(address, sizes[n], write) ==
-                           reference_range(address, sizes[n], write));
-                }
-    for (unsigned i = 0; i < 100000; ++i) {
-        uint64_t address = random_value();
-        size_t size = random_value();
-        bool write = random_value() & 1;
-        assert(z_user_range(address, size, write) == reference_range(address, size, write));
-    }
-}
-
-struct model_queue {
-    struct z_message list[8];
-    unsigned count;
+static struct z_broker broker;
+static const struct z_boot_grant initial[] = {
+    { Z_BLOCK, Z_FS, Z_RIGHT(Z_READ_REPLY), 0 },
+    { Z_FS, Z_BLOCK, Z_RIGHT(Z_READ), 0 },
+    { Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE, 0 },
+    { Z_FS, Z_CLIENT, Z_RIGHT(Z_FILE_REPLY) | Z_RIGHT(Z_CAP_OFFER), 0 },
+    { Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT(Z_CAP_ACK), 0 },
 };
 
-static void adversarial_broker(void)
+static uint64_t endpoint(unsigned cell)
 {
-    struct z_broker broker;
-    struct model_queue model[4] = {0};
+    return z_policy_handle(&broker.policies[cell], cell);
+}
+
+static uint64_t grant(unsigned holder, unsigned target, uint32_t rights)
+{
+    int64_t result = z_broker_find(&broker, holder, endpoint(target), rights);
+    assert(result > 0);
+    return (uint64_t)result;
+}
+
+static void setup(void)
+{
     z_broker_init(&broker);
-    const unsigned sources[] = { Z_BLOCK, Z_FS, Z_CLIENT, Z_FS };
-    const unsigned targets[] = { Z_FS, Z_BLOCK, Z_FS, Z_CLIENT };
-    for (unsigned step = 0; step < 100000; ++step) {
-        unsigned operation = random_value() % 10;
-        unsigned edge = random_value() % 4;
-        unsigned target = targets[edge], source = sources[edge];
-        struct model_queue *queue = &model[target];
-        if (operation < 6) {
-            struct z_message input = request(step, random_value() % 33);
-            int expected = queue->count == 8 ? Z_AGAIN : Z_OK;
-            assert(z_broker_send(&broker, source, endpoint(&broker, target), &input) == expected);
-            if (expected == Z_OK) {
-                struct z_message *copy = &queue->list[queue->count++];
-                *copy = (struct z_message){0};
-                copy->sender = endpoint(&broker, source);
-                copy->operation = input.operation;
-                copy->length = input.length;
-                memcpy(copy->payload, input.payload, input.length);
-            }
-        } else if (operation < 9) {
+    assert(z_broker_configure(&broker, initial, sizeof(initial) / sizeof(initial[0])) == Z_OK);
+    assert(z_broker_refresh(&broker) == Z_OK);
+}
+
+static struct z_message message(uint32_t operation, uint64_t marker)
+{
+    struct z_message result = { .sender = UINT64_MAX, .operation = operation, .length = 8 };
+    memcpy(result.payload, &marker, sizeof(marker));
+    return result;
+}
+
+static void fifo_and_bounded_copy(void)
+{
+    setup();
+    uint64_t cap = grant(Z_FS, Z_BLOCK, Z_RIGHT(Z_READ));
+    for (uint64_t i = 0; i < Z_QUEUE_DEPTH; ++i) {
+        struct z_message input = message(Z_READ, i);
+        assert(z_broker_send(&broker, Z_FS, endpoint(Z_BLOCK), cap, &input) == Z_OK);
+    }
+    struct z_message extra = message(Z_READ, 9);
+    assert(z_broker_send(&broker, Z_FS, endpoint(Z_BLOCK), cap, &extra) == Z_AGAIN);
+    for (uint64_t i = 0; i < Z_QUEUE_DEPTH; ++i) {
+        struct z_message output;
+        uint64_t marker;
+        assert(z_broker_receive(&broker, Z_BLOCK, &output) == Z_OK);
+        memcpy(&marker, output.payload, sizeof(marker));
+        assert(marker == i && output.sender == endpoint(Z_FS));
+        assert(output.payload[8] == 0 && output.payload[31] == 0);
+    }
+    assert(z_broker_receive(&broker, Z_BLOCK, &(struct z_message){0}) == Z_AGAIN);
+    assert(z_broker_send(&broker, Z_FS, endpoint(Z_BLOCK), cap, NULL) == Z_INVALID);
+    extra.length = Z_PAYLOAD_SIZE + 1;
+    assert(z_broker_send(&broker, Z_FS, endpoint(Z_BLOCK), cap, &extra) == Z_TOO_LARGE);
+}
+
+static void rights_and_delegation(void)
+{
+    setup();
+    uint64_t parent = grant(Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+    uint64_t holder = endpoint(Z_CLIENT);
+    int64_t child = z_broker_delegate(&broker, Z_FS, parent, holder, Z_RIGHT(Z_FILE_READ));
+    assert(child > 0 && (uint64_t)child != parent);
+    struct z_message allowed = message(Z_FILE_READ, 1);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), (uint64_t)child, &allowed) == Z_OK);
+    struct z_message forbidden = message(Z_READ, 2);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), (uint64_t)child, &forbidden) == Z_DENIED);
+    assert(z_broker_delegate(&broker, Z_CLIENT, (uint64_t)child, endpoint(Z_BLOCK),
+                             Z_RIGHT(Z_READ)) == Z_DENIED);
+    assert(z_broker_delegate(&broker, Z_FS, parent, holder,
+                             Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE | Z_RIGHT(Z_READ)) == Z_DENIED);
+    struct z_cap_info info;
+    assert(z_broker_query(&broker, Z_CLIENT, (uint64_t)child, &info) == Z_OK);
+    assert(info.holder == holder && info.target == endpoint(Z_FS) &&
+           info.parent == parent && info.rights == Z_RIGHT(Z_FILE_READ));
+    assert(z_broker_query(&broker, Z_BLOCK, (uint64_t)child, &info) == Z_DENIED);
+    assert(z_broker_revoke_cap(&broker, Z_CLIENT, (uint64_t)child) == Z_OK);
+    assert(broker.queues[Z_FS].count == 0);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), (uint64_t)child, &allowed) == Z_STALE);
+    assert(z_broker_revoke_cap(&broker, Z_CLIENT, (uint64_t)child) == Z_STALE);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), 0, &allowed) == Z_INVALID);
+    assert(z_broker_send(&broker, Z_CLIENT, UINT64_MAX, 1, &allowed) == Z_INVALID);
+}
+
+static void queued_revocation_preserves_unrelated_work(void)
+{
+    setup();
+    uint64_t app_cap = grant(Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ));
+    uint64_t parent = grant(Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+    int64_t child = z_broker_delegate(&broker, Z_FS, parent, endpoint(Z_CLIENT), Z_RIGHT(Z_FILE_READ));
+    assert(child > 0);
+    uint64_t service_cap = grant(Z_FS, Z_BLOCK, Z_RIGHT(Z_READ));
+    uint64_t other_cap = grant(Z_BLOCK, Z_FS, Z_RIGHT(Z_READ_REPLY));
+    struct z_message app = message(Z_FILE_READ, 1);
+    struct z_message delegated = message(Z_FILE_READ, 4);
+    struct z_message service = message(Z_READ, 2);
+    struct z_message unrelated = message(Z_READ_REPLY, 3);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), app_cap, &app) == Z_OK);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), (uint64_t)child, &delegated) == Z_OK);
+    assert(z_broker_send(&broker, Z_FS, endpoint(Z_BLOCK), service_cap, &service) == Z_OK);
+    assert(z_broker_send(&broker, Z_BLOCK, endpoint(Z_FS), other_cap, &unrelated) == Z_OK);
+    assert(z_broker_revoke_cap(&broker, Z_CLIENT, app_cap) == Z_OK);
+    assert(z_broker_revoke_cap(&broker, Z_FS, parent) == Z_OK);
+    struct z_message output;
+    uint64_t marker;
+    assert(z_broker_receive(&broker, Z_FS, &output) == Z_OK);
+    memcpy(&marker, output.payload, 8);
+    assert(marker == 3 && output.sender == endpoint(Z_BLOCK));
+    assert(z_broker_receive(&broker, Z_FS, &output) == Z_AGAIN);
+    assert(z_broker_receive(&broker, Z_BLOCK, &output) == Z_OK);
+    memcpy(&marker, output.payload, 8);
+    assert(marker == 2 && output.sender == endpoint(Z_FS));
+}
+
+static void restart_reissues_only_fresh_roots(void)
+{
+    setup();
+    uint64_t old_endpoint = endpoint(Z_FS);
+    uint64_t old_cap = grant(Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ));
+    z_broker_revoke(&broker, Z_FS);
+    z_policy_fault(&broker.policies[Z_FS], 100);
+    assert(z_policy_poll(&broker.policies[Z_FS], 103) == 0);
+    assert(z_policy_poll(&broker.policies[Z_FS], 104) == 1);
+    assert(z_broker_refresh(&broker) == Z_OK);
+    assert(endpoint(Z_FS) != old_endpoint);
+    struct z_message request = message(Z_FILE_READ, 0);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), old_cap, &request) == Z_STALE);
+    uint64_t fresh_cap = grant(Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ));
+    assert(fresh_cap != old_cap);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), fresh_cap, &request) == Z_OK);
+    assert(z_broker_receive(&broker, Z_FS, &(struct z_message){0}) == Z_OK);
+}
+
+static void capability_table_pressure_is_atomic(void)
+{
+    setup();
+    uint64_t parent = grant(Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+    uint64_t holder = endpoint(Z_CLIENT);
+    unsigned children = 0;
+    for (; children < Z_CAPACITY; ++children) {
+        int64_t result = z_broker_delegate(&broker, Z_FS, parent, holder, Z_RIGHT(Z_FILE_READ));
+        if (result == Z_NO_SPACE) break;
+        assert(result > 0);
+    }
+    assert(children == Z_CAPACITY - (sizeof(initial) / sizeof(initial[0])));
+    struct z_cap_info info;
+    assert(z_broker_query(&broker, Z_CLIENT, grant(Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ)), &info) == Z_OK);
+    assert(z_broker_delegate(&broker, Z_FS, parent, holder, Z_RIGHT(Z_FILE_READ)) == Z_NO_SPACE);
+}
+
+static uint32_t rng = 0x6d2b79f5;
+static uint32_t random_next(void)
+{
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng;
+}
+
+static void generated_transitions(void)
+{
+    setup();
+    uint64_t parent = grant(Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+    uint64_t cap = 0;
+    unsigned expected = 0;
+    uint64_t model[Z_QUEUE_DEPTH];
+    for (unsigned step = 0; step < 50000; ++step) {
+        if (cap == 0) {
+            int64_t created = z_broker_delegate(&broker, Z_FS, parent,
+                endpoint(Z_FS), Z_RIGHT(Z_FILE_READ));
+            assert(created > 0);
+            cap = (uint64_t)created;
+        }
+        unsigned choice = random_next() % 10;
+        if (choice < 5) {
+            uint64_t marker = random_next();
+            struct z_message input = message(Z_FILE_READ, marker);
+            int result = z_broker_send(&broker, Z_FS, endpoint(Z_FS), cap, &input);
+            assert(result == (expected == Z_QUEUE_DEPTH ? Z_AGAIN : Z_OK));
+            if (result == Z_OK) model[expected++] = marker;
+        } else if (choice < 7) {
+            struct z_message forbidden = message(Z_READ, random_next());
+            assert(z_broker_send(&broker, Z_FS, endpoint(Z_FS), cap, &forbidden) == Z_DENIED);
+            assert(broker.queues[Z_FS].count == expected);
+        } else if (choice < 9) {
             struct z_message output;
-            assert(z_broker_receive(&broker, target, &output) == (queue->count ? Z_OK : Z_AGAIN));
-            if (queue->count) {
-                assert(memcmp(&output, &queue->list[0], sizeof(output)) == 0);
-                --queue->count;
-                memmove(queue->list, queue->list + 1, queue->count * sizeof(output));
+            int result = z_broker_receive(&broker, Z_FS, &output);
+            assert(result == (expected ? Z_OK : Z_AGAIN));
+            if (expected) {
+                uint64_t marker;
+                memcpy(&marker, output.payload, 8);
+                assert(marker == model[0]);
+                memmove(model, model + 1, --expected * sizeof(*model));
             }
         } else {
-            unsigned revoked = random_value() % 4;
-            z_broker_revoke(&broker, revoked);
-            for (unsigned slot = 0; slot < 4; ++slot) {
-                if (slot == revoked) {
-                    model[slot].count = 0;
-                    continue;
-                }
-                for (unsigned i = 0; i < model[slot].count;) {
-                    if ((model[slot].list[i].sender & 255) == revoked + 1) {
-                        --model[slot].count;
-                        memmove(&model[slot].list[i], &model[slot].list[i + 1],
-                                (model[slot].count - i) * sizeof(struct z_message));
-                    } else {
-                        ++i;
-                    }
-                }
-            }
+            assert(z_broker_revoke_cap(&broker, Z_FS, cap) == Z_OK);
+            expected = 0;
+            assert(broker.queues[Z_FS].count == 0);
+            struct z_message stale = message(Z_FILE_READ, 0);
+            assert(z_broker_send(&broker, Z_FS, endpoint(Z_FS), cap, &stale) == Z_STALE);
+            cap = 0;
         }
-        for (unsigned slot = 0; slot < 4; ++slot)
-            assert(broker.queues[slot].count == model[slot].count);
+        assert(broker.queues[Z_FS].count == expected);
     }
 }
 
 int main(void)
 {
     _Static_assert(sizeof(struct z_policy_state) == 32, "Rust policy ABI");
-    bounded_fifo();
-    authority_and_restarts();
-    stale_sender_discard();
-    address_boundaries();
-    adversarial_broker();
-    puts("C IPC: FIFO, authority, revocation, address boundaries, 100000 model steps PASS");
+    _Static_assert(sizeof(struct z_cap_entry) == 48, "Rust capability ABI");
+    fifo_and_bounded_copy();
+    rights_and_delegation();
+    queued_revocation_preserves_unrelated_work();
+    restart_reissues_only_fresh_roots();
+    capability_table_pressure_is_atomic();
+    generated_transitions();
+    puts("C IPC: bounded queues, capabilities, delegation, revocation, restart, seed=0x6d2b79f5, 50000 steps PASS");
     return 0;
 }

@@ -28,13 +28,20 @@ fn capabilityChecks() noreturn {
     var message = abi.Message.empty(.file_read);
     message.sender = 0xffffffffffffffff;
     for (0..3) |slot| {
-        expect(syscall.raw(@intFromEnum(abi.Call.lookup), slot, 0, 0), .denied);
+        const discovered = syscall.raw(@intFromEnum(abi.Call.lookup), (slot + 1) * 100, 0, 0);
+        if (discovered <= 0) {
+            syscall.report(255);
+            syscall.exit();
+        }
+        expect(syscall.raw(@intFromEnum(abi.Call.find), @intCast(discovered),
+            (@as(u64, 1) << 32) | abi.right(.file_read), 0), .invalid);
         const handle: u64 = (1 << 8) | (slot + 1);
-        expect(syscall.send(handle, &message), .denied);
-        expect(syscall.send(handle + (1 << 8), &message), .stale);
+        expect(syscall.find(handle, abi.right(.file_read)), .denied);
+        expect(syscall.send(handle, &message, 0x101), .denied);
+        expect(syscall.send(handle + (1 << 8), &message, 0x101), .stale);
     }
-    expect(syscall.send(0, &message), .invalid);
-    expect(syscall.send(255, &message), .invalid);
+    expect(syscall.send(0, &message, 0), .invalid);
+    expect(syscall.send(255, &message, 0), .invalid);
     syscall.report(2);
     syscall.exit();
 }

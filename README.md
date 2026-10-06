@@ -8,10 +8,10 @@ Zeal is a research operating system exploring a fractal architecture: drivers,
 filesystems, and applications are sealed systems that boot, fail, and restart
 independently.
 
-The first milestone runs isolated x86-64 cells with a small C kernel, assembly
-boot and trap handling, Rust lifecycle policy, and Zig services. Each cell has
-private memory and generation-tagged IPC endpoints. A driver fault revokes its
-endpoints and cold-boots that cell while healthy cells continue running.
+Zeal runs isolated x86-64 cells configured by a versioned boot manifest. Each
+cell has private budgeted memory, a lifecycle, and revocable IPC capabilities
+with operation rights. A fault cold-boots that cell while healthy cells keep
+running. Recursive hosting remains future work.
 
 ## Build and run
 
@@ -29,9 +29,9 @@ See [building](docs/building.md), [architecture](docs/architecture.md), and
 
 ## Status
 
-Early research software. The current storage service is RAM-backed and the
-filesystem exposes one immutable file. Hardware NVMe, DMA isolation, persistent
-storage, SMP, and recursively hosted child systems are future milestones.
+Research software. Storage is RAM-backed and the filesystem exposes one
+immutable file. Hardware NVMe, DMA isolation, persistent storage, SMP, and
+recursively hosted child systems remain future work.
 
 ## License
 
