@@ -44,16 +44,22 @@ make BUILD=build/filesystem SOLO=1 run
 make BUILD=build/client SOLO=2 run
 make BUILD=build/probe SOLO=3 SCENARIO=7 run
 make BUILD=build/waits SCENARIO=19 run
+make BUILD=build/storage SCENARIO=20 TEST=1 run
 make BUILD=build/idle-waits SOLO=3 SCENARIO=19 run
 ```
 
 A standalone filesystem or client waits for its absent dependencies. The wait
-scenario verifies blocking receive, later message delivery, timeout, and sleep;
-its standalone probe verifies timer wakeups while the supervisor idles. These are
+scenario verifies blocking receive, later message delivery, timeout, and sleep.
+Scenario 20 runs writable file round trips and stale-handle recovery across
+separate block and filesystem restarts, then exits QEMU when `TEST=1`; the
+external oracle also verifies its structured storage evidence. The standalone
+wait probe verifies timer wakeups while the supervisor idles. These are
 independent cell boots inside the supervisor, rather than firmware images with
 separate hardware kernels. The `SCENARIO` option selects a fault probe; `TEST=1`
 exits QEMU after checking recovery. The research runner creates separate build
-directories for each configuration.
+directories for each configuration. The QEMU debug-exit device reports status
+1 on a successful test boot, so a direct `make ... TEST=1 run` can report that
+nonzero status; `make test` checks it together with the trace oracle.
 
 Override tools using `RUSTC`, `ZIG`, `QEMU`, and `PYTHON`. Additional emulator
 options can be set with `QEMU_FLAGS`. `RESEARCH_REPEAT` changes repeated emulator

@@ -33,6 +33,10 @@ static unsigned run_ticks[Z_CELL_COUNT], boots[Z_CELL_COUNT], reset_reports, rec
 static bool contract_ok, finished;
 static unsigned wait_events[Z_CELL_COUNT], idle_events;
 static bool wait_traced[Z_CELL_COUNT];
+static unsigned storage_events, storage_reports;
+static unsigned storage_stage;
+static uint64_t storage_checkpoint;
+static bool storage_done;
 
 static void field(const char *name, uint64_t value)
 {
@@ -44,6 +48,28 @@ static void event(const char *name, unsigned cell)
     serial_puts("EVENT "); serial_puts(name);
     field("cell", cell); field("identity", manifest.cells[cell].identity);
     field("generation", broker.policies[cell].generation); field("tick", ticks);
+}
+
+static uint64_t storage_word(const uint8_t *bytes, unsigned count)
+{
+    uint64_t value = 0;
+    for (unsigned i = 0; i < count; ++i) value |= (uint64_t)bytes[i] << (i * 8);
+    return value;
+}
+
+static void trace_storage(const struct z_message *message, uint64_t target, uint64_t cap, int result)
+{
+    if (message->operation < Z_BLOCK_READ || message->operation > Z_FILE_RESULT ||
+        storage_events >= 512) return;
+    ++storage_events;
+    event(result == Z_OK ? "storage-ipc" : "storage-reject", current);
+    field("target", target); field("cap", cap); field("outcome", (uint64_t)(int64_t)result);
+    field("operation", message->operation); field("length", message->length);
+    field("request", storage_word(message->payload, 8));
+    field("handle", storage_word(message->payload + 8, 8));
+    field("offset", storage_word(message->payload + 16, 4));
+    field("result", storage_word(message->payload + 20, 4));
+    field("data", storage_word(message->payload + 24, 8)); serial_puts("\n");
 }
 
 static void wait_event(const char *name, unsigned cell,
@@ -189,13 +215,19 @@ static void fail_cell(unsigned cell, uint64_t reason, uint64_t error, uint64_t a
 static void supervisor_tick(void)
 {
     if (Z_SCENARIO == 12 && ticks == 10) __asm__ volatile("ud2");
-    if (Z_SOLO < 0 && ticks == 20) {
+    if (Z_SOLO < 0 && Z_SCENARIO != 20 && ticks == 20) {
         unsigned block = role_slot(Z_BLOCK);
         if (block < manifest.cell_count) fail_cell(block, 64, 0, 0);
     }
-    if (Z_SOLO < 0 && ticks == 40) {
+    if (Z_SOLO < 0 && Z_SCENARIO != 20 && ticks == 40) {
         unsigned fs = role_slot(Z_FS);
         if (fs < manifest.cell_count) fail_cell(fs, 64, 0, 0);
+    }
+    if (Z_SOLO < 0 && Z_SCENARIO == 20 &&
+        (storage_stage == 1 || storage_stage == 3) && ticks - storage_checkpoint >= 2) {
+        unsigned service = role_slot(storage_stage == 1 ? Z_BLOCK : Z_FS);
+        ++storage_stage;
+        if (service < manifest.cell_count) fail_cell(service, 64, 0, 0);
     }
     for (unsigned i = 0; i < manifest.cell_count; ++i) {
         if (!z_policy_check(&broker.policies[i])) panic("policy invariant");
@@ -251,6 +283,7 @@ static int64_t syscall(struct z_frame *frame)
         {
             int result = z_broker_send(&broker, current, argument, frame->rdx, &message);
             if (result == Z_OK) ++sends[current];
+            trace_storage(&message, argument, frame->rdx, result);
             return result;
         }
     case Z_RECV:
@@ -305,7 +338,7 @@ static int64_t syscall(struct z_frame *frame)
             observe_read(); return Z_OK;
         }
         if (argument == 2 && manifest.cells[current].image == 4 &&
-            (Z_SCENARIO == 7 || Z_SCENARIO == 8 || Z_SCENARIO == 15)) {
+            (Z_SCENARIO == 7 || Z_SCENARIO == 8 || Z_SCENARIO == 15 || Z_SCENARIO == 20)) {
             contract_ok = true; event("contract", current); serial_puts("\n"); return Z_OK;
         }
         if (argument == 8 && manifest.cells[current].image == 3) {
@@ -343,6 +376,49 @@ static int64_t syscall(struct z_frame *frame)
             event("wait-contract", current); field("checks", frame->rsi);
             field("duration", frame->rdx); serial_puts("\n"); return Z_OK;
         }
+        if ((argument == 30 && manifest.cells[current].image == 1) ||
+            (argument == 31 && manifest.cells[current].image == 2)) {
+            if (storage_reports >= 512) return Z_TOO_LARGE;
+            ++storage_reports;
+            event(argument == 30 ? "storage-block" : "storage-fs", current);
+            field("request", frame->rsi); field("operation", frame->rdx >> 32);
+            field("result", frame->rdx & UINT32_MAX); serial_puts("\n"); return Z_OK;
+        }
+        if (argument >= 32 && argument <= 36 && manifest.cells[current].image == 3) {
+            if (storage_reports >= 512) return Z_TOO_LARGE;
+            ++storage_reports;
+            if (argument == 32) {
+                event("storage-verified", current); field("request", frame->rsi);
+                field("data", frame->rdx);
+            } else if (argument == 33) {
+                event("storage-stale", current); field("request", frame->rsi);
+                field("handle", frame->rdx);
+            } else if (argument == 34) {
+                event("storage-denied", current); field("request", frame->rsi);
+                field("result", frame->rdx);
+            } else if (argument == 35) {
+                if (Z_SCENARIO != 20 || !((frame->rsi == 1 && storage_stage == 0) ||
+                    (frame->rsi == 2 && storage_stage == 2))) return Z_INVALID;
+                ++storage_stage; storage_checkpoint = ticks;
+                event("storage-checkpoint", current); field("phase", frame->rsi);
+            } else {
+                if (Z_SCENARIO != 20 || storage_stage != 4) return Z_INVALID;
+                storage_done = true; event("storage-complete", current);
+            }
+            serial_puts("\n"); return Z_OK;
+        }
+        if (argument == 37 && manifest.cells[current].image == 2) {
+            if (storage_reports >= 512) return Z_TOO_LARGE;
+            ++storage_reports;
+            event("storage-link", current); field("request", frame->rsi);
+            field("block_request", frame->rdx); serial_puts("\n"); return Z_OK;
+        }
+        if (argument == 38 && manifest.cells[current].image == 3) {
+            if (storage_reports >= 512) return Z_TOO_LARGE;
+            ++storage_reports;
+            event("storage-rebind", current); field("old", frame->rsi);
+            field("endpoint", frame->rdx); serial_puts("\n"); return Z_OK;
+        }
         if (argument == (uint64_t)manifest.cells[current].image + 2) {
             event("entry", current); serial_puts("\n"); return Z_OK;
         }
@@ -365,12 +441,12 @@ static int64_t syscall(struct z_frame *frame)
 
 static void research_check(void)
 {
-    if (finished || ticks < 120 || Z_SOLO >= 0) return;
+    if (finished || ticks < (Z_SCENARIO == 20 ? 400u : 120u) || Z_SOLO >= 0) return;
     unsigned block = role_slot(Z_BLOCK), fs = role_slot(Z_FS), client = role_slot(Z_CLIENT);
     unsigned probe = role_slot(Z_PROBE);
     bool probe_ok = probe < manifest.cell_count &&
         broker.policies[probe].phase == Z_POLICY_QUARANTINED;
-    if (probe < manifest.cell_count && (Z_SCENARIO == 7 || Z_SCENARIO == 8 || Z_SCENARIO == 15 || Z_SCENARIO == 19))
+    if (probe < manifest.cell_count && (Z_SCENARIO == 7 || Z_SCENARIO == 8 || Z_SCENARIO == 15 || Z_SCENARIO == 19 || Z_SCENARIO == 20))
         probe_ok = broker.policies[probe].phase == Z_POLICY_STOPPED && contract_ok;
     else if (probe < manifest.cell_count)
         probe_ok = probe_ok && broker.policies[probe].faults == 4 && boots[probe] == 4;
@@ -378,7 +454,7 @@ static void research_check(void)
         probe < manifest.cell_count && recovered == 3 && reads > 2 && probe_ok &&
         reset_reports == boots[probe] && broker.policies[block].phase == Z_POLICY_READY &&
         broker.policies[fs].phase == Z_POLICY_READY && broker.policies[client].faults == 0 &&
-        boots[client] == 1;
+        boots[client] == 1 && (Z_SCENARIO != 20 || storage_done);
     serial_puts(pass ? "RESEARCH_PASS" : "RESEARCH_FAIL");
     field("scenario", Z_SCENARIO); field("reads", reads); field("tick", ticks); serial_puts("\n");
     finished = true;
@@ -435,7 +511,7 @@ struct z_frame *kernel_trap(struct z_frame *frame)
 
 void kernel_main(void)
 {
-    serial_init(); serial_puts("ZEAL boot abi=2 x86_64\n");
+    serial_init(); serial_puts("ZEAL boot abi=3 x86_64\n");
     arch_init(); load_manifest(); z_broker_init(&broker);
     z_wait_init(&waits);
     for (unsigned i = manifest.cell_count; i < Z_CELL_COUNT; ++i)

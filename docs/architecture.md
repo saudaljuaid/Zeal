@@ -12,7 +12,7 @@ supervision.
 | Boot and traps | Assembly | BIOS loading, long mode, register capture, privilege return |
 | Supervisor | C | Address spaces, allocation, scheduling, checked copies, IPC |
 | Policy | Rust, `no_std` | Lifecycle state, capabilities, delegation, revocation |
-| Cells | Zig | RAM block service, immutable filesystem, application, probes |
+| Cells | Zig | Writable RAM block service, bounded filesystem, application, probes |
 
 ## Manifest and image validation
 
@@ -95,8 +95,9 @@ each restart.
 
 ## Communication authority
 
-ABI v2 uses `int 0x80`, including the additive finite `sleep` and `recv_wait`
-calls. `include/zeal/abi.h`, Rust FFI layouts, and Zig's
+ABI v3 uses `int 0x80`, preserving the finite `sleep` and `recv_wait`
+calls and existing structure layouts while adding bounded storage operations.
+`include/zeal/abi.h`, Rust FFI layouts, and Zig's
 `cells/abi.zig` define the same call numbers, message layout, capability
 records, and result codes; tests compare the compiled C and Zig layout reports.
 Endpoint lookup uses stable manifest identities. Endpoints identify a cell
@@ -111,8 +112,8 @@ queueing a copied message. Cells still validate protocol senders and payloads,
 but those checks do not replace supervisor enforcement.
 
 The capability table holds 32 entries and the manifest may define 16 initial
-grants. Rights cover the six defined message operations; a separate high bit
-permits delegation. Delegation requires a live capability held by the caller
+grants. Rights cover the fourteen defined message operations; a separate high
+bit permits delegation. Delegation requires a live capability held by the caller
 with that bit set. New rights must be a subset of the parent, and the delegated
 target and generation remain the parent's target. A holder cannot amplify
 rights or delegate through a capability without delegation permission. Table
@@ -161,18 +162,55 @@ the cell. Generation and deadline overflow fail closed. Intentional exit is a
 separate stopped state. A kernel-origin exception stops the machine with a
 diagnostic and is never treated as a recoverable cell fault.
 
-The application reads `/hello` through the RAM block service and immutable
-filesystem. The research scenario delegates a `file_read` capability at
+The application reads `/hello` through the RAM block service and bounded
+filesystem. The recovery scenario delegates a `file_read` capability at
 runtime, checks an allowed read and a forbidden `read` operation, revokes the
 grant, rejects the stale handle, restarts the filesystem, rejects its old
 endpoint generation, obtains a fresh manifest grant, and verifies reads resume.
 The application remains in its original generation and reports unchanged
 stack and heap sentinels throughout recovery.
 
+## Writable storage and generation-safe handles
+
+The block cell owns 512 bytes in its manifest-budgeted private writable memory.
+It initializes `/hello`'s 14 bytes and zeros the remainder on every cold boot.
+Eight-byte reads and writes reject overflow and out-of-range addresses before
+copying. The filesystem stores metadata and handles without caching file data;
+every byte operation crosses the isolated block-service boundary.
+
+The flat filesystem has four fixed 128-byte extents, including read-only
+`/hello`, 16-byte maximum names, and eight open handles. Create-or-open, explicit
+offset read/write, and close use ABI v3's bounded 32-byte payloads. Creation
+zeros an entire free extent through the block service before publishing it;
+writes grow length only after the matching block acknowledgment. Gaps are
+unsupported and multi-chunk operations can leave an acknowledged prefix.
+
+Handles bind the exact owner endpoint and its generation to a filesystem
+generation, monotonically increasing 24-bit serial, and slot. Closed, forged,
+cross-owner, reused-slot, and earlier-generation handles stay stale; exhaustion
+never wraps. Operation capability checks remain independent of handle
+possession. Kernel delivery revalidates queued authority, while already
+received service work can finish after revocation.
+
+Filesystem restart discards writable metadata and handles but can leave bytes
+private in a healthy block cell; reuse clears those bytes before exposure.
+Block restart clears storage and causes filesystem metadata and handle
+invalidation without resetting the filesystem serial. Interrupted writes may
+already have changed bytes, and lost replies have an unknown outcome rather
+than exactly-once behavior. See [storage contracts](storage.md) for limits,
+protocol fields, result semantics, and bounded retry/receive rules.
+
+Scenario 20 creates, writes, closes, reopens, and byte-verifies `/note` through
+both services. It rejects an unauthorized write and old file handles, then
+resumes verified work after separate block and filesystem restarts. Structured
+records bind application progress to the participating service generations and
+request identities. Healthy application memory and the existing recovery,
+authority, and wait demonstrations remain part of the verification suite.
+
 ## Current boundary and open work
 
-The block service is RAM-backed, and the filesystem exposes one immutable
-file. The supervisor is single-CPU and preserves general registers only.
+Storage is volatile and the filesystem has the fixed flat limits above.
+The supervisor is single-CPU and preserves general registers only.
 Recursive hosting, hardware NVMe, DMA isolation, device ownership and reset,
 persistent storage, SMP, and extended CPU context are not implemented. These
 need separate contracts and tests; this milestone makes no DMA-containment or

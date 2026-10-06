@@ -8,7 +8,10 @@ pub fn main() !void {
         "\"boot_size\":{d},\"boot_generation\":{d},\"request_size\":{d},\"request_rights\":{d}," ++
         "\"info_size\":{d},\"info_parent\":{d},\"find\":{d},\"delegate\":{d},\"query\":{d},\"revoke\":{d}," ++
         "\"no_space\":{d},\"file_read_right\":{d},\"cap_ack_right\":{d},\"delegate_right\":{d}," ++
-        "\"sleep\":{d},\"recv_wait\":{d},\"timeout\":{d},\"wait_max_ticks\":{d}}}\n",
+        "\"sleep\":{d},\"recv_wait\":{d},\"timeout\":{d},\"wait_max_ticks\":{d}," ++
+        "\"operation_max\":{d},\"operation_rights\":{d},\"block_read_right\":{d},\"block_write_right\":{d}," ++
+        "\"block_reply_right\":{d},\"file_open_right\":{d},\"file_chunk_read_right\":{d}," ++
+        "\"file_write_right\":{d},\"file_close_right\":{d},\"file_result_right\":{d}}}\n",
         .{
             abi.version, @sizeOf(abi.Message), @alignOf(abi.Message), @offsetOf(abi.Message, "payload"),
             @sizeOf(abi.BootInfo), @offsetOf(abi.BootInfo, "generation"),
@@ -19,6 +22,10 @@ pub fn main() !void {
             @intFromEnum(abi.Error.no_space), abi.right(.file_read), abi.right(.cap_ack), abi.delegate_right,
             @intFromEnum(abi.Call.sleep), @intFromEnum(abi.Call.recv_wait),
             @intFromEnum(abi.Error.timeout), abi.wait_max_ticks,
+            @intFromEnum(abi.Operation.file_result), abi.operation_rights,
+            abi.right(.block_read), abi.right(.block_write), abi.right(.block_reply),
+            abi.right(.file_open), abi.right(.file_chunk_read), abi.right(.file_write),
+            abi.right(.file_close), abi.right(.file_result),
         });
     var offset: usize = 0;
     while (offset < output.len) offset += try std.posix.write(1, output[offset..]);

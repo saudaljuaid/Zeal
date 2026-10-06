@@ -4,7 +4,7 @@ use core::ptr;
 const SLOTS: usize = 32;
 const ROOTS: usize = 16;
 const DELEGATE: u32 = 1 << 31;
-const OPERATIONS: u32 = 0x3f;
+const OPERATIONS: u32 = super::Z_RIGHT_OPERATIONS;
 const INVALID: i64 = -1;
 const DENIED: i64 = -2;
 const STALE: i64 = -3;
@@ -476,6 +476,36 @@ mod tests {
         assert_eq!(table.delegate(&states, client, child as u64, fs, 4), DENIED);
         assert_eq!(table.delegate(&states, fs, parent as u64, client, 4 | DELEGATE | 1), DENIED);
         assert_eq!(table.check(&states, client, (child as u64) ^ (1 << 8), fs, 4), STALE as i32);
+    }
+
+    #[test]
+    fn storage_operation_rights_do_not_widen_read_authority() {
+        let states = states();
+        let mut table = configured(&states);
+        let fs = states[1].handle(1);
+        let client = states[2].handle(2);
+        let parent = table.find(&states, fs, fs, 4 | DELEGATE) as u64;
+        let child = table.delegate(&states, fs, parent, client, 4) as u64;
+        for operation in 7..=super::super::Z_OPERATION_MAX {
+            let right = 1 << (operation - 1);
+            assert!(valid_rights(right));
+            assert_eq!(table.check(&states, client, child, fs, right), DENIED as i32);
+            assert_eq!(table.delegate(&states, fs, parent, client, right), DENIED);
+        }
+        for rights in [0, DELEGATE, 1 << 14, 1 << 30, u32::MAX] {
+            assert!(!valid_rights(rights));
+            assert_eq!(table.find(&states, client, fs, rights), INVALID);
+        }
+        let mut writable = Table::new();
+        let write = 1 << 11;
+        assert_eq!(writable.configure(&[Grant { holder: 2, target: 1,
+                                               rights: write, reserved: 0 }]), 0);
+        assert_eq!(writable.refresh(&states), 0);
+        let authority = writable.find(&states, client, fs, write) as u64;
+        assert_eq!(writable.check(&states, client, authority, fs, write), 0);
+        assert_eq!(writable.check(&states, client, authority, fs, 4), DENIED as i32);
+        assert_eq!(writable.revoke(&states, client, authority), 0);
+        assert_eq!(writable.check(&states, client, authority, fs, write), STALE as i32);
     }
 
     #[test]

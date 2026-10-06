@@ -21,7 +21,7 @@ NAMES = ["invalid instruction", "supervisor memory", "immutable code", "NX stack
          "capability forgery", "null dereference", "stack guard", "unmapped memory",
          "trusted kernel fault", "x87 state isolation", "SSE state isolation", "direction flag",
          "noncanonical return stack", "disabled SYSCALL entry", "disabled SYSENTER entry",
-         "blocking receive and timed sleep"]
+         "blocking receive and timed sleep", "writable storage and generation-safe handles"]
 
 
 def require(condition, message):
@@ -41,6 +41,288 @@ def records(output):
 
 def select(events, name, cell):
     return [fields for kind, fields in events if kind == name and fields["cell"] == cell]
+
+
+def verify_storage(events):
+    """Join application requests to independently observed service transfers and replies."""
+    payload = b"Zeal writable RAM storage."
+    generations = {}
+    unavailable = set()
+    indexed = []
+    roles = {"storage-block": 0, "storage-fs": 1, "storage-link": 1,
+             "storage-verified": 2, "storage-stale": 2, "storage-denied": 2,
+             "storage-checkpoint": 2, "storage-complete": 2, "storage-rebind": 2}
+    required = {"storage-block": ("request", "operation", "result"),
+                "storage-fs": ("request", "operation", "result"),
+                "storage-link": ("request", "block_request"),
+                "storage-verified": ("request", "data"),
+                "storage-stale": ("request", "handle"),
+                "storage-denied": ("request", "result"),
+                "storage-checkpoint": ("phase",), "storage-complete": (),
+                "storage-rebind": ("old", "endpoint"),
+                "storage-ipc": ("target", "cap", "operation", "length", "request",
+                                "handle", "offset", "result", "data"),
+                "storage-reject": ("target", "cap", "operation", "length", "request",
+                                   "handle", "offset", "result", "data", "outcome")}
+    for index, (name, fields) in enumerate(events):
+        if name == "boot":
+            generations[fields["cell"]] = fields["generation"]
+            unavailable.discard(fields["cell"])
+        elif name in ("fault", "exit", "quarantine"):
+            unavailable.add(fields["cell"])
+        if not name.startswith("storage-"):
+            continue
+        require(name in required and all(key in fields for key in
+                ("cell", "identity", "generation", "tick") + required[name]),
+                "storage trace has missing fields or an unknown event")
+        cell = fields.get("cell")
+        require(cell in (0, 1, 2, 3) and fields["identity"] == (cell + 1) * 100,
+                "storage trace contains an invalid cell identity")
+        require(cell not in unavailable and fields.get("generation") == generations.get(cell),
+                "storage event belongs to a stale service generation")
+        if name in roles:
+            require(cell == roles[name], "storage report came from the wrong cell")
+        elif name in ("storage-ipc", "storage-reject"):
+            op = fields.get("operation")
+            require((cell == 0 and op == 9) or (cell == 1 and op in (7, 8, 14)) or
+                    (cell == 2 and op in (10, 11, 12, 13)),
+                    "storage IPC came from the wrong cell or operation")
+            target = {0: 1, 1: 0 if op in (7, 8) else 2, 2: 1}[cell]
+            require(fields.get("target") == generations[target] * 256 + target + 1,
+                    "storage IPC targets a stale or unrelated endpoint")
+            require(name != "storage-ipc" or target not in unavailable,
+                    "storage IPC was accepted for an unavailable dependency")
+            require(fields.get("request", 0) > 0 and
+                    (10 <= fields.get("length", 0) <= 24 if op == 10 else fields.get("length") == 32),
+                    "storage IPC has a malformed request identity or extent")
+        indexed.append((index, name, fields))
+
+    def matches(name, cell=None, **values):
+        return [(i, f) for i, n, f in indexed if n == name and
+                (cell is None or f["cell"] == cell) and
+                all(f.get(k) == v for k, v in values.items())]
+
+    def unique(name, cell=None, **values):
+        found = matches(name, cell, **values)
+        require(len(found) == 1, f"missing or repeated {name} storage evidence")
+        return found[0]
+
+    app = matches("storage-ipc", 2)
+    require(len({f["request"] for _, f in app}) == len(app),
+            "application reused a storage request identity")
+    for request_at, request in app:
+        outcome_at, outcome = unique("storage-fs", 1, request=request["request"],
+                                      operation=request["operation"])
+        reply_at, reply = unique("storage-ipc", 1, request=request["request"], operation=14)
+        require(request_at < outcome_at < reply_at and outcome["result"] == reply["result"],
+                "filesystem result lacks its ordered application request and matching reply")
+    transfers = [(i, f) for i, f in matches("storage-ipc", 1) if f["operation"] in (7, 8)]
+    for fs_generation in (1, 2):
+        sequence = [f["request"] for _, f in transfers if f["generation"] == fs_generation]
+        require(sequence == list(range(1, len(sequence) + 1)),
+                "filesystem reused, skipped, or reordered a block request identity")
+    require(len(matches("storage-link", 1)) == len(transfers),
+            "block participation contains missing or unrelated request links")
+    for transfer_at, transfer in transfers:
+        link_at, link = unique("storage-link", 1, generation=transfer["generation"],
+                                block_request=transfer["request"])
+        request_at, request = unique("storage-ipc", 2, request=link["request"])
+        reply_at, reply = unique("storage-ipc", 1, operation=14, request=link["request"],
+                                  generation=transfer["generation"])
+        block_generation = transfer["target"] >> 8
+        applied_at, applied = unique("storage-block", 0, request=transfer["request"],
+                                      generation=block_generation, operation=transfer["operation"])
+        block_reply_at, block_reply = unique("storage-ipc", 0, operation=9, request=transfer["request"],
+                                              generation=block_generation)
+        require(request_at < link_at < transfer_at < applied_at < block_reply_at < reply_at and
+                transfer["offset"] == block_reply["offset"] and
+                transfer["result"] == applied["result"] == block_reply["result"] and
+                request["operation"] in (10, 11, 12),
+                "block transfer lacks a matched owning application operation and ordered outcome")
+    require(len(matches("storage-block", 0)) == len(matches("storage-ipc", 0)) == len(transfers),
+            "unrelated or counterfeit block operation appeared in storage evidence")
+    writes = [(i, f) for i, f in app if f["operation"] == 12 and
+              0 < unique("storage-ipc", 1, operation=14, request=f["request"])[1]["result"] <= 8]
+    successful_reads = [(i, f) for i, f in app if f["operation"] == 11 and
+                        matches("storage-verified", 2, request=f["request"])]
+    require(len(writes) == len(successful_reads) == 12,
+            "three complete multi-chunk writable file cycles were not observed")
+    expected_offsets = (0, 8, 16, 24)
+    cycle_bounds = []
+    cycle_handles = []
+    for cycle in range(3):
+        write_chunks = writes[cycle * 4:(cycle + 1) * 4]
+        read_chunks = successful_reads[cycle * 4:(cycle + 1) * 4]
+        require([f["offset"] for _, f in write_chunks] == list(expected_offsets) and
+                [f["offset"] for _, f in read_chunks] == list(expected_offsets),
+                "file chunks have missing, repeated, or reordered offsets")
+        fs_generation = 1 if cycle < 2 else 2
+        block_generation = 1 if cycle == 0 else 2
+        for is_read, chunks in ((False, write_chunks), (True, read_chunks)):
+            require(len({f["handle"] for _, f in chunks}) == 1,
+                    "one file operation changed handle between chunks")
+            for request_at, request in chunks:
+                identity = request["request"]
+                offset = request["offset"]
+                expected = payload[offset:offset + 8]
+                count = len(expected)
+                data = int.from_bytes(expected.ljust(8, b"\0"), "little")
+                require(request["result"] == count and (is_read or request["data"] == data),
+                        "application write bytes or chunk count differ from the known payload")
+                links = matches("storage-link", 1, request=identity, generation=fs_generation)
+                require(len(links) == 1, "file transfer lacks its unique block-service request link")
+                link_at, link = links[0]
+                block_id = link["block_request"]
+                block_at, block = unique("storage-ipc", 1, request=block_id,
+                                         generation=fs_generation, operation=7 if is_read else 8)
+                applied_at, applied = unique("storage-block", 0, request=block_id,
+                                               generation=block_generation,
+                                               operation=7 if is_read else 8)
+                block_reply_at, block_reply = unique("storage-ipc", 0, request=block_id,
+                                                       generation=block_generation, operation=9)
+                fs_at, fs = unique("storage-fs", 1, request=identity,
+                                    generation=fs_generation, operation=request["operation"])
+                reply_at, reply = unique("storage-ipc", 1, request=identity,
+                                          generation=fs_generation, operation=14)
+                require(request_at < link_at < block_at < applied_at < block_reply_at < fs_at < reply_at,
+                        "storage operation did not cross both services in the required order")
+                require(block["result"] == applied["result"] == block_reply["result"] ==
+                        fs["result"] == reply["result"] == count,
+                        "storage transfer has a counterfeit or failed operation result")
+                require(block["offset"] == block_reply["offset"] and
+                        reply["handle"] == request["handle"] and reply["offset"] == offset,
+                        "storage reply does not match the requested extent or handle")
+                if is_read:
+                    verified_at, verified = unique("storage-verified", 2, request=identity)
+                    require(reply_at < verified_at and
+                            block_reply["data"] == reply["data"] == verified["data"] == data,
+                            "application byte verification lacks matching block and filesystem data")
+                else:
+                    require(block["data"] == data,
+                            "filesystem did not send application write bytes to the block service")
+        write_handle = write_chunks[0][1]["handle"]
+        read_handle = read_chunks[0][1]["handle"]
+        require(write_handle != 0 and read_handle != 0 and write_handle != read_handle,
+                "close and reopen reused an old file handle")
+        opened = [(i, f) for i, f in matches("storage-ipc", 1, operation=14,
+                                              generation=fs_generation, handle=write_handle)
+                  if f["result"] == 0 and i < write_chunks[0][0] and
+                  matches("storage-ipc", 2, operation=10, request=f["request"])]
+        require(len(opened) == 1, "write handle lacks its successful file open")
+        open_request = unique("storage-ipc", 2, operation=10, request=opened[0][1]["request"])
+        zero_links = matches("storage-link", 1, generation=fs_generation,
+                              request=open_request[1]["request"])
+        # Fresh file slots are cleared through the isolated block service before publication.
+        require(len(zero_links) == 16, "file creation lacks complete private-slot initialization")
+        zero_offsets = []
+        for link_at, link in zero_links:
+            block_at, block = unique("storage-ipc", 1, operation=8,
+                                     generation=fs_generation, request=link["block_request"])
+            applied_at, applied = unique("storage-block", 0, operation=8,
+                                         generation=block_generation, request=link["block_request"])
+            block_reply_at, block_reply = unique("storage-ipc", 0, operation=9,
+                                                 generation=block_generation,
+                                                 request=link["block_request"])
+            require(open_request[0] < link_at < block_at < applied_at < block_reply_at < opened[0][0] and
+                    block["result"] == applied["result"] == block_reply["result"] == 8 and
+                    block["data"] == 0 and block["offset"] == block_reply["offset"],
+                    "file initialization did not apply zero bytes before opening")
+            zero_offsets.append(block["offset"])
+        require(zero_offsets == list(range(zero_offsets[0], zero_offsets[0] + 128, 8)),
+                "file slot initialization has missing or unrelated extents")
+        require(zero_offsets[0] in (128, 256, 384),
+                "file initialization changed the reserved hello extent")
+        for _, request in write_chunks + read_chunks:
+            _, link = unique("storage-link", 1, generation=fs_generation, request=request["request"])
+            _, block = unique("storage-ipc", 1, generation=fs_generation,
+                               request=link["block_request"],
+                               operation=7 if request["operation"] == 11 else 8)
+            require(block["offset"] == zero_offsets[0] + request["offset"],
+                    "file transfer reached an unrelated storage extent")
+        empty_at, empty = unique("storage-ipc", 2, operation=11, handle=write_handle,
+                                   offset=0, result=8)
+        empty_reply_at, empty_reply = unique("storage-ipc", 1, operation=14, request=empty["request"])
+        gap_at, gap = unique("storage-ipc", 2, operation=12, handle=write_handle, offset=1, result=1)
+        gap_reply_at, gap_reply = unique("storage-ipc", 1, operation=14, request=gap["request"])
+        require(opened[0][0] < empty_at < empty_reply_at < gap_at < gap_reply_at < write_chunks[0][0] and
+                empty_reply["result"] == empty_reply["data"] == 0 and
+                gap_reply["result"] == 0xffffffff and
+                not matches("storage-link", 1, request=gap["request"]),
+                "empty read or unsupported file gap had the wrong outcome")
+        closed_at, closed = unique("storage-ipc", 2, operation=13, handle=write_handle)
+        close_reply_at, close_reply = unique("storage-ipc", 1, operation=14,
+                                             generation=fs_generation, request=closed["request"])
+        reopened = [(i, f) for i, f in matches("storage-ipc", 1, operation=14,
+                                                generation=fs_generation, handle=read_handle)
+                    if f["result"] == 0 and i < read_chunks[0][0] and
+                    matches("storage-ipc", 2, operation=10, request=f["request"])]
+        require(len(reopened) == 1 and close_reply["result"] == 0 and
+                write_chunks[-1][0] < closed_at < close_reply_at < reopened[0][0] < read_chunks[0][0],
+                "application did not close and reopen before verified reads")
+        unique("storage-ipc", 2, operation=10, request=reopened[0][1]["request"])
+        final_at, _ = unique("storage-verified", 2, request=read_chunks[-1][1]["request"])
+        eof_at, eof = unique("storage-ipc", 2, operation=11, handle=read_handle,
+                              offset=len(payload), result=8)
+        eof_reply_at, eof_reply = unique("storage-ipc", 1, operation=14, request=eof["request"])
+        require(final_at < eof_at < eof_reply_at and eof_reply["result"] == eof_reply["data"] == 0,
+                "EOF did not return an empty chunk without reading unrelated storage")
+        for no_bytes_at, no_bytes, no_bytes_reply_at in ((empty_at, empty, empty_reply_at),
+                                                        (eof_at, eof, eof_reply_at)):
+            links = matches("storage-link", 1, request=no_bytes["request"])
+            require(len(links) <= 1, "empty file result issued repeated block operations")
+            for link_at, link in links:
+                block_at, block = unique("storage-ipc", 1, generation=fs_generation, operation=7,
+                                         request=link["block_request"])
+                applied_at, applied = unique("storage-block", 0, generation=block_generation, operation=7,
+                                             request=link["block_request"])
+                block_reply_at, block_reply = unique("storage-ipc", 0, generation=block_generation,
+                                                     operation=9, request=link["block_request"])
+                require(no_bytes_at < link_at < block_at < applied_at < block_reply_at < no_bytes_reply_at and
+                        block["result"] == applied["result"] == block_reply["result"] ==
+                        block_reply["data"] == 0 and
+                        block["offset"] == zero_offsets[0] + no_bytes["offset"],
+                        "empty file result read previously used storage bytes")
+        cycle_bounds.append((open_request[0], eof_reply_at))
+        cycle_handles.append(read_handle)
+
+    require(len(matches("storage-verified", 2)) == 12, "unexpected byte verification count")
+    checkpoints = matches("storage-checkpoint", 2)
+    require([f["phase"] for _, f in checkpoints] == [1, 2],
+            "storage recovery checkpoints are missing or repeated")
+    stale = matches("storage-stale", 2)
+    require(len(stale) == 2, "block and filesystem restart must each reject an old file handle")
+    for phase, service in enumerate((0, 1)):
+        checkpoint_at, checkpoint = checkpoints[phase]
+        fault = [(i, f) for i, (n, f) in enumerate(events) if n == "fault" and f["cell"] == service]
+        boot = [(i, f) for i, (n, f) in enumerate(events) if n == "boot" and f["cell"] == service and
+                f["generation"] == 2]
+        require(len(fault) == len(boot) == 1 and cycle_bounds[phase][1] < checkpoint_at <
+                fault[0][0] < boot[0][0] < stale[phase][0] < cycle_bounds[phase + 1][0] and
+                fault[0][1]["tick"] == checkpoint["tick"] + 2,
+                "dependency restart did not follow verified progress and precede resumed work")
+        stale_at, rejected = stale[phase]
+        request_at, request = unique("storage-ipc", 2, operation=11, request=rejected["request"])
+        reply_at, reply = unique("storage-ipc", 1, operation=14, request=rejected["request"])
+        outcome_at, outcome = unique("storage-fs", 1, operation=11, request=rejected["request"])
+        require(request_at < outcome_at < reply_at < stale_at and
+                request["handle"] == rejected["handle"] == cycle_handles[phase] and
+                outcome["result"] == reply["result"] == 0xfffffffd and
+                not matches("storage-link", 1, request=rejected["request"]),
+                "stale handle was accepted or reached private block storage")
+    denied_at, denied = unique("storage-denied", 2)
+    rejected_at, rejected = unique("storage-reject", 2, operation=12, request=denied["request"])
+    delegated = select(events, "cap-delegate", 1)
+    require(rejected["outcome"] == denied["result"] == 0xfffffffffffffffe and
+            len(delegated) == 1 and delegated[0]["cap"] == rejected["cap"] and
+            delegated[0]["rights"] == 4 and rejected_at < denied_at < cycle_bounds[0][0],
+            "read-only delegated authority did not reject a writable operation")
+    rebind_at, rebind = unique("storage-rebind", 2)
+    require(rebind["old"] == 0x102 and rebind["endpoint"] == 0x202 and
+            checkpoints[1][0] < rebind_at < stale[1][0],
+            "storage application did not rebind the filesystem generation")
+    complete_at, _ = unique("storage-complete", 2)
+    require(cycle_bounds[2][1] < complete_at,
+            "storage completion precedes verified resumed application progress")
 
 
 def verify_waits(events, standalone=False, demonstration=True):
@@ -176,7 +458,7 @@ def verify(output, code, scenario):
                 "kernel-fault negative control failed")
         return
     require(code == 1, f"unexpected emulator exit {code}")
-    require(output.count("ZEAL boot abi=2 x86_64") == 1, "kernel rebooted or never booted")
+    require(output.count("ZEAL boot abi=3 x86_64") == 1, "kernel rebooted or never booted")
     require(output.count("MANIFEST_ACCEPT version=1") == 1, "privileged manifest validation missing")
     require(output.count("RESEARCH_PASS") == 1, "missing unique research completion")
     require(f"RESEARCH_PASS scenario=0x{scenario:016x}" in output, "wrong boot configuration")
@@ -187,7 +469,7 @@ def verify(output, code, scenario):
     for cell, identity in expected_identities.items():
         for boot in select(events, "boot", cell):
             require(boot.get("identity") == identity, "boot identity differs from manifest")
-            require(boot.get("abi") == 2 and boot.get("entry") == 0x40000000,
+            require(boot.get("abi") == 3 and boot.get("entry") == 0x40000000,
                     "boot image contract differs from manifest")
     for cell in (0, 1):
         boots = select(events, "boot", cell)
@@ -250,7 +532,7 @@ def verify(output, code, scenario):
     reset_reports = select(events, "reset-memory", 3)
     require([r["generation"] for r in reset_reports] == [b["generation"] for b in boots],
             "cold boot did not clear prior stack memory")
-    if scenario in (7, 8, 15, 19):
+    if scenario in (7, 8, 15, 19, 20):
         contract = "wait-contract" if scenario == 19 else "contract"
         require(not faults and len(boots) == 1 and len(select(events, contract, 3)) == 1 and
                 len(select(events, "exit", 3)) == 1, "syscall probe did not exit cleanly")
@@ -273,6 +555,8 @@ def verify(output, code, scenario):
         if scenario == 3:
             require(all(0x40020000 <= f["address"] < 0x40024000 for f in faults),
                     "NX probe faulted outside its stack")
+    if scenario == 20:
+        verify_storage(events)
     if scenario == 19:
         verify_waits(events)
     else:
@@ -377,7 +661,7 @@ def main():
         label = "idle-supervisor-waits"
         output, code, duration = emulate(image, label)
         events = records(output)
-        require(code == 1 and output.count("ZEAL boot abi=2 x86_64") == 1 and
+        require(code == 1 and output.count("ZEAL boot abi=3 x86_64") == 1 and
                 output.count("MANIFEST_ACCEPT version=1") == 1 and
                 output.count("RESEARCH_PASS scenario=0x0000000000000013") == 1 and
                 not any(word in output for word in ("PANIC", "RESEARCH_FAIL", "bad-report")),

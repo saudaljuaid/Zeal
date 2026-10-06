@@ -9,12 +9,16 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXPECTED = {
-    "version": 2, "message_size": 48, "message_align": 8, "message_payload": 16,
+    "version": 3, "message_size": 48, "message_align": 8, "message_payload": 16,
     "boot_size": 24, "boot_generation": 8, "request_size": 24, "request_rights": 16,
     "info_size": 32, "info_parent": 24, "find": 7, "delegate": 8, "query": 9,
     "revoke": 10, "no_space": -7, "file_read_right": 4, "cap_ack_right": 32,
     "delegate_right": 0x80000000,
     "sleep": 11, "recv_wait": 12, "timeout": -8, "wait_max_ticks": 1000,
+    "operation_max": 14, "operation_rights": 0x3fff,
+    "block_read_right": 64, "block_write_right": 128, "block_reply_right": 256,
+    "file_open_right": 512, "file_chunk_read_right": 1024, "file_write_right": 2048,
+    "file_close_right": 4096, "file_result_right": 8192,
 }
 C_SOURCE = r'''#include <stddef.h>
 #include <stdio.h>
@@ -24,13 +28,19 @@ int main(void) {
          "\"boot_size\":%zu,\"boot_generation\":%zu,\"request_size\":%zu,\"request_rights\":%zu,"
          "\"info_size\":%zu,\"info_parent\":%zu,\"find\":%d,\"delegate\":%d,\"query\":%d,\"revoke\":%d,"
          "\"no_space\":%d,\"file_read_right\":%u,\"cap_ack_right\":%u,\"delegate_right\":%u,"
-         "\"sleep\":%d,\"recv_wait\":%d,\"timeout\":%d,\"wait_max_ticks\":%llu}\n",
+         "\"sleep\":%d,\"recv_wait\":%d,\"timeout\":%d,\"wait_max_ticks\":%llu,"
+         "\"operation_max\":%d,\"operation_rights\":%u,\"block_read_right\":%u,\"block_write_right\":%u,"
+         "\"block_reply_right\":%u,\"file_open_right\":%u,\"file_chunk_read_right\":%u,"
+         "\"file_write_right\":%u,\"file_close_right\":%u,\"file_result_right\":%u}\n",
          Z_ABI_VERSION, sizeof(struct z_message), _Alignof(struct z_message), offsetof(struct z_message, payload),
          sizeof(struct z_boot_info), offsetof(struct z_boot_info, generation), sizeof(struct z_cap_request),
          offsetof(struct z_cap_request, rights), sizeof(struct z_cap_info), offsetof(struct z_cap_info, parent),
          Z_CAP_FIND, Z_CAP_DELEGATE, Z_CAP_QUERY, Z_CAP_REVOKE, Z_NO_SPACE,
          Z_RIGHT(Z_FILE_READ), Z_RIGHT(Z_CAP_ACK), Z_RIGHT_DELEGATE,
-         Z_SLEEP, Z_RECV_WAIT, Z_TIMEOUT, (unsigned long long)Z_WAIT_MAX_TICKS);
+         Z_SLEEP, Z_RECV_WAIT, Z_TIMEOUT, (unsigned long long)Z_WAIT_MAX_TICKS,
+         Z_FILE_RESULT, Z_RIGHT_OPERATIONS, Z_RIGHT(Z_BLOCK_READ), Z_RIGHT(Z_BLOCK_WRITE),
+         Z_RIGHT(Z_BLOCK_REPLY), Z_RIGHT(Z_FILE_OPEN), Z_RIGHT(Z_FILE_CHUNK_READ),
+         Z_RIGHT(Z_FILE_WRITE), Z_RIGHT(Z_FILE_CLOSE), Z_RIGHT(Z_FILE_RESULT));
 }
 '''
 
@@ -42,6 +52,14 @@ class LanguageLayoutTests(unittest.TestCase):
                                ("Z_RECV_WAIT", "recv_wait"), ("Z_TIMEOUT", "timeout"),
                                ("Z_WAIT_MAX_TICKS", "wait_max_ticks")):
             match = re.search(rf"pub const {rust_name}: \w+ = (-?\d+);", source)
+            self.assertIsNotNone(match, rust_name)
+            self.assertEqual(int(match.group(1)), EXPECTED[key], rust_name)
+
+    def test_rust_storage_operation_constants_match(self):
+        source = (ROOT / "policy/lib.rs").read_text()
+        for rust_name, key in (("Z_OPERATION_MAX", "operation_max"),
+                               ("Z_RIGHT_OPERATIONS", "operation_rights")):
+            match = re.search(rf"pub const {rust_name}: \w+ = (\d+);", source)
             self.assertIsNotNone(match, rust_name)
             self.assertEqual(int(match.group(1)), EXPECTED[key], rust_name)
 

@@ -1,4 +1,8 @@
 #include <zeal/manifest.h>
+#include <zeal/abi.h>
+
+_Static_assert(Z_MANIFEST_ABI == Z_ABI_VERSION, "manifest cell ABI");
+_Static_assert(Z_MANIFEST_RIGHTS == Z_RIGHT_ALL, "manifest operation rights");
 
 static uint32_t read32(const uint8_t *bytes)
 {
@@ -166,7 +170,7 @@ bool z_manifest_validate(const void *data, size_t length,
         if (grant->flags)
             return fail(error, Z_MANIFEST_RESERVED_ERROR);
         if ((grant->rights & ~((uint32_t)Z_MANIFEST_RIGHTS)) ||
-            !(grant->rights & UINT32_C(0x3f)))
+            !(grant->rights & Z_RIGHT_OPERATIONS))
             return fail(error, Z_MANIFEST_RIGHTS_ERROR);
         for (unsigned j = 0; j < i; ++j)
             if (parsed.grants[j].holder == grant->holder &&

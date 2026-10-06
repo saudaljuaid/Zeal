@@ -17,9 +17,9 @@ static uint64_t injected_cap;
 static const uint64_t destination = Z_STACK_BASE + 4090;
 static const struct z_boot_grant initial[] = {
     { Z_BLOCK, Z_FS, Z_RIGHT(Z_READ_REPLY), 0 },
-    { Z_FS, Z_BLOCK, Z_RIGHT(Z_READ), 0 },
+    { Z_FS, Z_BLOCK, Z_RIGHT(Z_READ) | Z_RIGHT(Z_BLOCK_WRITE), 0 },
     { Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE, 0 },
-    { Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ), 0 },
+    { Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT(Z_FILE_WRITE), 0 },
     { Z_BLOCK, Z_BLOCK, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE, 0 },
     { Z_CLIENT, Z_CLIENT, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE, 0 },
     { Z_PROBE, Z_PROBE, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE, 0 },
@@ -276,6 +276,57 @@ static void cancellation_and_generation_ownership(void)
         assert(waits.entries[cell].kind == Z_WAIT_NONE && waits.entries[cell].deadline == 0);
 }
 
+static void interrupted_storage_preserves_unrelated_waits_and_memory(void)
+{
+    setup();
+    uint64_t file = cap(Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_WRITE));
+    uint64_t block = cap(Z_FS, Z_BLOCK, Z_RIGHT(Z_BLOCK_WRITE));
+    uint64_t unrelated = cap(Z_PROBE, Z_PROBE, Z_RIGHT(Z_FILE_READ));
+    bool blocked;
+    int result;
+    enum z_wake_reason reason;
+    assert(receive(Z_FS, 100, 7, &blocked) == Z_OK && blocked);
+    assert(z_wait_sleep(&waits, &broker, Z_PROBE, 100, 11) == Z_OK);
+    assert(send(Z_PROBE, Z_PROBE, unrelated, Z_FILE_READ, 201) == Z_OK);
+    struct z_wait_entry saved_wait = waits.entries[Z_PROBE];
+    struct z_queue saved_queue = broker.queues[Z_PROBE];
+    uint8_t *private_page = z_memory_page(&memory, Z_PROBE, 0);
+    private_page[31] = 0x96;
+    assert(send(Z_CLIENT, Z_FS, file, Z_FILE_WRITE, 202) == Z_OK);
+    /* A revoked queued write must never wake the filesystem receiver. */
+    assert(z_caps_revoke(&broker.capabilities, broker.policies,
+                         endpoint(Z_CLIENT), file) == Z_OK);
+    assert(poll(Z_FS, 101, &result, &reason) == Z_WAIT_PENDING);
+    assert(copies[Z_FS] == 0 && broker.queues[Z_FS].count == 0);
+    assert(send(Z_CLIENT, Z_FS, file, Z_FILE_WRITE, 203) == Z_STALE);
+    assert(poll(Z_FS, 107, &result, &reason) == Z_WAIT_DONE);
+    assert(result == Z_TIMEOUT && reason == Z_WAKE_TIMEOUT);
+    /* Block death drops the accepted downstream request, while its waiter
+     * remains finite and independent cells retain their state. */
+    assert(send(Z_FS, Z_BLOCK, block, Z_BLOCK_WRITE, 204) == Z_OK);
+    assert(receive(Z_FS, 108, 5, &blocked) == Z_OK && blocked);
+    z_broker_revoke(&broker, Z_BLOCK);
+    z_policy_fault(&broker.policies[Z_BLOCK], 108);
+    assert(broker.queues[Z_BLOCK].count == 0);
+    assert(poll(Z_FS, 112, &result, &reason) == Z_WAIT_PENDING);
+    assert(poll(Z_FS, 113, &result, &reason) == Z_WAIT_DONE && result == Z_TIMEOUT);
+    assert(memcmp(&saved_wait, &waits.entries[Z_PROBE], sizeof(saved_wait)) == 0);
+    assert(memcmp(&saved_queue, &broker.queues[Z_PROBE], sizeof(saved_queue)) == 0);
+    assert(private_page[31] == 0x96);
+    assert(z_broker_query(&broker, Z_PROBE, unrelated, &(struct z_cap_info){0}) == Z_OK);
+    assert(z_policy_poll(&broker.policies[Z_BLOCK], 112) == 1);
+    assert(z_broker_refresh(&broker) == Z_OK);
+    assert(z_memory_reset(&memory, Z_BLOCK));
+    assert(send(Z_FS, Z_BLOCK, block, Z_BLOCK_WRITE, 205) == Z_STALE);
+    uint64_t rebound = cap(Z_FS, Z_BLOCK, Z_RIGHT(Z_BLOCK_WRITE));
+    assert(rebound != block && send(Z_FS, Z_BLOCK, rebound, Z_BLOCK_WRITE, 206) == Z_OK);
+    assert(receive(Z_BLOCK, 114, 0, &blocked) == Z_OK && !blocked);
+    assert(output_marker(Z_BLOCK) == 206);
+    assert(poll(Z_PROBE, 114, &result, &reason) == Z_WAIT_DONE && reason == Z_WAKE_SLEEP);
+    assert(receive(Z_PROBE, 114, 0, &blocked) == Z_OK && output_marker(Z_PROBE) == 201);
+    assert(private_page[31] == 0x96 && z_memory_check(&memory));
+}
+
 static void invalid_buffers_and_deferred_copy_failure(void)
 {
     setup();
@@ -477,6 +528,7 @@ int main(void)
     enqueue_transitions_and_timeout_order();
     revocation_and_valid_fifo();
     cancellation_and_generation_ownership();
+    interrupted_storage_preserves_unrelated_waits_and_memory();
     invalid_buffers_and_deferred_copy_failure();
     idle_and_fair_selection();
     generated_model();

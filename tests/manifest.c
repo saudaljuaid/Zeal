@@ -31,7 +31,7 @@ static void base_manifest(void)
     put32(8, BASE_SIZE); put32(12, 4); put32(16, 5); artifact_length = BASE_SIZE;
     for (unsigned i = 0; i < 4; ++i) {
         size_t at = 32 + i * 64;
-        put32(at, 100 + i * 100); put32(at + 4, i + 1); put32(at + 8, 2);
+        put32(at, 100 + i * 100); put32(at + 4, i + 1); put32(at + 8, Z_ABI_VERSION);
         put32(at + 12, Z_MANIFEST_ACTIVE); put64(at + 16, Z_IMAGE_BASE);
         put32(at + 24, 65536); put32(at + 28, 16384); put32(at + 32, 81920);
         put32(at + 36, 0); put32(at + 40, 3); put32(at + 44, 4);
@@ -85,14 +85,15 @@ static void cell_field_boundaries(void)
     const size_t cell = 32;
     reject_at(cell, 0); reject_at(cell, 200); /* duplicate stable identity */
     reject_at(cell + 4, 99); /* unknown image */
-    reject_at(cell + 8, 1); reject_at(cell + 8, UINT32_MAX);
+    reject_at(cell + 8, 1); reject_at(cell + 8, 2); reject_at(cell + 8, UINT32_MAX);
     reject_at(cell + 12, 2); reject_at(cell + 12, UINT32_MAX);
     base_manifest(); put64(cell + 16, Z_IMAGE_BASE + 1); assert(!validate());
     base_manifest(); put64(cell + 16, UINT64_MAX); assert(!validate());
     reject_at(cell + 24, 0); reject_at(cell + 24, 63); reject_at(cell + 24, UINT32_MAX);
     reject_at(cell + 28, 0); reject_at(cell + 28, 4095); reject_at(cell + 28, 16385);
     reject_at(cell + 32, 0); reject_at(cell + 32, 4095); reject_at(cell + 32, 81921);
-    reject_at(cell + 36, 20); reject_at(cell + 40, 2); reject_at(cell + 44, UINT32_MAX);
+    reject_at(cell + 36, 21); reject_at(cell + 40, 2); reject_at(cell + 44, UINT32_MAX);
+    base_manifest(); put32(cell + 36, 20); assert(validate());
     base_manifest(); artifact[cell + 48] = 0; assert(!validate());
     base_manifest(); artifact[cell + 48] = 'x'; artifact[cell + 49] = 0; artifact[cell + 50] = 'y'; assert(!validate());
     base_manifest(); memset(&artifact[cell + 48], 'a', 16); assert(!validate());
@@ -106,7 +107,11 @@ static void grant_and_catalog_boundaries(void)
 {
     const size_t grant = 32 + 4 * 64;
     reject_at(grant, 999); reject_at(grant + 4, 999);
-    reject_at(grant + 8, 0); reject_at(grant + 8, 0x40); reject_at(grant + 8, UINT32_MAX);
+    reject_at(grant + 8, 0); reject_at(grant + 8, 0x4000); reject_at(grant + 8, UINT32_MAX);
+    reject_at(grant + 8, Z_RIGHT_DELEGATE);
+    for (unsigned operation = Z_BLOCK_READ; operation <= Z_FILE_RESULT; ++operation) {
+        base_manifest(); put32(grant + 8, Z_RIGHT(operation)); assert(validate());
+    }
     reject_at(grant + 12, 1);
     base_manifest(); put32(grant + 16, 100); put32(grant + 20, 200); assert(!validate());
     base_manifest(); catalog[0].entry++; assert(!validate());

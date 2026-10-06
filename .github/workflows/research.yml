@@ -29,4 +29,5 @@ jobs:
             build/research/**/*.log
             build/research/results.json
             build/default/zeal.img
+            build/research/scenario-20/zeal.img
           if-no-files-found: warn

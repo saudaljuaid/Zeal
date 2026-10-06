@@ -19,7 +19,7 @@ static uint64_t principal(const struct z_broker *broker, unsigned cell)
 
 static uint32_t operation_right(uint32_t operation)
 {
-    return operation >= Z_READ && operation <= Z_CAP_ACK ? Z_RIGHT(operation) : 0;
+    return operation >= Z_READ && operation <= Z_FILE_RESULT ? Z_RIGHT(operation) : 0;
 }
 
 static bool delivery_valid(const struct z_broker *broker,

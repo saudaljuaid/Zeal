@@ -4,8 +4,10 @@ use core::ptr;
 
 mod capability;
 
-// Additive syscall ABI v2 constants shared with C and isolated Zig cells.
-pub const Z_ABI_VERSION: u32 = 2;
+// ABI v3 extends isolated storage operation rights; syscall layouts are fixed.
+pub const Z_ABI_VERSION: u32 = 3;
+pub const Z_OPERATION_MAX: u32 = 14;
+pub const Z_RIGHT_OPERATIONS: u32 = 16383;
 pub const Z_SLEEP: u64 = 11;
 pub const Z_RECV_WAIT: u64 = 12;
 pub const Z_TIMEOUT: i64 = -8;
@@ -244,7 +246,8 @@ mod tests {
     #[test]
     fn c_abi_layout_is_fixed() {
         assert_eq!((Z_ABI_VERSION, Z_SLEEP, Z_RECV_WAIT, Z_TIMEOUT, Z_WAIT_MAX_TICKS),
-                   (2, 11, 12, -8, 1000));
+                   (3, 11, 12, -8, 1000));
+        assert_eq!(Z_RIGHT_OPERATIONS, (1 << Z_OPERATION_MAX) - 1);
         assert_eq!(size_of::<State>(), 32);
         assert_eq!(align_of::<State>(), 8);
         assert_eq!(offset_of!(State, generation), 0);

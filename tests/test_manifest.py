@@ -49,6 +49,11 @@ class ManifestCompilerTests(unittest.TestCase):
         self.assertEqual(configs, [0, 0, 19, 19])
         self.assertEqual(manifest.struct.unpack_from("<IIII", waiting, 32 + 4 * 64 + 5 * 16),
                          (300, 400, 16, 0))
+        storage = self.compile(scenario=20)
+        configs = [manifest.struct.unpack_from("<I", storage, 32 + n * 64 + 36)[0] for n in range(4)]
+        self.assertEqual(configs, [20, 20, 20, 20])
+        self.assertEqual([manifest.struct.unpack_from("<I", storage, 32 + n * 64 + 8)[0]
+                          for n in range(4)], [3] * 4)
 
     def test_rejects_bad_versions_ids_names_images_entries_and_widths(self):
         for old, new in (("version = 1", "version = 2"),
@@ -57,7 +62,7 @@ class ManifestCompilerTests(unittest.TestCase):
                          ('name = "block"', 'name = "invalid name"'),
                          ("image = 4", "image = 99"),
                          ("entry = 0x40000000", "entry = 18446744073709551616"),
-                         ("abi = 2", "abi = 4294967296")):
+                         ("abi = 3", "abi = 4294967296"), ("abi = 3", "abi = 2")):
             with self.subTest(old=old, new=new):
                 self.rejects(self.text.replace(old, new, 1))
 
@@ -67,8 +72,8 @@ class ManifestCompilerTests(unittest.TestCase):
             ("writable_budget = 81920", "writable_budget = 81921"),
             ("restart_limit = 3", "restart_limit = 4"),
             ("restart_delay = 4", "restart_delay = 0"),
-            ('rights = ["read_reply"]', 'rights = []'),
-            ('rights = ["read_reply"]', 'rights = ["read_reply", "read_reply"]'),
+            ('rights = ["read_reply", "block_reply"]', 'rights = []'),
+            ('rights = ["read_reply", "block_reply"]', 'rights = ["read_reply", "read_reply"]'),
             ("target = 200", "target = 999"),
             ("holder = 100", "holder = 0"),
         )
@@ -80,9 +85,21 @@ class ManifestCompilerTests(unittest.TestCase):
         self.images[0].write_bytes(b"x" * 65537)
         with self.assertRaises(ValueError):
             self.compile()
-        for kwargs in ({"scenario": 20}, {"solo": 4}):
+        for kwargs in ({"scenario": 21}, {"solo": 4}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.compile(**kwargs)
+
+    def test_storage_rights_are_explicit_and_delegation_remains_read_only(self):
+        artifact = self.compile()
+        rights = [manifest.struct.unpack_from("<I", artifact, 32 + 4 * 64 + n * 16 + 8)[0]
+                  for n in range(6)]
+        self.assertEqual(rights, [2 | 256, 1 | 64 | 128, 4 | 0x80000000,
+                                  8 | 16 | 8192, 4 | 32 | 512 | 1024 | 2048 | 4096, 16])
+        self.rejects(self.text.replace('"block_write"', '"unknown_write"'))
+        self.rejects(self.text.replace('"file_write"', '"file_open"'))
+        names = manifest.operation_rights(0x80003fff)
+        self.assertEqual(names["file_result"], 8192)
+        self.assertEqual(names["delegate"], 0x80000000)
 
 
 if __name__ == "__main__":

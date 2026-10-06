@@ -4,7 +4,7 @@ version = 1
 identity = 100
 name = "block"
 image = 1
-abi = 2
+abi = 3
 entry = 0x40000000
 image_budget = 65536
 stack_budget = 16384
@@ -17,7 +17,7 @@ restart_delay = 4
 identity = 200
 name = "filesystem"
 image = 2
-abi = 2
+abi = 3
 entry = 0x40000000
 image_budget = 65536
 stack_budget = 16384
@@ -30,7 +30,7 @@ restart_delay = 4
 identity = 300
 name = "client"
 image = 3
-abi = 2
+abi = 3
 entry = 0x40000000
 image_budget = 65536
 stack_budget = 16384
@@ -43,7 +43,7 @@ restart_delay = 4
 identity = 400
 name = "probe"
 image = 4
-abi = 2
+abi = 3
 entry = 0x40000000
 image_budget = 65536
 stack_budget = 16384
@@ -55,12 +55,12 @@ restart_delay = 4
 [[grant]]
 holder = 100
 target = 200
-rights = ["read_reply"]
+rights = ["read_reply", "block_reply"]
 
 [[grant]]
 holder = 200
 target = 100
-rights = ["read"]
+rights = ["read", "block_read", "block_write"]
 
 [[grant]]
 holder = 200
@@ -70,12 +70,12 @@ rights = ["file_read", "delegate"]
 [[grant]]
 holder = 200
 target = 300
-rights = ["file_reply", "cap_offer"]
+rights = ["file_reply", "cap_offer", "file_result"]
 
 [[grant]]
 holder = 300
 target = 200
-rights = ["file_read", "cap_ack"]
+rights = ["file_read", "cap_ack", "file_open", "file_chunk_read", "file_write", "file_close"]
 
 [[grant]]
 holder = 300

@@ -4,7 +4,8 @@ pub const stack_base: usize = 0x40020000;
 pub const stack_size: usize = 0x4000;
 pub const memory_base: usize = 0x40030000;
 pub const payload_size = 32;
-pub const version = 2;
+pub const version = 3;
+pub const operation_rights: u32 = 0x3fff;
 pub const wait_max_ticks: u64 = 1000;
 pub const delegate_right: u32 = 1 << 31;
 
@@ -21,7 +22,11 @@ pub const Error = enum(i64) {
     no_space = -7,
     timeout = -8,
 };
-pub const Operation = enum(u32) { read = 1, read_reply, file_read, file_reply, cap_offer, cap_ack };
+pub const Operation = enum(u32) {
+    read = 1, read_reply, file_read, file_reply, cap_offer, cap_ack,
+    block_read, block_write, block_reply, file_open,
+    file_chunk_read, file_write, file_close, file_result,
+};
 
 pub fn right(operation: Operation) u32 {
     return @as(u32, 1) << @intCast(@intFromEnum(operation) - 1);
@@ -66,6 +71,9 @@ pub const CapabilityInfo = extern struct {
 };
 
 comptime {
+    if (version != 3 or @intFromEnum(Operation.file_result) != 14 or
+        operation_rights != (right(.file_result) << 1) - 1)
+        @compileError("storage operation ABI differs from include/zeal/abi.h");
     if (@intFromEnum(Call.sleep) != 11 or @intFromEnum(Call.recv_wait) != 12 or
         @intFromEnum(Error.timeout) != -8 or wait_max_ticks != 1000)
         @compileError("wait ABI differs from include/zeal/abi.h");

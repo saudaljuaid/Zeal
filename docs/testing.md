@@ -1,4 +1,4 @@
-# Research validation
+# Validation
 
 Run `make test`. The command uses bounded subprocess timeouts, fails if any
 layer fails, preserves emulator serial traces, and writes a machine-readable
@@ -42,8 +42,25 @@ and page rounding. Build-compiler tests independently reject malformed source
 records and overlarge images. C and Zig emit their ABI layouts for direct
 comparison; Rust validates its policy FFI layouts. Zig protocol tests check
 message authentication, malformed lengths, backpressure, rebinding, and
-deterministic storage-chain recovery. Artifact tests reject malformed boot
-sectors, corrupt ELF headers, writable cell segments, and out-of-bounds images.
+deterministic storage-chain recovery. Direct Zig tests exercise the production
+storage, handle, and wire core: empty files, EOF, exact limits, overwrite,
+contiguous growth, unsupported gaps, unrelated-file preservation, malformed
+requests, arithmetic overflow, file/handle/storage exhaustion, owner and
+endpoint generations, forged/closed/stale handles, slot reuse, terminal
+counter exhaustion, full 128-byte multi-chunk close/reopen readback, and
+filesystem/block reset behavior. Two independent deterministic models each
+run 4,096 generated operations: one models bytes and lengths, the other owners,
+handle slots, serials, closes, and dependency changes.
+
+Seven direct tests for the shared production transport state cover bounded
+FIFO inbox preservation, four-attempt enqueue backpressure, no retransmission
+after enqueue, lost replies, fresh request identities after timeout, interrupted
+requests, dependency rebind, unrelated-traffic receive exhaustion, strict
+handle/offset/count reply matching, and terminal identity exhaustion. Storage
+rights and revocation also exercise the affected production C IPC and deferred
+receive paths under the existing sanitizers. Artifact tests reject malformed
+boot sectors, corrupt ELF headers, writable cell segments, and out-of-bounds
+images.
 
 ## Emulator checks
 
@@ -55,6 +72,17 @@ delegation, forbidden-operation denial, revocation, stale-handle rejection,
 rebind, resumed verified reads, restart delays, quarantine, and unchanged
 application memory. The demo restarts both the RAM block service and the
 filesystem while the application remains in its original generation.
+
+Scenario 20 verifies three writable `/note` round trips with the 26-byte
+`Zeal writable RAM storage.` payload, across the initial boot, a block restart,
+and a filesystem restart. Each round trip checks empty EOF, rejects a gap,
+writes four bounded chunks, closes and reopens, and verifies returned bytes.
+The oracle joins application requests to filesystem transfer identities,
+actual block reads/writes, ordered replies, and application byte-verification
+events. It requires both services' participation, matching offsets and counts,
+new generation bindings, stale-handle rejection before raw storage access,
+a denied write under delegated read authority, and resumed verified progress.
+The expected QEMU exit status is required alongside this evidence.
 
 Scenario 19 verifies that an empty-queue receiver suspends while another cell
 completes a verified file read, then wakes for an application message with the
@@ -80,8 +108,10 @@ events, forged generations, altered rights, missing app reads, counterfeit
 recovery, incorrect emulator exits, missing or counterfeit wakeups, altered
 deadlines, early timeout/sleep completion, stale-generation delivery, missing
 wait cancellation, counterfeit application progress, and missing or forged
-idle timer wakes. Emulator logs and `results.json` remain available under
-`build/research/`.
+idle timer wakes. Storage negative controls remove or counterfeit block writes,
+reads, transfer links, verified bytes, offsets, outcomes, handle generations,
+stale-handle rejection, recovery, and emulator exit status. Emulator logs and
+`results.json` remain available under `build/research/`.
 
 These tests do not establish real-hardware correctness, DMA containment,
 NVMe reset safety, SMP correctness, persistent-data integrity, extended CPU

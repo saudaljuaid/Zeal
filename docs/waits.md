@@ -6,7 +6,8 @@ It does not add an unbounded wait or a general-purpose scheduler framework.
 
 ## Syscall contract
 
-ABI v2 retains all existing calls and layouts and adds two call numbers. The
+ABI v2 introduced two additive call numbers; ABI v3 retains these calls and
+layouts while extending storage operation rights. The
 `int 0x80` calling convention uses `rax` for the call number and signed result,
 `rdi` for the first argument, and `rsi` for the second. C, Rust, and Zig declare
 the same call numbers, bounds, and results; compiled layout checks compare
@@ -102,7 +103,7 @@ and restarting cells retain their separate states.
 
 ## Demonstration and evidence
 
-The RAM block and immutable filesystem services use finite blocking receive.
+The RAM block and bounded filesystem services use finite blocking receive.
 QEMU scenario 19 arms a probe receive on an empty queue, verifies application
 reads while it waits, delivers a later application message, then checks a
 zero-timeout receive, a two-tick timeout, and a three-tick sleep. Service

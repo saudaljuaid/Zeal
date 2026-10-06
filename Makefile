@@ -115,6 +115,7 @@ test-host: $(COMMON)/policy-tests $(COMMON)/ipc-tests $(COMMON)/wait-tests $(COM
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/memory-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/manifest-tests
 	timeout 60s $(ZIG) test cells/protocol.zig
+	timeout 60s $(ZIG) test cells/storage_transport.zig
 	timeout 60s $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 test-qemu: all
 	timeout 900s $(PYTHON) tests/research.py

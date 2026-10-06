@@ -6,11 +6,12 @@
 
 static struct z_broker broker;
 static const struct z_boot_grant initial[] = {
-    { Z_BLOCK, Z_FS, Z_RIGHT(Z_READ_REPLY), 0 },
-    { Z_FS, Z_BLOCK, Z_RIGHT(Z_READ), 0 },
+    { Z_BLOCK, Z_FS, Z_RIGHT(Z_READ_REPLY) | Z_RIGHT(Z_BLOCK_REPLY), 0 },
+    { Z_FS, Z_BLOCK, Z_RIGHT(Z_READ) | Z_RIGHT(Z_BLOCK_READ) | Z_RIGHT(Z_BLOCK_WRITE), 0 },
     { Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE, 0 },
-    { Z_FS, Z_CLIENT, Z_RIGHT(Z_FILE_REPLY) | Z_RIGHT(Z_CAP_OFFER), 0 },
-    { Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT(Z_CAP_ACK), 0 },
+    { Z_FS, Z_CLIENT, Z_RIGHT(Z_FILE_REPLY) | Z_RIGHT(Z_CAP_OFFER) | Z_RIGHT(Z_FILE_RESULT), 0 },
+    { Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT(Z_CAP_ACK) | Z_RIGHT(Z_FILE_OPEN) |
+        Z_RIGHT(Z_FILE_CHUNK_READ) | Z_RIGHT(Z_FILE_WRITE) | Z_RIGHT(Z_FILE_CLOSE), 0 },
 };
 
 static uint64_t endpoint(unsigned cell)
@@ -157,6 +158,78 @@ static void capability_table_pressure_is_atomic(void)
     assert(z_broker_delegate(&broker, Z_FS, parent, holder, Z_RIGHT(Z_FILE_READ)) == Z_NO_SPACE);
 }
 
+static void storage_rights_are_per_operation(void)
+{
+    setup();
+    uint64_t parent = grant(Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+    int64_t delegated = z_broker_delegate(&broker, Z_FS, parent,
+                                          endpoint(Z_CLIENT), Z_RIGHT(Z_FILE_READ));
+    assert(delegated > 0);
+    struct z_broker before = broker;
+    for (unsigned operation = Z_BLOCK_READ; operation <= Z_FILE_RESULT; ++operation) {
+        struct z_message input = message(operation, operation);
+        assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS),
+                             (uint64_t)delegated, &input) == Z_DENIED);
+        assert(memcmp(&broker, &before, sizeof(broker)) == 0);
+    }
+    assert(z_broker_delegate(&broker, Z_FS, parent, endpoint(Z_CLIENT),
+                             Z_RIGHT(Z_FILE_WRITE)) == Z_DENIED);
+    assert(z_broker_find(&broker, Z_CLIENT, endpoint(Z_BLOCK),
+                         Z_RIGHT(Z_BLOCK_WRITE)) == Z_DENIED);
+    uint64_t file = grant(Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_WRITE));
+    uint64_t block = grant(Z_FS, Z_BLOCK, Z_RIGHT(Z_BLOCK_WRITE));
+    struct z_message write = message(Z_FILE_WRITE, 31);
+    assert(z_broker_send(&broker, Z_PROBE, endpoint(Z_FS), file, &write) == Z_DENIED);
+    write.operation = Z_BLOCK_WRITE;
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_BLOCK), file, &write) == Z_DENIED);
+    assert(z_broker_send(&broker, Z_FS, endpoint(Z_BLOCK), block, &write) == Z_OK);
+    struct z_message output;
+    assert(z_broker_receive(&broker, Z_BLOCK, &output) == Z_OK);
+    assert(output.operation == Z_BLOCK_WRITE && output.sender == endpoint(Z_FS));
+    for (unsigned operation = Z_FILE_OPEN; operation <= Z_FILE_CLOSE; ++operation) {
+        write = message(operation, operation);
+        assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), file, &write) == Z_OK);
+        assert(z_broker_receive(&broker, Z_FS, &output) == Z_OK);
+        assert(output.operation == operation && output.sender == endpoint(Z_CLIENT));
+    }
+    write = message(Z_FILE_RESULT, 1);
+    uint64_t reply = grant(Z_FS, Z_CLIENT, Z_RIGHT(Z_FILE_RESULT));
+    assert(z_broker_send(&broker, Z_FS, endpoint(Z_CLIENT), reply, &write) == Z_OK);
+    assert(z_broker_receive(&broker, Z_CLIENT, &output) == Z_OK);
+    for (unsigned operation = 0; operation <= Z_FILE_RESULT + 1; operation += Z_FILE_RESULT + 1) {
+        write = message(operation, 1);
+        assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), file, &write) == Z_INVALID);
+    }
+}
+
+static void revoked_storage_is_revalidated_at_delivery(void)
+{
+    setup();
+    uint64_t file = grant(Z_CLIENT, Z_FS, Z_RIGHT(Z_FILE_WRITE));
+    uint64_t block = grant(Z_FS, Z_BLOCK, Z_RIGHT(Z_BLOCK_WRITE));
+    uint64_t reply = grant(Z_BLOCK, Z_FS, Z_RIGHT(Z_BLOCK_REPLY));
+    struct z_message write = message(Z_FILE_WRITE, 100);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), file, &write) == Z_OK);
+    write = message(Z_BLOCK_WRITE, 101);
+    assert(z_broker_send(&broker, Z_FS, endpoint(Z_BLOCK), block, &write) == Z_OK);
+    write = message(Z_BLOCK_REPLY, 102);
+    assert(z_broker_send(&broker, Z_BLOCK, endpoint(Z_FS), reply, &write) == Z_OK);
+    struct z_queue saved = broker.queues[Z_BLOCK];
+    struct z_policy_state probe = broker.policies[Z_PROBE];
+    /* Exercise lazy revalidation independently of eager broker compaction. */
+    assert(z_caps_revoke(&broker.capabilities, broker.policies,
+                         endpoint(Z_CLIENT), file) == Z_OK);
+    struct z_message output;
+    assert(z_broker_receive(&broker, Z_FS, &output) == Z_OK);
+    assert(output.operation == Z_BLOCK_REPLY && output.sender == endpoint(Z_BLOCK));
+    assert(z_broker_receive(&broker, Z_FS, &output) == Z_AGAIN);
+    assert(memcmp(&saved, &broker.queues[Z_BLOCK], sizeof(saved)) == 0);
+    assert(memcmp(&probe, &broker.policies[Z_PROBE], sizeof(probe)) == 0);
+    assert(z_broker_query(&broker, Z_FS, block, &(struct z_cap_info){0}) == Z_OK);
+    write = message(Z_FILE_WRITE, 103);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), file, &write) == Z_STALE);
+}
+
 static uint32_t rng = 0x6d2b79f5;
 static uint32_t random_next(void)
 {
@@ -219,7 +292,9 @@ int main(void)
     queued_revocation_preserves_unrelated_work();
     restart_reissues_only_fresh_roots();
     capability_table_pressure_is_atomic();
+    storage_rights_are_per_operation();
+    revoked_storage_is_revalidated_at_delivery();
     generated_transitions();
-    puts("C IPC: bounded queues, capabilities, delegation, revocation, restart, seed=0x6d2b79f5, 50000 steps PASS");
+    puts("C IPC: bounded queues, per-operation storage rights, write denial/revocation/delivery checks, delegation, restart, seed=0x6d2b79f5, 50000 steps PASS");
     return 0;
 }
