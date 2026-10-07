@@ -23,6 +23,19 @@ struct z_broker {
     struct z_queue queues[Z_CELL_COUNT];
 };
 
+/* Privileged static-grant recovery state. This is not a syscall or a runtime
+ * channel entitlement. Missing root grants retry at most once per four ticks;
+ * an unrepresentable retry or exhausted pending epoch batch closes recovery. */
+#define Z_REFRESH_RETRY_TICKS UINT64_C(4)
+struct z_refresh_state {
+    uint64_t deadline;
+    uint32_t pending, closed;
+};
+_Static_assert(sizeof(struct z_refresh_state) == 16, "bounded root grant refresh state");
+void z_broker_refresh_state_init(struct z_refresh_state *state);
+int z_broker_refresh_bounded(struct z_broker *broker, struct z_refresh_state *state,
+                              uint64_t now, bool changed);
+
 void z_broker_init(struct z_broker *broker);
 int z_broker_configure(struct z_broker *broker, const struct z_boot_grant *grants,
                        unsigned count);

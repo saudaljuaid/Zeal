@@ -3,28 +3,31 @@
 Zeal is an operating system under development. Its long-term unit of
 composition is a sealed system called a cell. A cell has an immutable boot
 image, private memory, a lifecycle, and explicit
-communication authority. This milestone implements manifest-configured leaf
-cells. A cell cannot host child systems yet, so this is not recursive
-supervision.
+communication authority. Manifest roots can supervise approved runtime cells
+through bounded ring-3 management operations. The implemented hierarchy is
+root → child supervisor → grandchild worker, with four globally available
+runtime child slots. All cells execute under one privileged supervisor and one
+global scheduler. See [hosting policy](hosting-policy.md),
+[management ABI](hosting-abi.md), and [application protocol](hosting-apps.md).
 
 | Layer | Implementation | Responsibility |
 | --- | --- | --- |
 | Boot and traps | Assembly | BIOS loading, long mode, register capture, privilege return |
-| Supervisor | C | Address spaces, allocation, scheduling, checked copies, IPC |
-| Policy | Rust, `no_std` | Lifecycle state, capabilities, delegation, revocation |
-| Cells | Zig | Writable RAM block service, bounded filesystem, application, probes |
+| Supervisor | C | Address spaces, allocation, scheduling, checked copies, IPC, atomic lifecycle orchestration |
+| Policy | Rust, `no_std` | Lifecycle, hierarchy, generation, resource accounting, capabilities and authority |
+| Cells | Zig | Writable RAM block service, bounded filesystem, applications, supervisor/worker and probes |
 
 ## Manifest and image validation
 
 `cells/manifest.toml` is the human-edited source. `tools/manifest.py` compiles
-it into a fixed-width, little-endian v1 artifact. The field schema and bounded
+it into a fixed-width, little-endian v2 artifact. The field schema and bounded
 limits are declared once in `include/zeal/manifest_schema.def`; the compiler
 reads those record declarations when constructing the artifact. The kernel
 validates the artifact again with `kernel/manifest.c` before it creates any
 cell address space. There is no general parser in the kernel.
 
-The 32-byte header contains magic `0x4c41455a`, version, exact total size, cell
-and grant counts, and zeroed reserved words. Each 64-byte cell record contains
+The 40-byte header contains magic `0x4c41455a`, version, exact total size, cell
+and grant counts, template/domain counts, and zeroed reserved words. Each 64-byte cell record contains
 a nonzero stable identity, diagnostic name, image identity, ABI version, entry,
 image/stack/writable budgets, boot configuration, restart limit/delay, and
 active flag. Each 16-byte grant names a holder identity, target identity,
@@ -40,8 +43,10 @@ and duplicate holder/target grant pairs. Arithmetic is bounded before record
 offsets are calculated. The build compiler applies the same explicit limits,
 and the privileged validator treats every boot byte as untrusted.
 
-The schema supports at most four cells, 16 initial grants, and a 544-byte boot
-artifact. Images are at most 65,536 bytes and must have the sealed entry at
+The schema supports four manifest roots, 16 initial grants, eight approved
+templates, eight root domain records, and a 1320-byte maximum boot artifact.
+Templates are sealed creation configurations, separate from live runtime records;
+only identity 400 has a creation domain in the hosting configurations. Images are at most 65,536 bytes and must have the sealed entry at
 `0x40000000`. The default
 block → filesystem → client chain, fault probes, and standalone boots all use
 this artifact. A standalone build changes active flags in the compiled
@@ -72,15 +77,16 @@ Consequently the mapped total may exceed the byte budget by less than one page
 for each separately rounded region. Rounding is checked against both the
 per-cell and global page limits.
 
-The fixed private page pool has 80 pages (320 KiB), up to 20 pages per cell.
-The default four cells use the full 80 pages: 16 KiB stack plus 64 KiB heap
-each. Supported stack budgets are 4–16 KiB; heap budgets are 0–64 KiB; total
+The fixed private page pool has 128 pages (512 KiB), up to 20 pages per cell.
+The four roots retain their original 80-page allocation: 16 KiB stack plus 64 KiB heap
+each. At most 48 additional pages can be committed to descendants, with
+separate logical reservations and actual physical ownership. Supported stack budgets are 4–16 KiB; heap budgets are 0–64 KiB; total
 writable budgets are at most 80 KiB. The pool allocator first finds every
 required page, then clears and claims them together, so exhaustion leaves no
 partial allocation. A restart clears the same owned backing; it does not
 allocate again. Stopping a cell clears and releases its pages for reuse.
 
-The 320 KiB writable pool is separate from image backing, page tables, kernel
+The 512 KiB writable pool is separate from image backing, page tables, kernel
 stacks, and capability/queue tables. Those fixed supervisor costs are statically
 allocated and are not charged to a cell budget. The boot image and all static
 supervisor memory remain below the 4 MiB identity-mapped boot region. The
@@ -95,7 +101,7 @@ each restart.
 
 ## Communication authority
 
-ABI v3 uses `int 0x80`, preserving the finite `sleep` and `recv_wait`
+ABI v4 uses `int 0x80`, preserving the finite `sleep` and `recv_wait`
 calls and existing structure layouts while adding bounded storage operations.
 `include/zeal/abi.h`, Rust FFI layouts, and Zig's
 `cells/abi.zig` define the same call numbers, message layout, capability
@@ -112,7 +118,7 @@ queueing a copied message. Cells still validate protocol senders and payloads,
 but those checks do not replace supervisor enforcement.
 
 The capability table holds 32 entries and the manifest may define 16 initial
-grants. Rights cover the fourteen defined message operations; a separate high
+grants. Rights cover the sixteen defined message operations; a separate high
 bit permits delegation. Delegation requires a live capability held by the caller
 with that bit set. New rights must be a subset of the parent, and the delegated
 target and generation remain the parent's target. A holder cannot amplify
@@ -180,7 +186,7 @@ every byte operation crosses the isolated block-service boundary.
 
 The flat filesystem has four fixed 128-byte extents, including read-only
 `/hello`, 16-byte maximum names, and eight open handles. Create-or-open, explicit
-offset read/write, and close use ABI v3's bounded 32-byte payloads. Creation
+offset read/write, and close use ABI v4's bounded 32-byte payloads. Creation
 zeros an entire free extent through the block service before publishing it;
 writes grow length only after the matching block acknowledgment. Gaps are
 unsupported and multi-chunk operations can leave an acknowledged prefix.
@@ -211,8 +217,8 @@ authority, and wait demonstrations remain part of the verification suite.
 
 Storage is volatile and the filesystem has the fixed flat limits above.
 The supervisor is single-CPU and preserves general registers only.
-Recursive hosting, hardware NVMe, DMA isolation, device ownership and reset,
+General recursive hosting, arbitrary executable loading, hardware NVMe, DMA isolation, device ownership and reset,
 persistent storage, SMP, and extended CPU context are not implemented. These
 need separate contracts and tests; this milestone makes no DMA-containment or
-recursive-supervision claim. Hardware recovery must stop device DMA and
+general recursive-supervision or nested-kernel claim. Hardware recovery must stop device DMA and
 interrupts and re-establish device state before CPU restart can be meaningful.

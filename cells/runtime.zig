@@ -21,6 +21,7 @@ pub fn run(comptime role: abi.Role) noreturn {
         .filesystem => 4,
         .client => 5,
         .probe => 6,
+        .supervisor, .worker => 255,
     });
     if (role == .probe) {
         const sentinel: *volatile u64 = @ptrFromInt(abi.stack_base + 64);
@@ -35,7 +36,11 @@ pub fn run(comptime role: abi.Role) noreturn {
         .block => @import("storage_runtime.zig").block(),
         .filesystem => filesystem(info.generation),
         .client => client(info.scenario),
-        .probe => @import("probe_runtime.zig").run(if (info.scenario == 20) 7 else info.scenario),
+        .probe => if (info.scenario >= 21 and info.scenario <= 23)
+            @import("hosting_controller.zig").run(info)
+        else
+            @import("probe_runtime.zig").run(if (info.scenario == 20) 7 else info.scenario),
+        .supervisor, .worker => syscall.exit(),
     }
 }
 
@@ -122,6 +127,7 @@ fn observeMemory() void {
 }
 
 fn client(scenario: u64) noreturn {
+    if (scenario >= 21 and scenario <= 23) @import("hosting_storage.zig").run();
     const stack: *volatile u64 = @ptrFromInt(abi.stack_base + 128);
     const writable: *volatile u64 = @ptrFromInt(abi.memory_base);
     require(stack.* == 0 and writable.* == 0);

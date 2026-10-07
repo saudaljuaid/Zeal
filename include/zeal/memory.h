@@ -18,7 +18,7 @@ struct z_memory_allocation {
 struct z_memory_pool {
     _Alignas(Z_MANIFEST_PAGE_SIZE) uint8_t data[Z_MANIFEST_POOL_PAGES][Z_MANIFEST_PAGE_SIZE];
     uint8_t owners[Z_MANIFEST_POOL_PAGES];
-    struct z_memory_allocation cells[Z_MANIFEST_CELL_MAX];
+    struct z_memory_allocation cells[Z_CELL_COUNT];
     uint16_t page_count;
 };
 

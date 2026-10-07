@@ -62,6 +62,27 @@ receive paths under the existing sanitizers. Artifact tests reject malformed
 boot sectors, corrupt ELF headers, writable cell segments, and out-of-bounds
 images.
 
+## Runtime hierarchy checks
+
+The production creation engine in `kernel/hosting.c` runs through injectable
+architecture/copy callbacks under ASan and UBSan. The fixtures use the actual
+private-page allocator, broker, queues, waits and Rust policy; there is no
+separate test spawn implementation. Tests cover unpublished rollback, every
+copy/allocation/frame boundary, parent and ancestor retirement, exact rounded
+credits and physical ownership, typed authority, table/counter pressure,
+terminal retention, subtree cancellation, sibling FIFO/deadline preservation,
+restart/rebind, and slot reuse. Both the Rust tree model and the independent C
+orchestration model compare invariants after every generated operation. Seeds,
+operation counts and reproducible failing step information are printed in the
+complete test transcript. See [hosting policy](hosting-policy.md).
+
+The hosting Zig tests exercise production packet, dispatcher, worker admission,
+bootstrap and resource-selection logic. They reject malformed, late and
+unsolicited traffic, preserve interleaved replies and deferred parent requests,
+bound pending/inbox pressure and retries, and enforce request exhaustion.
+Compiled C, Rust and Zig tests verify management structures, field offsets,
+alignments, object tags, call numbers and rights.
+
 ## Emulator checks
 
 The test runner boots the raw disk under QEMU TCG and validates structured
@@ -112,6 +133,39 @@ idle timer wakes. Storage negative controls remove or counterfeit block writes,
 reads, transfer links, verified bytes, offsets, outcomes, handle generations,
 stale-handle rejection, recovery, and emulator exit status. Emulator logs and
 `results.json` remain available under `build/research/`.
+
+## Dedicated hosting acceptance
+
+Scenarios 21–23 each run twice through `make test`, alongside every existing
+fault, standalone, idle and storage-recovery case. Hosting uses a separate
+external oracle in `tests/hosting_oracle.py`; the old oracle still requires the
+original block/filesystem generation-one-to-two recovery sequence for old
+scenarios. Hosting preserves all four root generations at one, and verifies
+runtime cells absent from active manifest roots.
+
+The oracle independently reads the emitted manifest, reconstructs logical
+instances and ancestor reservations, verifies unique physical-page ownership,
+and requires request → reserve → private initialization → publication → actual
+ring-3 entry → authenticated IPC delivery → recomputed owner progress. It
+checks current-generation rebinding, stale rejection, exact cleanup/refunds,
+FIFO and original sleep-deadline preservation, no delayed subtree revival,
+leaf restart and slot reuse. It joins `/hello`, `/alpha`, and `/beta` byte
+verification to actual filesystem/block traffic before and after cleanup.
+The recovery interval is supervisor fault through the first verified RPC after
+explicit root-owner rebinding; at least one complete matched storage chunk must
+occur inside that interval.
+
+The live-trace negative-control runner removes or counterfeits each essential
+creation, execution, generation, authority, budget, cancellation, cleanup,
+recovery, reuse, denial, storage and completion element. Complete capability
+epoch uniqueness, exact packet reserved fields, nonrunnable retirement phases,
+physical page IDs and zeroed private backing are checked independently. Genuine
+QEMU exit status is mandatory. Exhausted bounded trace budgets are failures.
+Results appear in `build/research/hosting-negative-controls.json`, while hosting
+case evidence is included in `build/research/results.json`. Additional hosting
+platform cases use `qemu64` with 32 MiB and `max` with 128 MiB. CI retains the
+same full target transcript, JSON evidence and default/storage/hosting images
+on success and failure.
 
 These tests do not establish real-hardware correctness, DMA containment,
 NVMe reset safety, SMP correctness, persistent-data integrity, extended CPU

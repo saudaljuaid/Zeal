@@ -20,8 +20,15 @@
 #undef Z_MANIFEST_BYTES
 #undef Z_MANIFEST_END
 
+_Static_assert(offsetof(struct z_manifest_header, template_count) == 20, "template count offset");
+_Static_assert(offsetof(struct z_manifest_cell, entry) == 16, "root entry offset");
+_Static_assert(offsetof(struct z_manifest_template, entry) == 16, "template entry offset");
+_Static_assert(offsetof(struct z_manifest_template, max_descendant_depth) == 48, "template depth offset");
+_Static_assert(offsetof(struct z_manifest_domain, max_depth) == 16, "domain depth offset");
+
 struct z_image_catalog {
     uint32_t identity;
+    uint32_t role;
     const void *data;
     size_t length;
     uint64_t entry;
@@ -30,8 +37,12 @@ struct z_image_catalog {
 struct z_manifest {
     uint32_t cell_count;
     uint32_t grant_count;
+    uint32_t template_count;
+    uint32_t domain_count;
     struct z_manifest_cell cells[Z_MANIFEST_CELL_MAX];
     struct z_manifest_grant grants[Z_MANIFEST_GRANT_MAX];
+    struct z_manifest_template templates[Z_MANIFEST_TEMPLATE_MAX];
+    struct z_manifest_domain domains[Z_MANIFEST_DOMAIN_MAX];
 };
 
 enum z_manifest_error {
@@ -41,7 +52,8 @@ enum z_manifest_error {
     Z_MANIFEST_NAME_ERROR, Z_MANIFEST_IMAGE_ERROR, Z_MANIFEST_ABI_ERROR,
     Z_MANIFEST_ENTRY_ERROR, Z_MANIFEST_BUDGET_ERROR, Z_MANIFEST_CONFIG_ERROR,
     Z_MANIFEST_LIFECYCLE_ERROR, Z_MANIFEST_REFERENCE_ERROR,
-    Z_MANIFEST_RIGHTS_ERROR, Z_MANIFEST_DUPLICATE_GRANT
+    Z_MANIFEST_RIGHTS_ERROR, Z_MANIFEST_DUPLICATE_GRANT,
+    Z_MANIFEST_TEMPLATE_ERROR, Z_MANIFEST_DOMAIN_ERROR
 };
 
 bool z_manifest_validate(const void *data, size_t length,
@@ -49,6 +61,7 @@ bool z_manifest_validate(const void *data, size_t length,
                          struct z_manifest *output, enum z_manifest_error *error);
 const char *z_manifest_diagnostic(enum z_manifest_error error);
 int z_manifest_slot(const struct z_manifest *manifest, uint32_t identity);
+int z_manifest_template_index(const struct z_manifest *manifest, uint32_t identity);
 bool z_manifest_memory_pages(uint32_t stack_budget, uint32_t writable_budget,
                               uint16_t *stack_pages, uint16_t *heap_pages);
 

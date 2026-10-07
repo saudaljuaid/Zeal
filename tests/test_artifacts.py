@@ -54,8 +54,10 @@ class SealedCellTests(unittest.TestCase):
 
     def test_corrupt_identity_and_truncated_headers_rejected(self):
         for offset, form, value in ((0, "B", 0), (4, "B", 1), (5, "B", 2),
-                                    (16, "H", 3), (18, "H", 3), (24, "Q", cell.BASE + 1),
-                                    (32, "Q", 120), (54, "H", 55), (56, "H", 0)):
+                                    (7, "B", 1), (8, "B", 1), (15, "B", 1),
+                                    (16, "H", 3), (18, "H", 3), (20, "I", 0),
+                                    (48, "I", 1), (52, "H", 63), (24, "Q", cell.BASE + 1),
+                                    (32, "Q", 120), (32, "Q", 0), (54, "H", 55), (56, "H", 0), (56, "H", 9)):
             data = executable()
             struct.pack_into("<" + form, data, offset, value)
             with self.subTest(offset=offset), self.assertRaises(ValueError):
@@ -66,7 +68,7 @@ class SealedCellTests(unittest.TestCase):
 
     def test_mutable_missing_and_out_of_bounds_segments_rejected(self):
         changes = ((64, "I", 0), (68, "I", 7), (68, "I", 4), (68, "I", 1),
-                   (68, "I", 13), (72, "Q", 127), (80, "Q", cell.BASE - 1),
+                   (68, "I", 13), (72, "Q", 127), (72, "Q", 64), (88, "Q", cell.BASE + 1), (80, "Q", cell.BASE - 1),
                    (80, "Q", cell.BASE + cell.LIMIT), (96, "Q", 0),
                    (104, "Q", 9), (104, "Q", cell.LIMIT + 1), (112, "Q", 3),
                    (112, "Q", 4096))
@@ -75,6 +77,31 @@ class SealedCellTests(unittest.TestCase):
             struct.pack_into("<" + form, data, offset, value)
             with self.subTest(offset=offset), self.assertRaises(ValueError):
                 cell.check_cell(data)
+
+    def test_multiple_immutable_segments_and_overlap_boundaries(self):
+        data = bytearray(192)
+        data[:64] = executable()[:64]
+        struct.pack_into("<H", data, 56, 2)
+        for number in range(2):
+            struct.pack_into("<IIQQQQQQ", data, 64 + number * 56,
+                             1, 5 if number == 0 else 4, 176 + number * 8,
+                             cell.BASE + number * 8, cell.BASE + number * 8, 8, 8, 1)
+        cell.check_cell(data)
+        for offset, value in ((136, 176), (144, cell.BASE), (152, cell.BASE)):
+            corrupted = data.copy()
+            struct.pack_into("<Q", corrupted, offset, value)
+            with self.subTest(offset=offset), self.assertRaises(ValueError):
+                cell.check_cell(corrupted)
+        memory_overlap = data.copy()
+        struct.pack_into("<QQ", memory_overlap, 144, cell.BASE, cell.BASE)
+        with self.assertRaises(ValueError):
+            cell.check_cell(memory_overlap)
+        stack = data.copy()
+        struct.pack_into("<IIQQQQQQ", stack, 120, 0x6474E551, 7, 0, 0, 0, 0, 0, 0)
+        with self.assertRaises(ValueError):
+            cell.check_cell(stack)
+        struct.pack_into("<I", stack, 124, 6)
+        cell.check_cell(stack)
 
 
 if __name__ == "__main__":

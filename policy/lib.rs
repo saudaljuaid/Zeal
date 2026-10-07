@@ -3,17 +3,18 @@
 use core::ptr;
 
 mod capability;
+mod hosting;
 
-// ABI v3 extends isolated storage operation rights; syscall layouts are fixed.
-pub const Z_ABI_VERSION: u32 = 3;
-pub const Z_OPERATION_MAX: u32 = 14;
-pub const Z_RIGHT_OPERATIONS: u32 = 16383;
+// ABI v4 adds bounded hosting management and narrow RPC operation rights.
+pub const Z_ABI_VERSION: u32 = 4;
+pub const Z_OPERATION_MAX: u32 = 16;
+pub const Z_RIGHT_OPERATIONS: u32 = 65535;
 pub const Z_SLEEP: u64 = 11;
 pub const Z_RECV_WAIT: u64 = 12;
 pub const Z_TIMEOUT: i64 = -8;
 pub const Z_WAIT_MAX_TICKS: u64 = 1000;
 
-const CELLS: u32 = 4;
+const CELLS: u32 = 8;
 const RESTART_LIMIT: u32 = 3;
 const GENERATION_MAX: u64 = (i64::MAX as u64) >> 8;
 const BACKOFF_BASE: u64 = 4;
@@ -246,7 +247,7 @@ mod tests {
     #[test]
     fn c_abi_layout_is_fixed() {
         assert_eq!((Z_ABI_VERSION, Z_SLEEP, Z_RECV_WAIT, Z_TIMEOUT, Z_WAIT_MAX_TICKS),
-                   (3, 11, 12, -8, 1000));
+                   (4, 11, 12, -8, 1000));
         assert_eq!(Z_RIGHT_OPERATIONS, (1 << Z_OPERATION_MAX) - 1);
         assert_eq!(size_of::<State>(), 32);
         assert_eq!(align_of::<State>(), 8);
@@ -493,7 +494,7 @@ mod tests {
     #[test]
     fn handles_reject_unassigned_slots() {
         let state = initialized(0);
-        for slot in [4, 5, 254, 255, 256, u32::MAX] {
+        for slot in [8, 9, 254, 255, 256, u32::MAX] {
             assert_eq!(state.handle(slot), 0);
         }
         let states = [state; 4];
@@ -523,7 +524,7 @@ mod tests {
             }
         }
         unsafe {
-            assert_eq!(z_policy_resolve(states.as_ptr(), 5, 257), INVALID);
+            assert_eq!(z_policy_resolve(states.as_ptr(), 9, 257), INVALID);
             assert_eq!(z_policy_resolve(states.as_ptr(), u32::MAX, 257), INVALID);
         }
     }

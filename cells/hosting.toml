@@ -48,7 +48,7 @@ entry = 0x40000000
 image_budget = 65536
 stack_budget = 16384
 writable_budget = 81920
-boot_config = 0
+boot_config = 21
 restart_limit = 3
 restart_delay = 4
 
@@ -81,3 +81,42 @@ rights = ["file_read", "cap_ack", "file_open", "file_chunk_read", "file_write", 
 holder = 300
 target = 400
 rights = ["cap_offer"]
+
+# Catalog images are immutable approved programs, never prebooted runtime children.
+[[template]]
+identity = 1
+image = 5
+abi = 4
+entry = 0x40000000
+image_budget = 65536
+stack_budget = 8192
+writable_budget = 16384
+boot_config = 21
+restart_limit = 3
+restart_delay = 4
+max_descendant_depth = 1
+child_template_mask = 2
+bootstrap_recipe = 1
+
+[[template]]
+identity = 2
+image = 6
+abi = 4
+entry = 0x40000000
+image_budget = 65536
+stack_budget = 4096
+writable_budget = 8192
+boot_config = 21
+restart_limit = 3
+restart_delay = 4
+max_descendant_depth = 0
+child_template_mask = 0
+bootstrap_recipe = 1
+
+[[domain]]
+owner_identity = 400
+template_mask = 3
+slot_limit = 4
+page_limit = 48
+max_depth = 2
+bootstrap_recipe = 1

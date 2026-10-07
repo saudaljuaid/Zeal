@@ -3,6 +3,7 @@ use core::ptr;
 
 const SLOTS: usize = 32;
 const ROOTS: usize = 16;
+const MANIFEST_ROOT_CELLS: u32 = 4;
 const DELEGATE: u32 = 1 << 31;
 const OPERATIONS: u32 = super::Z_RIGHT_OPERATIONS;
 const INVALID: i64 = -1;
@@ -149,7 +150,7 @@ impl Table {
             return INVALID as i32;
         }
         for (n, grant) in grants.iter().enumerate() {
-            if grant.holder >= CELLS || grant.target >= CELLS || grant.reserved != 0
+            if grant.holder >= MANIFEST_ROOT_CELLS || grant.target >= MANIFEST_ROOT_CELLS || grant.reserved != 0
                 || !valid_rights(grant.rights)
                 || grants[..n].iter().any(|old| old.holder == grant.holder && old.target == grant.target)
             {
@@ -163,14 +164,19 @@ impl Table {
         0
     }
 
-    fn refresh(&mut self, states: &[State; CELLS as usize]) -> i32 {
-        if self.root_count as usize > ROOTS || self.reserved != 0 {
-            return INVALID as i32;
+    fn pending_roots(&self, states: &[State; CELLS as usize]) -> Result<([bool; ROOTS], usize), i32> {
+        if self.root_count as usize > ROOTS || self.reserved != 0 || self.next_epoch == 0
+            || self.next_epoch > GENERATION_MAX + 1 {
+            return Err(INVALID as i32);
         }
-        self.reap_stale(states);
         let mut pending = [false; ROOTS];
         let mut count = 0;
         for (n, root) in self.roots[..self.root_count as usize].iter().enumerate() {
+            if root.grant.holder >= MANIFEST_ROOT_CELLS || root.grant.target >= MANIFEST_ROOT_CELLS
+                || root.grant.reserved != 0 || !valid_rights(root.grant.rights)
+                || root.holder_generation > GENERATION_MAX || root.target_generation > GENERATION_MAX {
+                return Err(INVALID as i32);
+            }
             let holder = states[root.grant.holder as usize].handle(root.grant.holder);
             let target = states[root.grant.target as usize].handle(root.grant.target);
             if holder != 0 && target != 0
@@ -180,12 +186,25 @@ impl Table {
                 count += 1;
             }
         }
+        Ok((pending, count))
+    }
+
+    fn refresh_epoch_status(&self, states: &[State; CELLS as usize]) -> i32 {
+        let (_, count) = match self.pending_roots(states) { Ok(value) => value, Err(error) => return error };
+        if count != 0 && (self.next_epoch > GENERATION_MAX
+            || count as u64 - 1 > GENERATION_MAX - self.next_epoch) {
+            NO_SPACE as i32
+        } else { 0 }
+    }
+
+    fn refresh(&mut self, states: &[State; CELLS as usize]) -> i32 {
+        let (pending, count) = match self.pending_roots(states) { Ok(value) => value, Err(error) => return error };
+        self.reap_stale(states);
         if count == 0 {
             return 0;
         }
         if self.entries.iter().filter(|entry| entry.live == 0).count() < count
-            || self.next_epoch == 0 || self.next_epoch > GENERATION_MAX
-            || count as u64 - 1 > GENERATION_MAX - self.next_epoch
+            || self.refresh_epoch_status(states) != 0
         {
             return NO_SPACE as i32;
         }
@@ -333,6 +352,69 @@ impl Table {
         }
         self.prune();
     }
+
+    fn channel(&mut self, states: &[State; CELLS as usize], parent: u64,
+               child: u64) -> Result<(u64, u64), i32> {
+        if endpoint(states, parent).is_none() {
+            return Err(AGAIN as i32);
+        }
+        let low = (child & 255) as usize;
+        let generation = child >> 8;
+        if low <= MANIFEST_ROOT_CELLS as usize || low > CELLS as usize
+            || generation == 0 || generation > GENERATION_MAX || child == parent
+        {
+            return Err(INVALID as i32);
+        }
+        let state = &states[low - 1];
+        // The production lifecycle engine can install channels for a prepared
+        // future generation or explicitly rebind a currently published child.
+        if !state.valid() || !((state.phase == super::DORMANT && generation > state.generation)
+            || (state.phase == READY && state.generation == generation))
+        {
+            return Err(STALE as i32);
+        }
+        if self.entries.iter().filter(|entry| entry.live == 0).count() < 2
+            || self.next_epoch == 0 || self.next_epoch >= GENERATION_MAX
+        {
+            return Err(NO_SPACE as i32);
+        }
+        // Preflight makes both insertions infallible. Epochs are never rewound
+        // if the encompassing creation transaction later aborts.
+        let request = self.insert(parent, child, 1 << 14, 0, parent)
+            .map_err(|error| error as i32)?;
+        let reply = self.insert(child, parent, 1 << 15, 0, parent)
+            .map_err(|error| error as i32)?;
+        Ok((request, reply))
+    }
+
+    fn drop_channel(&mut self, first: u64, second: u64) {
+        for handle in [first, second] {
+            if let Ok(slot) = self.slot(handle) {
+                self.entries[slot] = Entry::default();
+            }
+        }
+        self.prune();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn z_caps_channel(table: *mut Table,
+    states: *const [State; CELLS as usize], parent: u64, child: u64,
+    parent_cap: *mut u64, child_cap: *mut u64) -> i32 {
+    let (table, states) = match (table.as_mut(), states.as_ref()) {
+        (Some(table), Some(states)) if !parent_cap.is_null() && !child_cap.is_null()
+            && parent_cap != child_cap => (table, states),
+        _ => return INVALID as i32,
+    };
+    match table.channel(states, parent, child) {
+        Ok((request, reply)) => { ptr::write(parent_cap, request); ptr::write(child_cap, reply); 0 }
+        Err(error) => error,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn z_caps_drop_channel(table: *mut Table, first: u64, second: u64) {
+    if let Some(table) = table.as_mut() { table.drop_channel(first, second); }
 }
 
 #[no_mangle]
@@ -355,6 +437,17 @@ pub unsafe extern "C" fn z_caps_configure(table: *mut Table, grants: *const Gran
 pub unsafe extern "C" fn z_caps_refresh(table: *mut Table, states: *const [State; CELLS as usize]) -> i32 {
     match (table.as_mut(), states.as_ref()) {
         (Some(table), Some(states)) => table.refresh(states),
+        _ => INVALID as i32,
+    }
+}
+
+/// Privileged read-only classification of the exact pending manifest-root
+/// batch. This shares root entitlement/generation checks with publication.
+#[no_mangle]
+pub unsafe extern "C" fn z_caps_refresh_epoch_status(table: *const Table,
+    states: *const [State; CELLS as usize]) -> i32 {
+    match (table.as_ref(), states.as_ref()) {
+        (Some(table), Some(states)) => table.refresh_epoch_status(states),
         _ => INVALID as i32,
     }
 }
@@ -492,7 +585,7 @@ mod tests {
             assert_eq!(table.check(&states, client, child, fs, right), DENIED as i32);
             assert_eq!(table.delegate(&states, fs, parent, client, right), DENIED);
         }
-        for rights in [0, DELEGATE, 1 << 14, 1 << 30, u32::MAX] {
+        for rights in [0, DELEGATE, 1 << 16, 1 << 30, u32::MAX] {
             assert!(!valid_rights(rights));
             assert_eq!(table.find(&states, client, fs, rights), INVALID);
         }
@@ -556,5 +649,55 @@ mod tests {
         let before = table.clone();
         assert_eq!(table.delegate(&states, fs, parent, client, 4), NO_SPACE);
         assert_eq!(table, before);
+    }
+    #[test]
+    fn static_refresh_epoch_status_uses_exact_atomic_pending_batch() {
+        let mut states = states();
+        let mut table = configured(&states);
+        assert_eq!(table.refresh_epoch_status(&states), 0);
+        table.invalidate(1);
+        states[1].fault(0);
+        assert!(states[1].poll(4));
+        let (_, pending) = table.pending_roots(&states).unwrap();
+        assert_eq!(pending, 2);
+        table.next_epoch = GENERATION_MAX;
+        let before = table.clone();
+        assert_eq!(table.refresh_epoch_status(&states), NO_SPACE as i32);
+        assert_eq!(table, before);
+        table.next_epoch = GENERATION_MAX - 1;
+        assert_eq!(table.refresh_epoch_status(&states), 0);
+        assert_eq!(table.refresh(&states), 0);
+        assert_eq!(table.next_epoch, GENERATION_MAX + 1);
+        assert_eq!(table.refresh_epoch_status(&states), 0);
+        assert_eq!(table.refresh(&states), 0);
+        states[1].fault(4); assert!(states[1].poll(12));
+        assert_eq!(table.refresh_epoch_status(&states), NO_SPACE as i32);
+    }
+    #[test]
+    fn static_refresh_metadata_and_null_ffi_fail_closed_without_mutation() {
+        let states = states();
+        let original = configured(&states);
+        for field in 0..8 {
+            let mut table = original.clone();
+            match field {
+                0 => table.root_count = ROOTS as u32 + 1,
+                1 => table.reserved = 1,
+                2 => table.roots[0].grant.holder = u32::MAX,
+                3 => table.roots[0].grant.target = MANIFEST_ROOT_CELLS,
+                4 => table.roots[0].grant.reserved = 1,
+                5 => table.roots[0].holder_generation = GENERATION_MAX + 1,
+                6 => table.next_epoch = 0,
+                7 => table.next_epoch = GENERATION_MAX + 2,
+                _ => unreachable!(),
+            }
+            let before = table.clone();
+            assert_eq!(table.refresh_epoch_status(&states), INVALID as i32);
+            assert_eq!(table.refresh(&states), INVALID as i32);
+            assert_eq!(table, before);
+        }
+        unsafe {
+            assert_eq!(z_caps_refresh_epoch_status(ptr::null(), &states), INVALID as i32);
+            assert_eq!(z_caps_refresh_epoch_status(&original, ptr::null()), INVALID as i32);
+        }
     }
 }

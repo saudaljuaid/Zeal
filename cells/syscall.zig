@@ -37,6 +37,9 @@ pub fn receiveWait(message: *abi.Message, timeout: u64) i64 {
 }
 
 pub fn lookup(role: abi.Role) u64 {
+    // Only manifest roots have stable role-to-diagnostic routing. Runtime
+    // endpoints come from creation/status results, even for identical images.
+    if (@intFromEnum(role) >= 4) return 0;
     const result = raw(@intFromEnum(abi.Call.lookup), (@as(u64, @intFromEnum(role)) + 1) * 100, 0, 0);
     return if (result > 0) @intCast(result) else 0;
 }
@@ -67,6 +70,28 @@ pub fn reportValues(code: u64, value: u64, extra: u64) void {
 
 pub fn boot(info: *abi.BootInfo) i64 {
     return raw(@intFromEnum(abi.Call.boot), @intFromPtr(info), 0, 0);
+}
+
+pub fn create(request: *const abi.CreateRequest, result: *abi.CreateResult) i64 {
+    return raw(@intFromEnum(abi.Call.create), @intFromPtr(request), @sizeOf(abi.CreateRequest), @intFromPtr(result));
+}
+pub fn status(control: u64, result: *abi.CellStatus) i64 {
+    return raw(@intFromEnum(abi.Call.status), control, @intFromPtr(result), @sizeOf(abi.CellStatus));
+}
+pub fn stop(control: u64) i64 {
+    return raw(@intFromEnum(abi.Call.stop), control, 0, 0);
+}
+pub fn reap(control: u64) i64 {
+    return raw(@intFromEnum(abi.Call.reap), control, 0, 0);
+}
+pub fn rebind(request: *const abi.RebindRequest, result: *abi.CreateResult) i64 {
+    return raw(@intFromEnum(abi.Call.rebind), @intFromPtr(request), @sizeOf(abi.RebindRequest), @intFromPtr(result));
+}
+pub fn creationRevoke(domain: u64) i64 {
+    return raw(@intFromEnum(abi.Call.creation_revoke), domain, 0, 0);
+}
+pub fn domainStatus(domain: u64, result: *abi.DomainStatus) i64 {
+    return raw(@intFromEnum(abi.Call.domain_status), domain, @intFromPtr(result), @sizeOf(abi.DomainStatus));
 }
 
 pub fn exit() noreturn {

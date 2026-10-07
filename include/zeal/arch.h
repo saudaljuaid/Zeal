@@ -25,6 +25,13 @@ void arch_user_copy_out(uint64_t destination, const void *source, size_t length)
 bool arch_cell_copy_valid(unsigned cell, uint64_t destination, size_t length);
 bool arch_cell_copy_out(unsigned cell, uint64_t destination,
                         const void *source, size_t length);
+bool arch_cell_range(unsigned cell, uint64_t address, size_t length, bool write);
+bool arch_cell_copy_in(unsigned cell, void *destination,
+                       uint64_t source, size_t length);
+unsigned arch_space_pages(unsigned cell);
+bool arch_memory_check(void);
+uint32_t arch_space_page_id(unsigned cell, unsigned page);
+bool arch_space_zero(unsigned cell);
 void arch_frame_init(struct z_frame *frame, unsigned cell);
 void arch_enter(struct z_frame *frame) __attribute__((noreturn));
 struct z_frame *kernel_trap(struct z_frame *frame);

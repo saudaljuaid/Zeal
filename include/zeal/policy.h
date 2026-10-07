@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <zeal/abi.h>
 
-#define Z_POLICY_CELLS 4u
+#define Z_POLICY_CELLS 8u
 #define Z_POLICY_RESTART_LIMIT 3u
 #define Z_POLICY_GENERATION_MAX (INT64_MAX >> 8)
 
@@ -82,6 +82,8 @@ void z_caps_init(struct z_cap_table *table);
 int32_t z_caps_configure(struct z_cap_table *table,
                          const struct z_boot_grant *grants, uint32_t count);
 int32_t z_caps_refresh(struct z_cap_table *table, const struct z_policy_state *states);
+int32_t z_caps_refresh_epoch_status(const struct z_cap_table *table,
+                                    const struct z_policy_state *states);
 int32_t z_caps_check(const struct z_cap_table *table,
                      const struct z_policy_state *states, uint64_t holder,
                      uint64_t cap, uint64_t target, uint32_t rights);
@@ -97,5 +99,14 @@ int32_t z_caps_query(const struct z_cap_table *table,
 int32_t z_caps_revoke(struct z_cap_table *table,
                       const struct z_policy_state *states, uint64_t caller, uint64_t cap);
 void z_caps_invalidate(struct z_cap_table *table, uint32_t cell);
+
+/* Privileged recipe installation, called only by checked C creation/rebind.
+ * An unpublished child endpoint may be prepared, but cannot resolve or receive
+ * until the lifecycle transaction publishes its matching READY generation. */
+int32_t z_caps_channel(struct z_cap_table *table,
+                       const struct z_policy_state *states, uint64_t parent,
+                       uint64_t child, uint64_t *parent_cap, uint64_t *child_cap);
+void z_caps_drop_channel(struct z_cap_table *table, uint64_t parent_cap,
+                         uint64_t child_cap);
 
 #endif

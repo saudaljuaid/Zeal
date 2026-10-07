@@ -15,9 +15,9 @@ def event(name, cell, generation, tick, **fields):
 
 
 def healthy_trace():
-    output = "ZEAL boot abi=3 x86_64\nMANIFEST_ACCEPT version=1\n"
+    output = "ZEAL boot abi=4 x86_64\nMANIFEST_ACCEPT version=2\n"
     for cell in range(4):
-        output += event("boot", cell, 1, 0, abi=3, entry=0x40000000)
+        output += event("boot", cell, 1, 0, abi=4, entry=0x40000000)
     output += event("healthy-memory", 2, 1, 1, stack=0x710bf391ad42c865, writable=0x38d126ef8a905b47)
     output += event("cap-delegate", 1, 1, 1, holder=0x103, target=0x102, rights=4, cap=0x606, parent=0x303)
     output += event("demo-forbidden", 2, 1, 1, rights=1, result=0xfffffffffffffffe)
@@ -29,7 +29,7 @@ def healthy_trace():
     output += event("demo-resumed", 2, 1, 3, endpoint=0x102, cap=0x403)
     for cell, tick in ((0, 20), (1, 40)):
         output += event("fault", cell, 1, tick, reason=64, error=0, address=0)
-        output += event("boot", cell, 2, tick + 4, abi=3, entry=0x40000000)
+        output += event("boot", cell, 2, tick + 4, abi=4, entry=0x40000000)
         if cell == 0:
             output += event("read-verified", 2, 1, 25, reads=2)
             output += event("recovered", cell, 2, 25, reads=2)
@@ -41,7 +41,7 @@ def healthy_trace():
             output += event("recovered", cell, 2, 46, reads=3)
     for generation, tick in enumerate((1, 5, 13, 29), 1):
         if generation > 1:
-            output += event("boot", 3, generation, tick, abi=3, entry=0x40000000)
+            output += event("boot", 3, generation, tick, abi=4, entry=0x40000000)
         output += event("reset-memory", 3, generation, tick)
         output += event("fault", 3, generation, tick, reason=6, error=0, address=0)
     output += event("quarantine", 3, 4, 29)
@@ -119,7 +119,7 @@ def storage_trace():
         ipc(1, 14, identity, handle=handle, offset=offset, result=result, data=data)
 
     for cell in range(4):
-        emit("boot", cell, abi=3, entry=0x40000000)
+        emit("boot", cell, abi=4, entry=0x40000000)
     emit("cap-delegate", 1, cap=1, rights=4, holder=0x103, target=0x102, parent=2)
     emit("storage-reject", 2, target=0x102, cap=1, operation=12, length=32,
          request=1, handle=0, offset=0, result=1, data=0, outcome=0xfffffffffffffffe)
@@ -177,7 +177,7 @@ def storage_trace():
             emit("fault", cycle, reason=64, error=0, address=0)
             tick += 4
             generation[cycle] = 2
-            emit("boot", cycle, abi=3, entry=0x40000000)
+            emit("boot", cycle, abi=4, entry=0x40000000)
             if cycle == 1:
                 block_request = 1
     emit("storage-complete", 2)
@@ -196,22 +196,22 @@ class ResearchOracleTests(unittest.TestCase):
         good = healthy_trace()
         modifications = [
             good.replace("ZEAL boot", "ZEAL missing"),
-            "ZEAL boot abi=3 x86_64\n" + good,
+            "ZEAL boot abi=4 x86_64\n" + good,
             good.replace("RESEARCH_PASS", "RESEARCH_FAIL"),
             good + "PANIC simulated\n",
             good.replace(event("read", 2, 1, 1), ""),
             good.replace(event("recovered", 0, 2, 25, reads=2), ""),
             good.replace(event("recovered", 1, 2, 46, reads=3),
                          event("recovered", 1, 1, 46, reads=3)),
-            good.replace(event("boot", 0, 2, 24, abi=3, entry=0x40000000),
-                         event("boot", 0, 2, 23, abi=3, entry=0x40000000)),
+            good.replace(event("boot", 0, 2, 24, abi=4, entry=0x40000000),
+                         event("boot", 0, 2, 23, abi=4, entry=0x40000000)),
             good + event("boot", 2, 2, 50),
             good + event("fault", 2, 1, 50, reason=6, error=0, address=0),
             good.replace(event("quarantine", 3, 4, 29), ""),
             good.replace(event("reset-memory", 3, 2, 5), ""),
             good.replace("reason=0x0000000000000006", "reason=0x000000000000000e"),
-            good.replace(event("boot", 3, 2, 5, abi=3, entry=0x40000000),
-                         event("boot", 3, 1, 5, abi=3, entry=0x40000000)),
+            good.replace(event("boot", 3, 2, 5, abi=4, entry=0x40000000),
+                         event("boot", 3, 1, 5, abi=4, entry=0x40000000)),
             good.replace("scenario=0x0000000000000000", "scenario=0x0000000000000001"),
             good.replace(event("cap-delegate", 1, 1, 1, holder=0x103, target=0x102,
                                rights=4, cap=0x606, parent=0x303), ""),
@@ -243,7 +243,7 @@ class ResearchOracleTests(unittest.TestCase):
         research.verify(waiting_trace(), 1, 19)
 
     def test_idle_timer_wait_trace_is_accepted(self):
-        trace = event("boot", 3, 1, 0, abi=3, entry=0x40000000) + wait_probe_trace(True)
+        trace = event("boot", 3, 1, 0, abi=4, entry=0x40000000) + wait_probe_trace(True)
         research.verify_waits(research.records(trace), standalone=True)
 
     def test_missing_or_counterfeit_wakeups_are_rejected(self):
@@ -285,7 +285,7 @@ class ResearchOracleTests(unittest.TestCase):
                 research.verify(output, 1, 19)
 
     def test_missing_or_counterfeit_idle_wake_is_rejected(self):
-        good = event("boot", 3, 1, 0, abi=3, entry=0x40000000) + wait_probe_trace(True)
+        good = event("boot", 3, 1, 0, abi=4, entry=0x40000000) + wait_probe_trace(True)
         alterations = [
             good.replace(event("idle-wake", 3, 1, 5, entered=4, reason=6), ""),
             good.replace(event("idle-enter", 3, 1, 4), ""),
@@ -304,7 +304,7 @@ class ResearchOracleTests(unittest.TestCase):
                 research.verify_waits(research.records(output), standalone=True)
 
     def test_terminal_event_requires_prior_wait_cancellation(self):
-        trace = event("boot", 0, 1, 0, abi=3, entry=0x40000000)
+        trace = event("boot", 0, 1, 0, abi=4, entry=0x40000000)
         trace += event("wait-arm", 0, 1, 1, kind=2, deadline=20)
         for terminal in ("fault", "exit", "quarantine"):
             with self.subTest(terminal=terminal), self.assertRaises(AssertionError):
@@ -312,7 +312,7 @@ class ResearchOracleTests(unittest.TestCase):
                                      demonstration=False)
 
     def test_idle_with_runnable_cell_is_rejected(self):
-        trace = event("boot", 3, 1, 0, abi=3, entry=0x40000000)
+        trace = event("boot", 3, 1, 0, abi=4, entry=0x40000000)
         trace += event("idle-enter", 3, 1, 1)
         trace += event("idle-wake", 3, 1, 2, entered=1, reason=6)
         with self.assertRaises(AssertionError):

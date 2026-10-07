@@ -13,7 +13,13 @@ cell has private budgeted memory, a lifecycle, and revocable IPC capabilities
 with operation rights. Cells can sleep and receive messages with finite tick
 deadlines. A fault cold-boots that cell while healthy cells keep running.
 Its isolated RAM block and flat filesystem services support bounded writable
-files and generation-safe handles. Recursive hosting remains future work.
+files and generation-safe handles.
+
+An explicitly authorized ring-3 controller can create approved supervisor and
+worker cells. A supervisor can create workers one level below itself, giving a
+bounded root → supervisor → worker hierarchy under one privileged supervisor
+and global scheduler. Delegated page/slot allowances, typed lifecycle controls,
+atomic creation, cold restart, and subtree cleanup govern these descendants.
 
 ## Build and run
 
@@ -28,14 +34,18 @@ make test
 
 See [building](docs/building.md), [architecture](docs/architecture.md),
 [storage contracts](docs/storage.md), [wait contracts](docs/waits.md), and
-[test coverage](docs/testing.md).
+[hosting contracts](docs/hosting-policy.md), [management ABI](docs/hosting-abi.md),
+and [test coverage](docs/testing.md).
 
 ## Status
 
 Storage is volatile: four files including read-only `/hello`, 128 bytes per
-file, eight open handles, and eight-byte transfer chunks. Hardware NVMe, DMA
-isolation, persistent storage, SMP, and recursively hosted child systems remain
-future work.
+file, eight open handles, and eight-byte transfer chunks. Hosting has eight
+runtime slots: four permanently reserved roots and four descendant slots, at
+most two child levels, and 128 private writable pages. Only the approved
+supervisor/worker templates support creation. Arbitrary executable loading,
+general recursive hosting, hardware NVMe, DMA isolation, persistent storage,
+and SMP remain future work.
 
 ## License
 

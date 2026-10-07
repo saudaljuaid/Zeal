@@ -19,7 +19,7 @@ static uint64_t principal(const struct z_broker *broker, unsigned cell)
 
 static uint32_t operation_right(uint32_t operation)
 {
-    return operation >= Z_READ && operation <= Z_FILE_RESULT ? Z_RIGHT(operation) : 0;
+    return operation >= Z_READ && operation <= Z_HOST_REPLY ? Z_RIGHT(operation) : 0;
 }
 
 static bool delivery_valid(const struct z_broker *broker,
@@ -47,7 +47,7 @@ static void compact(struct z_broker *broker)
 void z_broker_init(struct z_broker *broker)
 {
     *broker = (struct z_broker){0};
-    for (unsigned i = 0; i < Z_CELL_COUNT; ++i)
+    for (unsigned i = 0; i < Z_ROOT_COUNT; ++i)
         z_policy_init(&broker->policies[i], 0);
     z_caps_init(&broker->capabilities);
 }
@@ -65,6 +65,35 @@ int z_broker_refresh(struct z_broker *broker)
     if (broker == NULL)
         return Z_INVALID;
     return z_caps_refresh(&broker->capabilities, broker->policies);
+}
+
+void z_broker_refresh_state_init(struct z_refresh_state *state)
+{
+    if (state != NULL) *state = (struct z_refresh_state){0};
+}
+
+int z_broker_refresh_bounded(struct z_broker *broker, struct z_refresh_state *state,
+                              uint64_t now, bool changed)
+{
+    if (broker == NULL || state == NULL || state->pending > 1 || state->closed > 1 ||
+        (state->closed && (state->pending || state->deadline)) ||
+        (!state->pending && state->deadline)) return Z_INVALID;
+    int epoch = z_caps_refresh_epoch_status(&broker->capabilities, broker->policies);
+    if (epoch != Z_OK && epoch != Z_NO_SPACE) return epoch;
+    if (state->closed) return Z_NO_SPACE;
+    if (!state->pending && !changed) return Z_OK;
+    state->pending = 1;
+    if (state->deadline && now < state->deadline) return Z_AGAIN;
+    int result = z_broker_refresh(broker);
+    if (result == Z_OK) {
+        state->pending = 0; state->deadline = 0;
+        return Z_OK;
+    }
+    if (result != Z_NO_SPACE) return result;
+    if (epoch == Z_NO_SPACE || now > UINT64_MAX - Z_REFRESH_RETRY_TICKS) {
+        state->closed = 1; state->pending = 0; state->deadline = 0;
+    } else state->deadline = now + Z_REFRESH_RETRY_TICKS;
+    return Z_NO_SPACE;
 }
 
 int64_t z_broker_lookup(const struct z_broker *broker, unsigned source,

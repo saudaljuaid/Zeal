@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import hashlib
 import os
 import pathlib
 import re
@@ -21,7 +22,10 @@ NAMES = ["invalid instruction", "supervisor memory", "immutable code", "NX stack
          "capability forgery", "null dereference", "stack guard", "unmapped memory",
          "trusted kernel fault", "x87 state isolation", "SSE state isolation", "direction flag",
          "noncanonical return stack", "disabled SYSCALL entry", "disabled SYSENTER entry",
-         "blocking receive and timed sleep", "writable storage and generation-safe handles"]
+         "blocking receive and timed sleep", "writable storage and generation-safe handles",
+         "runtime creation, hierarchy and storage preservation",
+         "subtree failure, cancellation and explicit recovery",
+         "hosting authority, pressure, rollback and slot reuse"]
 
 
 def require(condition, message):
@@ -452,14 +456,17 @@ def verify_waits(events, standalone=False, demonstration=True):
 
 
 def verify(output, code, scenario):
+    if scenario in (21, 22, 23):
+        import hosting_oracle
+        return hosting_oracle.verify(output, code, scenario)
     if scenario == 12:
         require(code == 5 and "KERNEL_FAULT vector=0x0000000000000006" in output and
                 "PANIC trusted kernel fault" in output and "RESEARCH_PASS" not in output,
                 "kernel-fault negative control failed")
         return
     require(code == 1, f"unexpected emulator exit {code}")
-    require(output.count("ZEAL boot abi=3 x86_64") == 1, "kernel rebooted or never booted")
-    require(output.count("MANIFEST_ACCEPT version=1") == 1, "privileged manifest validation missing")
+    require(output.count("ZEAL boot abi=4 x86_64") == 1, "kernel rebooted or never booted")
+    require(output.count("MANIFEST_ACCEPT version=2") == 1, "privileged manifest validation missing")
     require(output.count("RESEARCH_PASS") == 1, "missing unique research completion")
     require(f"RESEARCH_PASS scenario=0x{scenario:016x}" in output, "wrong boot configuration")
     require(not any(word in output for word in ("PANIC", "RESEARCH_FAIL", "bad-report")),
@@ -469,7 +476,7 @@ def verify(output, code, scenario):
     for cell, identity in expected_identities.items():
         for boot in select(events, "boot", cell):
             require(boot.get("identity") == identity, "boot identity differs from manifest")
-            require(boot.get("abi") == 3 and boot.get("entry") == 0x40000000,
+            require(boot.get("abi") == 4 and boot.get("entry") == 0x40000000,
                     "boot image contract differs from manifest")
     for cell in (0, 1):
         boots = select(events, "boot", cell)
@@ -594,6 +601,7 @@ def emulate(image, label, cpu="max", memory="64M", timeout=12):
 def main():
     LOGS.mkdir(parents=True, exist_ok=True)
     results = []
+    negatives = []
     repetitions = int(os.environ.get("RESEARCH_REPEAT", "2"))
     require(1 <= repetitions <= 20, "RESEARCH_REPEAT must be 1..20")
     try:
@@ -602,9 +610,17 @@ def main():
             for repeat in range(repetitions):
                 label = f"scenario-{scenario:02}-run-{repeat + 1}"
                 output, code, duration = emulate(image, label)
-                verify(output, code, scenario)
-                results.append({"case": label, "scenario": NAMES[scenario], "seconds": duration,
-                                "exit": code, "passed": True})
+                evidence = verify(output, code, scenario)
+                result = {"case": label, "scenario": NAMES[scenario], "seconds": duration,
+                          "exit": code, "passed": True, "new_hosting_case": scenario >= 21,
+                          "boot_image_sha256": hashlib.sha256(image.read_bytes()).hexdigest()}
+                if evidence is not None: result["evidence"] = evidence
+                results.append(result)
+                if scenario >= 21 and repeat == 0:
+                    import hosting_oracle
+                    controls = hosting_oracle.negative_controls(output, code, scenario)
+                    negatives.append({"scenario": scenario, "controls": controls, "passed": True})
+                    print(f"PASS hosting oracle {scenario}: {len(controls)} negative controls", flush=True)
             print(f"PASS {scenario:02} {NAMES[scenario]} ({repetitions} runs)", flush=True)
         image = LOGS / "scenario-00" / "zeal.img"
         for cpu, memory in (("qemu64", "32M"), ("max", "128M")):
@@ -612,6 +628,15 @@ def main():
             output, code, duration = emulate(image, label, cpu, memory)
             verify(output, code, 0)
             results.append({"case": label, "seconds": duration, "passed": True})
+            print(f"PASS {label}", flush=True)
+        for scenario, cpu, memory in ((21, "qemu64", "32M"), (22, "max", "128M")):
+            label = f"hosting-platform-{scenario}-{cpu}-{memory}"
+            hosted_image = LOGS / f"scenario-{scenario}" / "zeal.img"
+            output, code, duration = emulate(hosted_image, label, cpu, memory)
+            evidence = verify(output, code, scenario)
+            results.append({"case": label, "seconds": duration, "exit": code,
+                            "passed": True, "new_hosting_case": True, "evidence": evidence,
+                            "boot_image_sha256": hashlib.sha256(hosted_image.read_bytes()).hexdigest()})
             print(f"PASS {label}", flush=True)
         output, code, duration = emulate(LOGS / "scenario-18" / "zeal.img",
                                          "sysenter-intel", "max,vendor=GenuineIntel")
@@ -661,8 +686,8 @@ def main():
         label = "idle-supervisor-waits"
         output, code, duration = emulate(image, label)
         events = records(output)
-        require(code == 1 and output.count("ZEAL boot abi=3 x86_64") == 1 and
-                output.count("MANIFEST_ACCEPT version=1") == 1 and
+        require(code == 1 and output.count("ZEAL boot abi=4 x86_64") == 1 and
+                output.count("MANIFEST_ACCEPT version=2") == 1 and
                 output.count("RESEARCH_PASS scenario=0x0000000000000013") == 1 and
                 not any(word in output for word in ("PANIC", "RESEARCH_FAIL", "bad-report")),
                 "standalone waiting supervisor did not complete with the expected emulator exit")
@@ -677,6 +702,9 @@ def main():
         print(f"FAIL {exc}\nInspect {LOGS}", file=sys.stderr)
         return 1
     finally:
+        (LOGS / "hosting-negative-controls.json").write_text(json.dumps(
+            {"passed": len(negatives) == 3 and all(item["passed"] for item in negatives),
+             "cases": negatives}, indent=2) + "\n")
         (LOGS / "results.json").write_text(json.dumps({"passed": all(r["passed"] for r in results),
                                                      "cases": results}, indent=2) + "\n")
     print(f"Research suite: {len(results)} emulator runs passed. Logs: {LOGS}")

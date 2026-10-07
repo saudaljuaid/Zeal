@@ -296,6 +296,46 @@ bool arch_cell_copy_out(unsigned cell, uint64_t destination,
                            destination, source, length);
 }
 
+bool arch_cell_range(unsigned cell, uint64_t address, size_t length, bool write)
+{
+    return cell < Z_CELL_COUNT && spaces[cell].ready &&
+        z_memory_copy_valid(&memory_pool, cell, &spaces[cell].layout, address, length, write);
+}
+
+bool arch_cell_copy_in(unsigned cell, void *destination, uint64_t source, size_t length)
+{
+    return cell < Z_CELL_COUNT && spaces[cell].ready &&
+        z_memory_copy_in(&memory_pool, cell, &spaces[cell].layout, destination, source, length);
+}
+
+unsigned arch_space_pages(unsigned cell)
+{
+    return cell < Z_CELL_COUNT ? memory_pool.cells[cell].count : 0;
+}
+
+bool arch_memory_check(void)
+{
+    return z_memory_check(&memory_pool);
+}
+
+uint32_t arch_space_page_id(unsigned cell, unsigned page)
+{
+    return cell < Z_CELL_COUNT && page < memory_pool.cells[cell].count ?
+        memory_pool.cells[cell].pages[page] : UINT32_MAX;
+}
+
+bool arch_space_zero(unsigned cell)
+{
+    if (cell >= Z_CELL_COUNT || !spaces[cell].ready) return false;
+    for (unsigned page = 0; page < memory_pool.cells[cell].count; ++page) {
+        const uint8_t *bytes = z_memory_page(&memory_pool, cell, page);
+        if (bytes == NULL) return false;
+        for (unsigned i = 0; i < Z_MANIFEST_PAGE_SIZE; ++i)
+            if (bytes[i] != 0) return false;
+    }
+    return true;
+}
+
 void arch_frame_init(struct z_frame *frame, unsigned cell)
 {
     if (cell >= Z_CELL_COUNT || !spaces[cell].ready)

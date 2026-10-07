@@ -1,6 +1,7 @@
 #include <zeal/abi.h>
 #include <zeal/arch.h>
 #include <zeal/ipc.h>
+#include <zeal/hosting.h>
 #include <zeal/memory.h>
 #include <zeal/wait.h>
 
@@ -19,13 +20,18 @@ extern const unsigned char _binary_filesystem_bin_start[], _binary_filesystem_bi
 extern const unsigned char _binary_client_bin_start[], _binary_client_bin_end[];
 extern const unsigned char _binary_probe_bin_start[], _binary_probe_bin_end[];
 extern const unsigned char _binary_manifest_bin_start[], _binary_manifest_bin_end[];
+extern const unsigned char _binary_supervisor_bin_start[], _binary_supervisor_bin_end[];
+extern const unsigned char _binary_worker_bin_start[], _binary_worker_bin_end[];
 
 static struct z_broker broker;
 static struct z_wait_table waits;
+static struct z_refresh_state root_refresh;
 static struct z_manifest manifest;
+static struct z_runtime runtime;
+static struct z_image_catalog catalog[6];
 static struct z_frame frames[Z_CELL_COUNT];
-static const unsigned char *images[Z_CELL_COUNT];
-static size_t image_lengths[Z_CELL_COUNT];
+static const unsigned char *images[Z_MANIFEST_IMAGE_COUNT_MAX];
+static size_t image_lengths[Z_MANIFEST_IMAGE_COUNT_MAX];
 static unsigned current;
 static uint64_t ticks, reads;
 static uint64_t sends[Z_CELL_COUNT], fault_sends[2], fault_reads[2];
@@ -34,9 +40,31 @@ static bool contract_ok, finished;
 static unsigned wait_events[Z_CELL_COUNT], idle_events;
 static bool wait_traced[Z_CELL_COUNT];
 static unsigned storage_events, storage_reports;
+static unsigned refresh_events;
+static unsigned refresh_cell;
 static unsigned storage_stage;
 static uint64_t storage_checkpoint;
 static bool storage_done;
+static unsigned hosting_events, hosting_reports;
+static uint64_t hosting_storage_cycles;
+static bool hosting_complete, hosting_storage_ready;
+static uint64_t hosting_last_cleanup_tick, hosting_cycle_boundary_tick;
+static bool hosting_post_cleanup_verified;
+
+static unsigned storage_trace_limit(void)
+{
+    /* Hosting preservation observes two files through longer subtree recovery
+     * and teardown intervals. Legacy scenarios retain their original limit. */
+    return Z_SCENARIO >= 21 && Z_SCENARIO <= 23 ? 1024u : 512u;
+}
+
+static bool storage_trace_credit(unsigned *used)
+{
+    unsigned limit = storage_trace_limit();
+    if (*used < limit) { ++*used; return true; }
+    if (*used == limit) { ++*used; serial_puts("STORAGE_TRACE_EXHAUSTED\n"); }
+    return false;
+}
 
 static void field(const char *name, uint64_t value)
 {
@@ -46,7 +74,7 @@ static void field(const char *name, uint64_t value)
 static void event(const char *name, unsigned cell)
 {
     serial_puts("EVENT "); serial_puts(name);
-    field("cell", cell); field("identity", manifest.cells[cell].identity);
+    field("cell", cell); field("identity", runtime.initialized ? runtime.records[cell].config.identity : manifest.cells[cell].identity);
     field("generation", broker.policies[cell].generation); field("tick", ticks);
 }
 
@@ -57,11 +85,167 @@ static uint64_t storage_word(const uint8_t *bytes, unsigned count)
     return value;
 }
 
+static void page_fields(unsigned cell)
+{
+    unsigned count = arch_space_pages(cell);
+    field("physical_pages", count);
+    for (unsigned i = 0; i < count; ++i) {
+        char name[4] = { 'p', 0, 0, 0 };
+        if (i < 10) name[1] = (char)('0' + i);
+        else { name[1] = '1'; name[2] = (char)('0' + i - 10); }
+        field(name, arch_space_page_id(cell, i));
+    }
+}
+
+static bool hosting_trace_credit(void)
+{
+    if (hosting_events < 2048) { ++hosting_events; return true; }
+    if (hosting_events == 2048) {
+        ++hosting_events; serial_puts("HOSTING_TRACE_EXHAUSTED\n");
+    }
+    return false;
+}
+
+static void trace_host_ipc(const struct z_message *message, unsigned cell,
+                            uint64_t target, uint64_t capability, int result, bool delivered)
+{
+    if (Z_SCENARIO < 21 || Z_SCENARIO > 23 ||
+        (message->operation != Z_HOST_REQUEST && message->operation != Z_HOST_REPLY) ||
+        !hosting_trace_credit()) return;
+    event(delivered ? "host-ipc-deliver" : result == Z_OK ? "host-ipc-enqueue" : "host-ipc-reject", cell);
+    field("sender", message->sender); field("target", target); field("cap", capability);
+    field("operation", message->operation); field("length", message->length);
+    field("request", storage_word(message->payload, 8));
+    field("command", storage_word(message->payload + 8, 4));
+    field("reserved", storage_word(message->payload + 12, 4));
+    field("argument", storage_word(message->payload + 16, 8));
+    field("value", storage_word(message->payload + 24, 8));
+    field("result", (uint64_t)(int64_t)result); serial_puts("\n");
+}
+
+static void runtime_trace(void *context, const struct z_runtime_event *record)
+{
+    (void)context;
+    if (Z_SCENARIO < 21 || Z_SCENARIO > 23 || !hosting_trace_credit()) return;
+    static const char *const names[] = {
+        "host-request", "host-reserve", "host-space", "host-channel", "host-publish",
+        "host-abort", "host-result", "host-status", "host-stop", "host-reap",
+        "host-fault", "host-backoff", "host-restart", "host-rebind", "host-revoke",
+        "host-cancel", "host-invalidate", "host-cleanup", "host-return", "host-domain",
+    };
+    if (record->kind >= sizeof(names) / sizeof(names[0])) return;
+    unsigned cell = record->cell;
+    const struct z_runtime_record *owned = &record->record;
+    const struct z_host_transaction *transaction = &record->transaction;
+    serial_puts("EVENT "); serial_puts(names[record->kind]);
+    field("cell", cell); field("identity", owned->config.identity);
+    field("generation", transaction->endpoint ? transaction->endpoint >> 8 : broker.policies[cell].generation);
+    field("tick", ticks); field("caller", record->caller);
+    field("caller_identity", runtime.records[record->caller].config.identity);
+    field("caller_endpoint", record->caller_endpoint); field("request", record->request);
+    field("instance", transaction->instance ? transaction->instance : owned->instance);
+    field("control", transaction->control ? transaction->control : owned->control);
+    field("endpoint", transaction->endpoint ? transaction->endpoint :
+          (broker.policies[cell].generation << 8) | (cell + 1));
+    field("parent_instance", transaction->parent_instance ? transaction->parent_instance : owned->parent_instance);
+    field("parent_endpoint", transaction->parent_endpoint ? transaction->parent_endpoint : owned->parent_endpoint);
+    field("template", transaction->template_id ? transaction->template_id : owned->template_id);
+    field("image", owned->config.image); field("role", owned->role);
+    field("depth", transaction->depth ? transaction->depth : owned->depth);
+    field("pages", transaction->pages ? transaction->pages : owned->allocated_pages);
+    field("reserved_slots", transaction->transaction ? transaction->descendant_slots : owned->reserved_slots);
+    field("reserved_pages", transaction->transaction ? transaction->descendant_pages : owned->reserved_pages);
+    field("creation", transaction->domain ? transaction->domain : owned->creation);
+    field("transaction", transaction->transaction);
+    field("parent_cap", record->parent_cap); field("child_cap", record->child_cap);
+    field("result", (uint64_t)(int64_t)record->result);
+    field("phase", broker.policies[cell].phase); field("deadline", broker.policies[cell].deadline);
+    field("reason", owned->last_reason);
+    field("queued", record->queued); field("retired_pages", record->retired_pages);
+    field("retained", runtime.records[cell].origin != Z_RUNTIME_FREE);
+    if (record->kind == Z_RUNTIME_REQUEST ||
+        (record->kind == Z_RUNTIME_RESULT && record->result != Z_OK)) {
+        field("requested_slots", transaction->descendant_slots);
+        field("requested_pages", transaction->descendant_pages);
+    }
+    if (record->kind == Z_RUNTIME_SPACE || record->kind == Z_RUNTIME_RESTART) {
+        field("cs", frames[cell].cs); field("rip", frames[cell].rip); field("rsp", frames[cell].rsp);
+        field("ss", frames[cell].ss); field("rflags", frames[cell].flags);
+        field("zero", arch_space_zero(cell)); page_fields(cell);
+    }
+    if (record->kind == Z_RUNTIME_CHANNEL || record->kind == Z_RUNTIME_REBIND) {
+        uint64_t handles[] = { record->parent_cap, record->child_cap };
+        const char *prefix[] = { "parent", "child" };
+        for (unsigned direction = 0; direction < 2; ++direction) {
+            unsigned encoded = (unsigned)(handles[direction] & 255);
+            if (encoded == 0 || encoded > Z_CAPACITY) continue;
+            const struct z_cap_entry *grant = &broker.capabilities.entries[encoded - 1];
+            serial_puts(" "); serial_puts(prefix[direction]); serial_puts("_holder="); serial_hex(grant->holder);
+            serial_puts(" "); serial_puts(prefix[direction]); serial_puts("_target="); serial_hex(grant->target);
+            serial_puts(" "); serial_puts(prefix[direction]); serial_puts("_issuer="); serial_hex(grant->issuer);
+            serial_puts(" "); serial_puts(prefix[direction]); serial_puts("_rights="); serial_hex(grant->rights);
+            serial_puts(" "); serial_puts(prefix[direction]); serial_puts("_derivation="); serial_hex(grant->parent);
+            serial_puts(" "); serial_puts(prefix[direction]); serial_puts("_epoch="); serial_hex(grant->epoch);
+        }
+        field("recipe", transaction->bootstrap_recipe);
+    }
+    if (record->kind == Z_RUNTIME_CANCEL) {
+        field("wait_generation", record->wait.generation); field("wait_kind", record->wait.kind);
+        field("wait_deadline", record->wait.deadline);
+        wait_traced[cell] = false;
+    }
+    if (record->kind == Z_RUNTIME_DOMAIN) {
+        const struct z_domain_status *domain = &record->domain;
+        field("domain", domain->domain); field("holder", domain->holder);
+        field("domain_instance", domain->instance);
+        field("slot_limit", domain->slot_limit); field("page_limit", domain->page_limit);
+        field("owned_slots", domain->owned_slots); field("owned_pages", domain->owned_pages);
+        field("domain_reserved_slots", domain->reserved_slots); field("domain_reserved_pages", domain->reserved_pages);
+        field("available_slots", domain->available_slots); field("available_pages", domain->available_pages);
+        field("max_depth", domain->max_depth); field("template_mask", domain->template_mask);
+        field("recipe", domain->recipe); field("revoked", domain->revoked);
+    }
+    serial_puts("\n");
+    if (record->kind == Z_RUNTIME_PUBLISH) {
+        run_ticks[cell] = 0;
+        if (boots[cell] != UINT32_MAX) ++boots[cell];
+    }
+    if (record->kind == Z_RUNTIME_STOP || record->kind == Z_RUNTIME_REAP) {
+        hosting_last_cleanup_tick = ticks; hosting_post_cleanup_verified = false;
+    }
+}
+
+static bool runtime_range(void *context, unsigned cell, uint64_t address, size_t length, bool write)
+{ (void)context; return arch_cell_range(cell, address, length, write); }
+static bool runtime_copy_in(void *context, unsigned cell, void *destination, uint64_t source, size_t length)
+{ (void)context; return arch_cell_copy_in(cell, destination, source, length); }
+static bool runtime_copy_out(void *context, unsigned cell, uint64_t destination, const void *source, size_t length)
+{ (void)context; return arch_cell_copy_out(cell, destination, source, length); }
+static bool runtime_space_init(void *context, unsigned cell, const void *image, size_t length,
+                                const struct z_manifest_cell *config)
+{ (void)context; return arch_space_init(cell, image, length, config); }
+static bool runtime_space_reset(void *context, unsigned cell, const void *image, size_t length,
+                                 const struct z_manifest_cell *config)
+{ (void)context; return arch_space_reset(cell, image, length, config); }
+static void runtime_space_release(void *context, unsigned cell)
+{ (void)context; arch_space_release(cell); }
+static bool runtime_frame_init(void *context, unsigned cell, struct z_frame *frame)
+{ (void)context; arch_frame_init(frame, cell); return true; }
+static unsigned runtime_space_pages(void *context, unsigned cell)
+{ (void)context; return arch_space_pages(cell); }
+static bool runtime_memory_check(void *context)
+{ (void)context; return arch_memory_check(); }
+
+static const struct z_runtime_callbacks runtime_callbacks = {
+    runtime_range, runtime_copy_in, runtime_copy_out, runtime_space_init,
+    runtime_space_reset, runtime_space_release, runtime_frame_init,
+    runtime_space_pages, runtime_memory_check, runtime_trace,
+};
+
 static void trace_storage(const struct z_message *message, uint64_t target, uint64_t cap, int result)
 {
     if (message->operation < Z_BLOCK_READ || message->operation > Z_FILE_RESULT ||
-        storage_events >= 512) return;
-    ++storage_events;
+        !storage_trace_credit(&storage_events)) return;
     event(result == Z_OK ? "storage-ipc" : "storage-reject", current);
     field("target", target); field("cap", cap); field("outcome", (uint64_t)(int64_t)result);
     field("operation", message->operation); field("length", message->length);
@@ -76,7 +260,7 @@ static void wait_event(const char *name, unsigned cell,
                         const struct z_wait_entry *entry)
 {
     serial_puts("EVENT "); serial_puts(name);
-    field("cell", cell); field("identity", manifest.cells[cell].identity);
+    field("cell", cell); field("identity", runtime.initialized ? runtime.records[cell].config.identity : manifest.cells[cell].identity);
     field("generation", entry->generation); field("tick", ticks);
     field("kind", entry->kind); field("deadline", entry->deadline);
 }
@@ -104,16 +288,18 @@ static bool receive_copy(void *context, unsigned cell, uint64_t generation,
                           uint64_t destination, const struct z_message *message)
 {
     (void)context;
-    if (cell >= manifest.cell_count || broker.policies[cell].phase != Z_POLICY_READY ||
+    if (cell >= Z_CELL_COUNT || runtime.records[cell].origin == Z_RUNTIME_FREE || broker.policies[cell].phase != Z_POLICY_READY ||
         broker.policies[cell].generation != generation)
         return false;
-    return message == NULL ? arch_cell_copy_valid(cell, destination, sizeof(*message)) :
-        arch_cell_copy_out(cell, destination, message, sizeof(*message));
+    if (message == NULL) return arch_cell_copy_valid(cell, destination, sizeof(*message));
+    if (!arch_cell_copy_out(cell, destination, message, sizeof(*message))) return false;
+    trace_host_ipc(message, cell, z_policy_handle(&broker.policies[cell], cell), 0, Z_OK, true);
+    return true;
 }
 
 static void complete_waits(void)
 {
-    for (unsigned cell = 0; cell < manifest.cell_count; ++cell) {
+    for (unsigned cell = 0; cell < Z_CELL_COUNT; ++cell) {
         struct z_wait_entry owned = waits.entries[cell];
         int result;
         enum z_wake_reason reason;
@@ -155,12 +341,13 @@ static void load_manifest(void)
     image_lengths[1] = (size_t)(_binary_filesystem_bin_end - _binary_filesystem_bin_start);
     image_lengths[2] = (size_t)(_binary_client_bin_end - _binary_client_bin_start);
     image_lengths[3] = (size_t)(_binary_probe_bin_end - _binary_probe_bin_start);
-    const struct z_image_catalog catalog[] = {
-        { 1, images[0], image_lengths[0], Z_IMAGE_BASE },
-        { 2, images[1], image_lengths[1], Z_IMAGE_BASE },
-        { 3, images[2], image_lengths[2], Z_IMAGE_BASE },
-        { 4, images[3], image_lengths[3], Z_IMAGE_BASE },
-    };
+    images[4] = _binary_supervisor_bin_start;
+    images[5] = _binary_worker_bin_start;
+    image_lengths[4] = (size_t)(_binary_supervisor_bin_end - _binary_supervisor_bin_start);
+    image_lengths[5] = (size_t)(_binary_worker_bin_end - _binary_worker_bin_start);
+    static const uint32_t roles[] = { Z_BLOCK, Z_FS, Z_CLIENT, Z_PROBE, Z_SUPERVISOR, Z_WORKER };
+    for (unsigned i = 0; i < 6; ++i)
+        catalog[i] = (struct z_image_catalog) { i + 1, roles[i], images[i], image_lengths[i], Z_IMAGE_BASE };
     size_t length = (size_t)(_binary_manifest_bin_end - _binary_manifest_bin_start);
     enum z_manifest_error error;
     if (!z_manifest_validate(_binary_manifest_bin_start, length, catalog,
@@ -168,16 +355,28 @@ static void load_manifest(void)
         serial_puts("MANIFEST_REJECT reason="); serial_puts(z_manifest_diagnostic(error));
         serial_puts("\n"); arch_finish(3);
     }
-    serial_puts("MANIFEST_ACCEPT version=1 cells="); serial_hex(manifest.cell_count);
+    serial_puts("MANIFEST_ACCEPT version=2 cells="); serial_hex(manifest.cell_count);
     serial_puts(" grants="); serial_hex(manifest.grant_count); serial_puts("\n");
 }
 
 static unsigned role_slot(unsigned role)
 {
-    uint32_t image = role + 1;
-    for (unsigned i = 0; i < manifest.cell_count; ++i)
-        if (manifest.cells[i].image == image) return i;
-    return Z_CELL_COUNT;
+    static const uint32_t identities[] = { 100, 200, 300, 400 };
+    if (role >= sizeof(identities) / sizeof(identities[0])) return Z_CELL_COUNT;
+    int slot = z_manifest_slot(&manifest, identities[role]);
+    return slot >= 0 ? (unsigned)slot : Z_CELL_COUNT;
+}
+
+static void note_boot(unsigned cell)
+{
+    const struct z_manifest_cell *config = runtime.initialized ? &runtime.records[cell].config : &manifest.cells[cell];
+    run_ticks[cell] = 0;
+    if (boots[cell] != UINT32_MAX) ++boots[cell];
+    event("boot", cell);
+    field("image", config->image); field("abi", config->abi);
+    field("entry", config->entry); field("image_budget", config->image_budget);
+    field("writable_budget", config->writable_budget); field("config", config->boot_config);
+    page_fields(cell); serial_puts("\n");
 }
 
 static void cold_boot(unsigned cell)
@@ -188,13 +387,7 @@ static void cold_boot(unsigned cell)
     if (!arch_space_reset(cell, images[image], image_lengths[image], config))
         panic("manifest cell memory reset failed");
     arch_frame_init(&frames[cell], cell);
-    run_ticks[cell] = 0;
-    ++boots[cell];
-    event("boot", cell);
-    field("image", config->image); field("abi", config->abi);
-    field("entry", config->entry); field("image_budget", config->image_budget);
-    field("writable_budget", config->writable_budget); field("config", config->boot_config);
-    serial_puts("\n");
+    note_boot(cell);
 }
 
 static void fail_cell(unsigned cell, uint64_t reason, uint64_t error, uint64_t address)
@@ -203,8 +396,7 @@ static void fail_cell(unsigned cell, uint64_t reason, uint64_t error, uint64_t a
     event("fault", cell); field("reason", reason); field("error", error);
     field("address", address); serial_puts("\n");
     if (cell < 2) { fault_sends[cell] = sends[cell]; fault_reads[cell] = reads; }
-    z_broker_revoke(&broker, cell);
-    z_policy_fault(&broker.policies[cell], ticks);
+    if (z_runtime_fault(&runtime, cell, ticks, reason) != Z_OK) panic("runtime fault policy rejected live cell");
     run_ticks[cell] = 0;
     if (broker.policies[cell].phase == Z_POLICY_QUARANTINED) {
         arch_space_release(cell);
@@ -214,12 +406,13 @@ static void fail_cell(unsigned cell, uint64_t reason, uint64_t error, uint64_t a
 
 static void supervisor_tick(void)
 {
+    bool root_changed = false;
     if (Z_SCENARIO == 12 && ticks == 10) __asm__ volatile("ud2");
-    if (Z_SOLO < 0 && Z_SCENARIO != 20 && ticks == 20) {
+    if (Z_SOLO < 0 && Z_SCENARIO < 20 && ticks == 20) {
         unsigned block = role_slot(Z_BLOCK);
         if (block < manifest.cell_count) fail_cell(block, 64, 0, 0);
     }
-    if (Z_SOLO < 0 && Z_SCENARIO != 20 && ticks == 40) {
+    if (Z_SOLO < 0 && Z_SCENARIO < 20 && ticks == 40) {
         unsigned fs = role_slot(Z_FS);
         if (fs < manifest.cell_count) fail_cell(fs, 64, 0, 0);
     }
@@ -229,12 +422,30 @@ static void supervisor_tick(void)
         ++storage_stage;
         if (service < manifest.cell_count) fail_cell(service, 64, 0, 0);
     }
-    for (unsigned i = 0; i < manifest.cell_count; ++i) {
+    for (unsigned i = 0; i < Z_CELL_COUNT; ++i) {
         if (!z_policy_check(&broker.policies[i])) panic("policy invariant");
-        if (z_policy_poll(&broker.policies[i], ticks)) {
-            cold_boot(i);
-            if (z_broker_refresh(&broker) != Z_OK) panic("capability refresh exhausted");
+        int restarted = z_runtime_poll(&runtime, i, ticks);
+        if (restarted < 0) {
+            if (restarted != Z_NO_SPACE || broker.policies[i].phase != Z_POLICY_STOPPED ||
+                arch_space_pages(i) != 0 || !z_runtime_check(&runtime))
+                panic("reserved restart invariant failed");
+            event("restart-unavailable", i); field("result", (uint64_t)(int64_t)restarted);
+            serial_puts("\n");
+            continue;
         }
+        if (restarted) {
+            note_boot(i);
+            if (i < Z_ROOT_COUNT) { root_changed = true; refresh_cell = i; }
+        }
+    }
+    if (root_changed || root_refresh.pending) {
+        int result = z_broker_refresh_bounded(&broker, &root_refresh, ticks, root_changed);
+        if (result == Z_NO_SPACE && refresh_events < 16) {
+            ++refresh_events; event("cap-refresh-unavailable", refresh_cell);
+            field("result", (uint64_t)(int64_t)result); field("closed", root_refresh.closed);
+            field("deadline", root_refresh.deadline); serial_puts("\n");
+        } else if (result != Z_OK && result != Z_AGAIN && result != Z_NO_SPACE)
+            panic("static grant refresh invariant failed");
     }
 }
 
@@ -259,11 +470,108 @@ static void observe_read(void)
     }
 }
 
+static int64_t hosting_management(struct z_frame *frame)
+{
+    int result;
+    switch (frame->rax) {
+    case Z_CREATE: result = z_runtime_create(&runtime, current, frame->rdi, frame->rsi, frame->rdx); break;
+    case Z_CELL_STATUS: result = z_runtime_status(&runtime, current, frame->rdi, frame->rsi, frame->rdx); break;
+    case Z_CELL_STOP:
+        result = frame->rsi || frame->rdx ? Z_INVALID : z_runtime_stop(&runtime, current, frame->rdi); break;
+    case Z_CELL_REAP:
+        result = frame->rsi || frame->rdx ? Z_INVALID : z_runtime_reap(&runtime, current, frame->rdi); break;
+    case Z_CELL_REBIND: result = z_runtime_rebind(&runtime, current, frame->rdi, frame->rsi, frame->rdx); break;
+    case Z_CREATION_REVOKE:
+        result = frame->rsi || frame->rdx ? Z_INVALID : z_runtime_revoke(&runtime, current, frame->rdi); break;
+    case Z_DOMAIN_STATUS: result = z_runtime_domain_status(&runtime, current, frame->rdi, frame->rsi, frame->rdx); break;
+    default: return Z_INVALID;
+    }
+    if (Z_SCENARIO >= 21 && Z_SCENARIO <= 23 && hosting_trace_credit()) {
+        event("host-call", current); field("caller_endpoint", z_policy_handle(&broker.policies[current], current));
+        field("call", frame->rax); field("arg0", frame->rdi); field("arg1", frame->rsi); field("arg2", frame->rdx);
+        field("result", (uint64_t)(int64_t)result); serial_puts("\n");
+    }
+    return result;
+}
+
+static int hosting_report(struct z_frame *frame)
+{
+    if (hosting_reports >= 256 || !hosting_trace_credit()) return Z_TOO_LARGE;
+    unsigned code = (unsigned)frame->rdi;
+    unsigned role = runtime.records[current].role;
+    bool dynamic = runtime.records[current].origin == Z_RUNTIME_CHILD;
+    bool controller = runtime.records[current].origin == Z_RUNTIME_ROOT &&
+        runtime.records[current].config.identity == 400;
+    bool client = runtime.records[current].origin == Z_RUNTIME_ROOT &&
+        runtime.records[current].config.identity == 300;
+    const char *name = NULL;
+    switch (code) {
+    case 40:
+        if (!dynamic || frame->rsi != z_policy_handle(&broker.policies[current], current) ||
+            frame->rdx != runtime.records[current].instance) return Z_DENIED;
+        name = "host-entry"; break;
+    case 41: {
+        uint64_t stack, heap;
+        if (!dynamic || !arch_cell_copy_in(current, &stack, Z_STACK_BASE + 64, sizeof(stack)) ||
+            !arch_cell_copy_in(current, &heap, Z_WRITABLE_BASE, sizeof(heap)) ||
+            stack != 0 || heap != 0 || frame->rsi != stack || frame->rdx != heap) return Z_DENIED;
+        name = "host-cold"; break;
+    }
+    case 42: {
+        uint64_t heap[2];
+        if (!dynamic || !arch_cell_copy_in(current, heap, Z_WRITABLE_BASE, sizeof(heap)) ||
+            frame->rsi != heap[0] || frame->rdx != heap[1]) return Z_DENIED;
+        name = "host-memory"; break;
+    }
+    case 43: if (!dynamic) return Z_DENIED; name = "host-computed"; break;
+    case 44: if (!controller) return Z_DENIED; name = "host-verified"; break;
+    case 45: if (role != Z_SUPERVISOR || !dynamic) return Z_DENIED; name = "host-nested-verified"; break;
+    case 46: if (role != Z_WORKER || !dynamic) return Z_DENIED; name = "host-sleep-start"; break;
+    case 47: if (role != Z_WORKER || !dynamic) return Z_DENIED; name = "host-sleep-return"; break;
+    case 48: if (role != Z_WORKER || !dynamic) return Z_DENIED; name = "host-timeout"; break;
+    case 49: if (!dynamic) return Z_DENIED; name = "host-storage-denied"; break;
+    case 50: if (!controller) return Z_DENIED; name = "host-rebound"; break;
+    case 51: if (!controller) return Z_DENIED; name = "host-stale"; break;
+    case 52: if (!controller) return Z_DENIED; name = "host-denied"; break;
+    case 53: if (!controller && role != Z_SUPERVISOR) return Z_DENIED; name = "host-ledger"; break;
+    case 54: if (!controller) return Z_DENIED; name = "host-fifo"; break;
+    case 55: if (!controller) return Z_DENIED; name = "host-reaped"; break;
+    case 56:
+        if (!controller || frame->rsi != Z_SCENARIO || frame->rdx != 0) return Z_DENIED;
+        hosting_complete = true; name = "host-complete"; break;
+    case 57: if (!dynamic) return Z_DENIED; name = "host-copied"; break;
+    case 58: if (role != Z_SUPERVISOR || !dynamic) return Z_DENIED; name = "host-backoff-observed"; break;
+    case 59: if (!controller) return Z_DENIED; name = "host-probe-verified"; break;
+    case 64:
+        if (!client || frame->rsi == 0 || frame->rdx == 0 || frame->rsi == frame->rdx) return Z_DENIED;
+        hosting_storage_ready = true; name = "hosting-storage-ready"; break;
+    case 65:
+        if (!client || !hosting_storage_ready || frame->rdx != 7 || frame->rsi != hosting_storage_cycles)
+            return Z_DENIED;
+        if (hosting_storage_cycles == UINT64_MAX) return Z_NO_SPACE;
+        if (hosting_last_cleanup_tick && hosting_cycle_boundary_tick >= hosting_last_cleanup_tick)
+            hosting_post_cleanup_verified = true;
+        hosting_cycle_boundary_tick = ticks;
+        ++hosting_storage_cycles; name = "hosting-storage-cycle"; break;
+    default: return Z_INVALID;
+    }
+    ++hosting_reports;
+    event(name, current); field("value", frame->rsi); field("extra", frame->rdx);
+    field("endpoint", z_policy_handle(&broker.policies[current], current));
+    field("instance", runtime.records[current].instance);
+    field("template", runtime.records[current].template_id); field("depth", runtime.records[current].depth);
+    field("parent_endpoint", runtime.records[current].parent_endpoint);
+    serial_puts("\n"); return Z_OK;
+}
+
 static int64_t syscall(struct z_frame *frame)
 {
     struct z_message message;
     uint64_t argument = frame->rdi;
     switch (frame->rax) {
+    case Z_CREATE: case Z_CELL_STATUS: case Z_CELL_STOP: case Z_CELL_REAP:
+    case Z_CELL_REBIND: case Z_CREATION_REVOKE: case Z_DOMAIN_STATUS:
+        return hosting_management(frame);
     case Z_YIELD: return Z_OK;
     case Z_SLEEP: {
         int result = z_wait_sleep(&waits, &broker, current, ticks, argument);
@@ -282,7 +590,9 @@ static int64_t syscall(struct z_frame *frame)
         arch_user_copy_in(&message, frame->rsi, sizeof(message));
         {
             int result = z_broker_send(&broker, current, argument, frame->rdx, &message);
-            if (result == Z_OK) ++sends[current];
+            if (result == Z_OK && sends[current] != UINT64_MAX) ++sends[current];
+            message.sender = z_policy_handle(&broker.policies[current], current);
+            trace_host_ipc(&message, current, argument, frame->rdx, result, false);
             trace_storage(&message, argument, frame->rdx, result);
             return result;
         }
@@ -295,9 +605,11 @@ static int64_t syscall(struct z_frame *frame)
     }
     case Z_BOOT:
         if (!arch_user_range(argument, sizeof(struct z_boot_info), true)) return Z_BAD_ADDRESS;
-        { struct z_boot_info info = { Z_ABI_VERSION, manifest.cells[current].image - 1,
-              broker.policies[current].generation, manifest.cells[current].boot_config };
-          arch_user_copy_out(argument, &info, sizeof(info)); return Z_OK; }
+        { struct z_boot_info info;
+          int result = z_runtime_boot(&runtime, current, &info);
+          if (result == Z_OK) arch_user_copy_out(argument, &info, sizeof(info));
+          return result; }
+
     case Z_CAP_FIND:
         if (frame->rsi > UINT32_MAX) return Z_INVALID;
         return z_broker_find(&broker, current, argument, (uint32_t)frame->rsi);
@@ -331,62 +643,63 @@ static int64_t syscall(struct z_frame *frame)
         return result;
     }
     case Z_REPORT:
-        if (argument == 7 && manifest.cells[current].image == 4) {
+        if (Z_SCENARIO >= 21 && Z_SCENARIO <= 23 &&
+            ((argument >= 40 && argument <= 59) || argument == 64 || argument == 65))
+            return hosting_report(frame);
+        if (argument == 7 && runtime.records[current].role == Z_PROBE) {
             ++reset_reports; event("reset-memory", current); serial_puts("\n"); return Z_OK;
         }
-        if (argument == 1 && manifest.cells[current].image == 3) {
+        if (argument == 1 && runtime.records[current].role == Z_CLIENT) {
             observe_read(); return Z_OK;
         }
-        if (argument == 2 && manifest.cells[current].image == 4 &&
+        if (argument == 2 && runtime.records[current].role == Z_PROBE &&
             (Z_SCENARIO == 7 || Z_SCENARIO == 8 || Z_SCENARIO == 15 || Z_SCENARIO == 20)) {
             contract_ok = true; event("contract", current); serial_puts("\n"); return Z_OK;
         }
-        if (argument == 8 && manifest.cells[current].image == 3) {
+        if (argument == 8 && runtime.records[current].role == Z_CLIENT) {
             event("healthy-memory", current); field("stack", frame->rsi);
             field("writable", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if (argument == 9 && manifest.cells[current].image == 3) {
+        if (argument == 9 && runtime.records[current].role == Z_CLIENT) {
             event("demo-allowed", current); field("cap", frame->rsi);
             field("parent", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if (argument == 10 && manifest.cells[current].image == 3) {
+        if (argument == 10 && runtime.records[current].role == Z_CLIENT) {
             event("demo-revoked", current); field("cap", frame->rsi);
             field("endpoint", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if (argument == 11 && manifest.cells[current].image == 3) {
+        if (argument == 11 && runtime.records[current].role == Z_CLIENT) {
             event("demo-rebind", current); field("old", frame->rsi);
             field("endpoint", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if (argument == 12 && manifest.cells[current].image == 3) {
+        if (argument == 12 && runtime.records[current].role == Z_CLIENT) {
             event("demo-forbidden", current); field("rights", frame->rsi);
             field("result", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if (argument == 13 && manifest.cells[current].image == 3) {
+        if (argument == 13 && runtime.records[current].role == Z_CLIENT) {
             event("demo-resumed", current); field("reads", reads); serial_puts("\n"); return Z_OK;
         }
-        if (Z_SCENARIO == 19 && argument == 14 && manifest.cells[current].image == 3) {
+        if (Z_SCENARIO == 19 && argument == 14 && runtime.records[current].role == Z_CLIENT) {
             event("wait-progress", current); field("reads", reads); serial_puts("\n"); return Z_OK;
         }
-        if (Z_SCENARIO == 19 && argument == 15 && manifest.cells[current].image == 4) {
+        if (Z_SCENARIO == 19 && argument == 15 && runtime.records[current].role == Z_PROBE) {
             event("wait-delivered", current); field("sender", frame->rsi);
             field("value", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if (Z_SCENARIO == 19 && argument == 16 && manifest.cells[current].image == 4) {
+        if (Z_SCENARIO == 19 && argument == 16 && runtime.records[current].role == Z_PROBE) {
             contract_ok = frame->rsi == 7 && frame->rdx == 3;
             event("wait-contract", current); field("checks", frame->rsi);
             field("duration", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if ((argument == 30 && manifest.cells[current].image == 1) ||
-            (argument == 31 && manifest.cells[current].image == 2)) {
-            if (storage_reports >= 512) return Z_TOO_LARGE;
-            ++storage_reports;
+        if ((argument == 30 && runtime.records[current].role == Z_BLOCK) ||
+            (argument == 31 && runtime.records[current].role == Z_FS)) {
+            if (!storage_trace_credit(&storage_reports)) return Z_TOO_LARGE;
             event(argument == 30 ? "storage-block" : "storage-fs", current);
             field("request", frame->rsi); field("operation", frame->rdx >> 32);
             field("result", frame->rdx & UINT32_MAX); serial_puts("\n"); return Z_OK;
         }
-        if (argument >= 32 && argument <= 36 && manifest.cells[current].image == 3) {
-            if (storage_reports >= 512) return Z_TOO_LARGE;
-            ++storage_reports;
+        if (argument >= 32 && argument <= 36 && runtime.records[current].role == Z_CLIENT) {
+            if (!storage_trace_credit(&storage_reports)) return Z_TOO_LARGE;
             if (argument == 32) {
                 event("storage-verified", current); field("request", frame->rsi);
                 field("data", frame->rdx);
@@ -407,27 +720,24 @@ static int64_t syscall(struct z_frame *frame)
             }
             serial_puts("\n"); return Z_OK;
         }
-        if (argument == 37 && manifest.cells[current].image == 2) {
-            if (storage_reports >= 512) return Z_TOO_LARGE;
-            ++storage_reports;
+        if (argument == 37 && runtime.records[current].role == Z_FS) {
+            if (!storage_trace_credit(&storage_reports)) return Z_TOO_LARGE;
             event("storage-link", current); field("request", frame->rsi);
             field("block_request", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if (argument == 38 && manifest.cells[current].image == 3) {
-            if (storage_reports >= 512) return Z_TOO_LARGE;
-            ++storage_reports;
+        if (argument == 38 && runtime.records[current].role == Z_CLIENT) {
+            if (!storage_trace_credit(&storage_reports)) return Z_TOO_LARGE;
             event("storage-rebind", current); field("old", frame->rsi);
             field("endpoint", frame->rdx); serial_puts("\n"); return Z_OK;
         }
-        if (argument == (uint64_t)manifest.cells[current].image + 2) {
+        if (argument == (uint64_t)runtime.records[current].role + 3) {
             event("entry", current); serial_puts("\n"); return Z_OK;
         }
         event("bad-report", current); field("code", argument); serial_puts("\n");
         fail_cell(current, 66, 0, 0); return Z_INVALID;
     case Z_EXIT:
         cancel_wait(current, 67);
-        z_broker_revoke(&broker, current); z_policy_stop(&broker.policies[current]);
-        arch_space_release(current);
+        if (z_runtime_exit(&runtime, current) != Z_OK) panic("runtime exit policy rejected live cell");
         event("exit", current); serial_puts("\n");
         if (Z_SCENARIO == 19 && Z_SOLO == 3 && Z_TEST) {
             serial_puts(contract_ok ? "RESEARCH_PASS" : "RESEARCH_FAIL");
@@ -441,6 +751,23 @@ static int64_t syscall(struct z_frame *frame)
 
 static void research_check(void)
 {
+    if (Z_SCENARIO >= 21 && Z_SCENARIO <= 23) {
+        if (finished || !hosting_complete || hosting_storage_cycles < 2 || !hosting_post_cleanup_verified) return;
+        bool pass = hosting_storage_ready && hosting_events <= 2048 && hosting_reports < 256 &&
+            storage_events <= storage_trace_limit() && storage_reports <= storage_trace_limit() &&
+            z_runtime_check(&runtime);
+        for (unsigned i = 0; i < Z_ROOT_COUNT; ++i)
+            pass = pass && runtime.records[i].origin == Z_RUNTIME_ROOT &&
+                broker.policies[i].phase == Z_POLICY_READY && broker.policies[i].generation == 1 &&
+                broker.policies[i].faults == 0 && boots[i] == 1;
+        for (unsigned i = Z_ROOT_COUNT; i < Z_CELL_COUNT; ++i)
+            pass = pass && runtime.records[i].origin == Z_RUNTIME_FREE && arch_space_pages(i) == 0;
+        serial_puts(pass ? "RESEARCH_PASS" : "RESEARCH_FAIL");
+        field("scenario", Z_SCENARIO); field("cycles", hosting_storage_cycles); field("tick", ticks);
+        serial_puts("\n"); finished = true;
+        if (!pass || Z_TEST) arch_finish(pass ? 0 : 1);
+        return;
+    }
     if (finished || ticks < (Z_SCENARIO == 20 ? 400u : 120u) || Z_SOLO >= 0) return;
     unsigned block = role_slot(Z_BLOCK), fs = role_slot(Z_FS), client = role_slot(Z_CLIENT);
     unsigned probe = role_slot(Z_PROBE);
@@ -511,9 +838,10 @@ struct z_frame *kernel_trap(struct z_frame *frame)
 
 void kernel_main(void)
 {
-    serial_init(); serial_puts("ZEAL boot abi=3 x86_64\n");
+    serial_init(); serial_puts("ZEAL boot abi=4 x86_64\n");
     arch_init(); load_manifest(); z_broker_init(&broker);
     z_wait_init(&waits);
+    z_broker_refresh_state_init(&root_refresh);
     for (unsigned i = manifest.cell_count; i < Z_CELL_COUNT; ++i)
         broker.policies[i] = (struct z_policy_state){ .phase = Z_POLICY_DORMANT };
     struct z_boot_grant grants[Z_MANIFEST_GRANT_MAX];
@@ -544,6 +872,9 @@ void kernel_main(void)
         cold_boot(i); ++active_count;
     }
     if (!active_count || z_broker_refresh(&broker) != Z_OK) panic("empty boot or initial authority failure");
+    if (z_runtime_init(&runtime, &broker, &waits, frames, &manifest, catalog,
+                         sizeof(catalog) / sizeof(catalog[0]), &runtime_callbacks, NULL) != Z_OK ||
+        !z_runtime_check(&runtime)) panic("runtime registry initialization failed");
     current = role_slot(Z_SOLO >= 0 ? (unsigned)Z_SOLO : Z_BLOCK);
     if (current >= manifest.cell_count || broker.policies[current].phase != Z_POLICY_READY)
         panic("standalone selection is not active");

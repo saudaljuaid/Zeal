@@ -7,7 +7,7 @@ SECTIONS
     __kernel_start = .;
     .text : ALIGN(16) { KEEP(*(.boot.text)) *(.text .text.*) }
     .rodata : ALIGN(16) { *(.rodata .rodata.*) }
-    .data : ALIGN(4096) { *(.boot.data) *(.data .data.*) }
+    .data : ALIGN(4096) { *(.boot.data) *(.data .data.*) *(.got .got.*) }
     __kernel_load_end = .;
     . = 0x200000;
     .bss (NOLOAD) : ALIGN(4096) {
@@ -20,4 +20,4 @@ SECTIONS
     /DISCARD/ : { *(.eh_frame*) *(.note*) *(.comment*) }
 }
 ASSERT(__kernel_load_end <= 0x90000, "BIOS payload exceeds conventional-memory window")
-ASSERT(__kernel_end < 0x40000000, "kernel exceeds identity mapping")
+ASSERT(__kernel_end < 0x400000, "bounded supervisor exceeds 4 MiB static address footprint")

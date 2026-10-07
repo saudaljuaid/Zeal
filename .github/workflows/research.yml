@@ -27,7 +27,11 @@ jobs:
           path: |
             build/test.log
             build/research/**/*.log
-            build/research/results.json
+            build/research/*.json
             build/default/zeal.img
             build/research/scenario-20/zeal.img
+            build/research/scenario-21/zeal.img
+            build/research/scenario-22/zeal.img
+            build/research/scenario-23/zeal.img
+            build/research/scenario-*/footprint.json
           if-no-files-found: warn

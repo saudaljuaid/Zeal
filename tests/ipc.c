@@ -192,11 +192,15 @@ static void storage_rights_are_per_operation(void)
         assert(z_broker_receive(&broker, Z_FS, &output) == Z_OK);
         assert(output.operation == operation && output.sender == endpoint(Z_CLIENT));
     }
+    for (unsigned operation = Z_HOST_REQUEST; operation <= Z_HOST_REPLY; ++operation) {
+        write = message(operation, 1);
+        assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), file, &write) == Z_DENIED);
+    }
     write = message(Z_FILE_RESULT, 1);
     uint64_t reply = grant(Z_FS, Z_CLIENT, Z_RIGHT(Z_FILE_RESULT));
     assert(z_broker_send(&broker, Z_FS, endpoint(Z_CLIENT), reply, &write) == Z_OK);
     assert(z_broker_receive(&broker, Z_CLIENT, &output) == Z_OK);
-    for (unsigned operation = 0; operation <= Z_FILE_RESULT + 1; operation += Z_FILE_RESULT + 1) {
+    for (unsigned operation = 0; operation <= Z_HOST_REPLY + 1; operation += Z_HOST_REPLY + 1) {
         write = message(operation, 1);
         assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), file, &write) == Z_INVALID);
     }
@@ -283,6 +287,147 @@ static void generated_transitions(void)
     }
 }
 
+static uint64_t refresh_pressure(uint64_t delegates[Z_CAPACITY])
+{
+    z_broker_init(&broker);
+    const struct z_boot_grant roots[] = {
+        { Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE, 0 },
+        { Z_PROBE, Z_PROBE, Z_RIGHT(Z_FILE_READ), 0 },
+    };
+    assert(z_broker_configure(&broker, roots, 2) == Z_OK);
+    assert(z_broker_refresh(&broker) == Z_OK);
+    uint64_t removed = grant(Z_PROBE, Z_PROBE, Z_RIGHT(Z_FILE_READ));
+    assert(z_broker_revoke_cap(&broker, Z_PROBE, removed) == Z_OK);
+    uint64_t parent = grant(Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+    for (unsigned i = 0; i < Z_CAPACITY - 1; ++i) {
+        int64_t result = z_broker_delegate(&broker, Z_FS, parent, endpoint(Z_CLIENT), Z_RIGHT(Z_FILE_READ));
+        assert(result > 0); delegates[i] = (uint64_t)result;
+    }
+    z_broker_revoke(&broker, Z_PROBE);
+    z_policy_fault(&broker.policies[Z_PROBE], 10);
+    assert(z_policy_poll(&broker.policies[Z_PROBE], 14) == 1);
+    return removed;
+}
+
+static void bounded_root_refresh_retries_preserve_authority_and_fifo(void)
+{
+    uint64_t delegates[Z_CAPACITY] = {0};
+    uint64_t removed = refresh_pressure(delegates);
+    struct z_message input = message(Z_FILE_READ, 123);
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), delegates[Z_CAPACITY - 2], &input) == Z_OK);
+    struct z_queue queue = broker.queues[Z_FS];
+    struct z_refresh_state state;
+    z_broker_refresh_state_init(&state);
+    uint64_t epoch = broker.capabilities.next_epoch;
+    assert(z_caps_refresh_epoch_status(&broker.capabilities, broker.policies) == Z_OK);
+    assert(z_broker_refresh_bounded(&broker, &state, 14, true) == Z_NO_SPACE);
+    assert(state.pending == 1 && state.deadline == 18 && state.closed == 0);
+    assert(broker.capabilities.next_epoch == epoch);
+    for (uint64_t now = 14; now < 18; ++now) {
+        assert(z_broker_refresh_bounded(&broker, &state, now, true) == Z_AGAIN);
+        assert(state.deadline == 18 && broker.capabilities.next_epoch == epoch);
+    }
+    assert(z_broker_revoke_cap(&broker, Z_FS, delegates[0]) == Z_OK);
+    assert(z_broker_refresh_bounded(&broker, &state, 17, false) == Z_AGAIN);
+    assert(z_broker_refresh_bounded(&broker, &state, 18, false) == Z_OK);
+    assert(state.pending == 0 && state.closed == 0 && state.deadline == 0);
+    uint64_t fresh = grant(Z_PROBE, Z_PROBE, Z_RIGHT(Z_FILE_READ));
+    assert(fresh != removed && broker.capabilities.next_epoch == epoch + 1);
+    assert(z_broker_query(&broker, Z_PROBE, removed, &(struct z_cap_info){0}) == Z_STALE);
+    assert(memcmp(&broker.queues[Z_FS], &queue, sizeof(queue)) == 0);
+    for (unsigned i = 1; i < Z_CAPACITY - 1; ++i)
+        assert(z_caps_check(&broker.capabilities, broker.policies, endpoint(Z_CLIENT), delegates[i],
+            endpoint(Z_FS), Z_RIGHT(Z_FILE_READ)) == Z_OK);
+    /* A same-generation explicit revocation is never reconstructed. */
+    assert(z_broker_revoke_cap(&broker, Z_PROBE, fresh) == Z_OK);
+    epoch = broker.capabilities.next_epoch;
+    assert(z_broker_refresh_bounded(&broker, &state, 19, true) == Z_OK);
+    assert(z_broker_find(&broker, Z_PROBE, endpoint(Z_PROBE), Z_RIGHT(Z_FILE_READ)) == Z_DENIED);
+    assert(broker.capabilities.next_epoch == epoch);
+    /* No dynamic recipe grants enter the permanently reserved root list. */
+    uint64_t parent_cap, child_cap;
+    assert(z_broker_revoke_cap(&broker, Z_FS, delegates[1]) == Z_OK);
+    assert(z_caps_channel(&broker.capabilities, broker.policies, endpoint(Z_PROBE),
+        (UINT64_C(1) << 8) | 5, &parent_cap, &child_cap) == Z_OK);
+    z_policy_init(&broker.policies[4], 0);
+    z_broker_revoke(&broker, 4);
+    z_policy_fault(&broker.policies[4], 20);
+    assert(z_policy_poll(&broker.policies[4], 24) == 1);
+    assert(z_broker_refresh_bounded(&broker, &state, 24, true) == Z_OK);
+    assert(z_broker_find(&broker, Z_PROBE, endpoint(4), Z_RIGHT(Z_HOST_REQUEST)) == Z_DENIED);
+    assert(z_broker_query(&broker, Z_PROBE, parent_cap, &(struct z_cap_info){0}) == Z_STALE);
+}
+
+static void bounded_root_refresh_epoch_deadline_exhaustion_and_malformed_state(void)
+{
+    z_broker_init(&broker);
+    const struct z_boot_grant roots[] = {
+        { Z_FS, Z_FS, Z_RIGHT(Z_FILE_READ), 0 },
+        { Z_PROBE, Z_PROBE, Z_RIGHT(Z_FILE_READ), 0 },
+        { Z_CLIENT, Z_CLIENT, Z_RIGHT(Z_FILE_READ), 0 },
+    };
+    assert(z_broker_configure(&broker, roots, 3) == Z_OK && z_broker_refresh(&broker) == Z_OK);
+    uint64_t preserved = grant(Z_CLIENT, Z_CLIENT, Z_RIGHT(Z_FILE_READ));
+    for (unsigned cell = Z_FS; cell <= Z_PROBE; cell += 2) {
+        z_broker_revoke(&broker, cell); z_policy_fault(&broker.policies[cell], 0);
+        assert(z_policy_poll(&broker.policies[cell], 4) == 1);
+    }
+    broker.capabilities.next_epoch = (uint64_t)Z_POLICY_GENERATION_MAX;
+    /* Two static grants need two distinct epochs; one remaining is terminal
+     * for this atomic batch, even though the raw counter has not overflowed. */
+    assert(z_caps_refresh_epoch_status(&broker.capabilities, broker.policies) == Z_NO_SPACE);
+    struct z_refresh_state state = {0};
+    assert(z_broker_refresh_bounded(&broker, &state, 4, true) == Z_NO_SPACE);
+    assert(state.closed == 1 && state.pending == 0 && state.deadline == 0);
+    assert(z_broker_refresh_bounded(&broker, &state, 8, true) == Z_NO_SPACE);
+    assert(broker.capabilities.next_epoch == (uint64_t)Z_POLICY_GENERATION_MAX);
+    assert(z_broker_query(&broker, Z_CLIENT, preserved, &(struct z_cap_info){0}) == Z_OK);
+    struct z_message input = message(Z_FILE_READ, 71), output;
+    assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_CLIENT), preserved, &input) == Z_OK);
+    assert(z_broker_receive(&broker, Z_CLIENT, &output) == Z_OK);
+    setup(); broker.capabilities.next_epoch = (uint64_t)Z_POLICY_GENERATION_MAX + 1;
+    state = (struct z_refresh_state){0};
+    assert(z_broker_refresh_bounded(&broker, &state, 0, true) == Z_OK);
+    uint64_t delegates[Z_CAPACITY] = {0};
+    refresh_pressure(delegates); state = (struct z_refresh_state){0};
+    assert(z_broker_refresh_bounded(&broker, &state, UINT64_MAX - 3, true) == Z_NO_SPACE);
+    assert(state.closed == 1 && state.deadline == 0 && state.pending == 0);
+    assert(z_broker_refresh_bounded(&broker, &state, UINT64_MAX, true) == Z_NO_SPACE);
+    refresh_pressure(delegates); state = (struct z_refresh_state){0};
+    assert(z_broker_refresh_bounded(&broker, &state, UINT64_MAX - 4, true) == Z_NO_SPACE);
+    assert(state.pending && !state.closed && state.deadline == UINT64_MAX);
+    assert(z_broker_refresh_bounded(&broker, &state, UINT64_MAX - 1, false) == Z_AGAIN);
+    assert(z_broker_revoke_cap(&broker, Z_FS, delegates[0]) == Z_OK);
+    assert(z_broker_refresh_bounded(&broker, &state, UINT64_MAX, false) == Z_OK);
+    z_broker_refresh_state_init(NULL);
+    assert(z_broker_refresh_bounded(NULL, &state, 0, true) == Z_INVALID);
+    assert(z_broker_refresh_bounded(&broker, NULL, 0, true) == Z_INVALID);
+    assert(z_caps_refresh_epoch_status(NULL, broker.policies) == Z_INVALID);
+    assert(z_caps_refresh_epoch_status(&broker.capabilities, NULL) == Z_INVALID);
+    const struct z_refresh_state bad[] = { { .pending = 2 }, { .closed = 2 },
+        { .closed = 1, .pending = 1 }, { .deadline = 1 } };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(*bad); ++i) {
+        state = bad[i]; assert(z_broker_refresh_bounded(&broker, &state, 0, true) == Z_INVALID);
+        assert(memcmp(&state, &bad[i], sizeof(state)) == 0);
+    }
+    struct z_cap_table before = broker.capabilities;
+    for (unsigned field = 0; field < 5; ++field) {
+        broker.capabilities = before;
+        switch (field) {
+        case 0: broker.capabilities.root_count = Z_BOOT_GRANTS + 1; break;
+        case 1: broker.capabilities.reserved = 1; break;
+        case 2: broker.capabilities.roots[0].grant.holder = UINT32_MAX; break;
+        case 3: broker.capabilities.next_epoch = 0; break;
+        case 4: broker.capabilities.roots[0].grant.target = Z_ROOT_COUNT; break;
+        }
+        struct z_cap_table malformed = broker.capabilities;
+        state = (struct z_refresh_state){0};
+        assert(z_broker_refresh_bounded(&broker, &state, 0, true) == Z_INVALID);
+        assert(memcmp(&broker.capabilities, &malformed, sizeof(malformed)) == 0);
+    }
+    broker.capabilities = before;
+}
+
 int main(void)
 {
     _Static_assert(sizeof(struct z_policy_state) == 32, "Rust policy ABI");
@@ -295,6 +440,8 @@ int main(void)
     storage_rights_are_per_operation();
     revoked_storage_is_revalidated_at_delivery();
     generated_transitions();
-    puts("C IPC: bounded queues, per-operation storage rights, write denial/revocation/delivery checks, delegation, restart, seed=0x6d2b79f5, 50000 steps PASS");
+    bounded_root_refresh_retries_preserve_authority_and_fifo();
+    bounded_root_refresh_epoch_deadline_exhaustion_and_malformed_state();
+    puts("C IPC: bounded queues, per-operation storage rights, write denial/revocation/delivery checks, delegation, restart, bounded static-grant pressure/retry/epoch/deadline/malformed controls, seed=0x6d2b79f5, 50000 steps PASS");
     return 0;
 }

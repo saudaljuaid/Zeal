@@ -24,7 +24,8 @@ not download dependencies. The Rust policy has no external crates.
 
 `build/default/zeal.img` is a 16 MiB raw BIOS disk image. The boot sector loads
 the flat kernel, checks CPU requirements, enables long mode, and calls the
-kernel. The kernel embeds four independently linked cell images and the
+kernel. The kernel embeds six checked, independently linked images (four roots
+and two approved runtime templates) and the
 compiled `build/default/manifest.bin`. Cell linking rejects mutable global
 storage; the image checker rejects writable segments, invalid entries, and
 out-of-bounds segments. The manifest compiler rejects invalid source records
@@ -46,6 +47,9 @@ make BUILD=build/probe SOLO=3 SCENARIO=7 run
 make BUILD=build/waits SCENARIO=19 run
 make BUILD=build/storage SCENARIO=20 TEST=1 run
 make BUILD=build/idle-waits SOLO=3 SCENARIO=19 run
+make BUILD=build/hosting-tree SCENARIO=21 TEST=1 run
+make BUILD=build/hosting-recovery SCENARIO=22 TEST=1 run
+make BUILD=build/hosting-authority SCENARIO=23 TEST=1 run
 ```
 
 A standalone filesystem or client waits for its absent dependencies. The wait
@@ -60,6 +64,13 @@ exits QEMU after checking recovery. The research runner creates separate build
 directories for each configuration. The QEMU debug-exit device reports status
 1 on a successful test boot, so a direct `make ... TEST=1 run` can report that
 nonzero status; `make test` checks it together with the trace oracle.
+
+Hosting scenarios boot the original four roots and create their descendants
+only through the checked ring-3 management calls. Scenarios 21–23 select
+`cells/hosting.toml`; the default manifest grants no creation authority. The
+storage services and root client remain in generation one in these scenarios.
+The build runs `tools/footprint.py` after linking and enforces both the BIOS
+loaded-byte window and a static supervisor address end below 4 MiB.
 
 Override tools using `RUSTC`, `ZIG`, `QEMU`, and `PYTHON`. Additional emulator
 options can be set with `QEMU_FLAGS`. `RESEARCH_REPEAT` changes repeated emulator

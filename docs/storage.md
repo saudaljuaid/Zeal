@@ -105,11 +105,12 @@ private deferred inbox. Revocation does not retroactively undo delivered work.
 A caller with another live appropriate capability can continue using its own
 still-valid handle. Delegation never transfers file-handle ownership.
 
-## ABI v3 protocol and bounded waits
+## Storage protocol under ABI v4
 
-ABI v3 retains syscall numbers and structure layouts, and adds operation rights
-for the storage protocol. The compiled C, Rust, and Zig contracts and manifest
-validator agree on fourteen operation bits. The legacy `/hello` operations and
+The storage calls and 32-byte protocol payloads introduced by ABI v3 retain
+their layouts and operation numbers under ABI v4. The full rights mask now has
+sixteen operation bits, including two narrow hosting operations; storage grants
+retain their original rights. Boot information is expanded in ABI v4. The legacy `/hello` operations and
 capability handoff remain supported.
 
 | Operation | Number |

@@ -9,9 +9,9 @@ static struct z_broker broker;
 static struct z_wait_table waits;
 static struct z_memory_pool memory;
 static const uint8_t image[4096] = {0};
-static struct z_memory_layout layouts[Z_CELL_COUNT];
-static bool fail_copy[Z_CELL_COUNT];
-static unsigned copies[Z_CELL_COUNT];
+static struct z_memory_layout layouts[Z_ROOT_COUNT];
+static bool fail_copy[Z_ROOT_COUNT];
+static unsigned copies[Z_ROOT_COUNT];
 static bool inject_send;
 static uint64_t injected_cap;
 static const uint64_t destination = Z_STACK_BASE + 4090;
@@ -59,7 +59,7 @@ static bool checked_copy(void *context, unsigned cell, uint64_t generation,
                           uint64_t address, const struct z_message *input)
 {
     assert(context == &memory);
-    assert(cell < Z_CELL_COUNT);
+    assert(cell < Z_ROOT_COUNT);
     if (generation != broker.policies[cell].generation)
         return false;
     if (inject_send && input == NULL) {
@@ -97,7 +97,7 @@ static void setup(void)
     assert(z_broker_refresh(&broker) == Z_OK);
     z_wait_init(&waits);
     assert(z_memory_init(&memory, Z_MANIFEST_POOL_PAGES));
-    for (unsigned cell = 0; cell < Z_CELL_COUNT; ++cell) {
+    for (unsigned cell = 0; cell < Z_ROOT_COUNT; ++cell) {
         assert(z_memory_allocate(&memory, cell, 8192, 16384));
         layouts[cell] = (struct z_memory_layout){ image, sizeof(image), 8192, 8192 };
         copies[cell] = 0;
@@ -272,7 +272,7 @@ static void cancellation_and_generation_ownership(void)
     broker.policies[Z_FS].phase = Z_POLICY_QUARANTINED;
     assert(poll(Z_FS, 203, &result, &reason) == Z_WAIT_CANCELLED);
     z_wait_init(&waits);
-    for (unsigned cell = 0; cell < Z_CELL_COUNT; ++cell)
+    for (unsigned cell = 0; cell < Z_ROOT_COUNT; ++cell)
         assert(waits.entries[cell].kind == Z_WAIT_NONE && waits.entries[cell].deadline == 0);
 }
 
@@ -371,18 +371,18 @@ static void invalid_buffers_and_deferred_copy_failure(void)
 static void idle_and_fair_selection(void)
 {
     setup();
-    unsigned after = Z_CELL_COUNT - 1;
+    unsigned after = Z_ROOT_COUNT - 1;
     for (unsigned turn = 0; turn < 100; ++turn) {
         int next = z_wait_next(&waits, &broker, after);
-        assert(next == (int)(turn % Z_CELL_COUNT));
+        assert(next == (int)(turn % Z_ROOT_COUNT));
         after = (unsigned)next;
     }
-    for (unsigned cell = 0; cell < Z_CELL_COUNT; ++cell)
+    for (unsigned cell = 0; cell < Z_ROOT_COUNT; ++cell)
         assert(z_wait_sleep(&waits, &broker, cell, 10, 4 + 3 * cell) == Z_OK);
     assert(z_wait_next(&waits, &broker, after) == -1);
     int result;
     enum z_wake_reason reason;
-    for (unsigned cell = 0; cell < Z_CELL_COUNT; ++cell)
+    for (unsigned cell = 0; cell < Z_ROOT_COUNT; ++cell)
         assert(poll(cell, 13, &result, &reason) == Z_WAIT_PENDING);
     assert(z_wait_next(&waits, &broker, after) == -1);
     assert(poll(Z_BLOCK, 14, &result, &reason) == Z_WAIT_DONE && reason == Z_WAKE_SLEEP);
@@ -393,6 +393,10 @@ static void idle_and_fair_selection(void)
     z_policy_stop(&broker.policies[Z_FS]);
     assert(z_wait_next(&waits, &broker, Z_BLOCK) == Z_BLOCK);
 }
+
+/* The legacy root model retains all four original manifest grants. Dynamic
+ * membership, waits and scheduler selection are tested through the production
+ * creation engine in hosting.c; root slots never become dynamic grants. */
 
 /* Independent state machine: it stores an abstract FIFO and wait mode, then
  * compares production transitions and scheduling after each generated action. */
@@ -415,9 +419,9 @@ static uint64_t model_pop(struct model_cell *model)
 static void generated_model(void)
 {
     setup();
-    struct model_cell model[Z_CELL_COUNT] = {0};
-    uint64_t authorities[Z_CELL_COUNT], parents[Z_CELL_COUNT];
-    for (unsigned cell = 0; cell < Z_CELL_COUNT; ++cell) {
+    struct model_cell model[Z_ROOT_COUNT] = {0};
+    uint64_t authorities[Z_ROOT_COUNT], parents[Z_ROOT_COUNT];
+    for (unsigned cell = 0; cell < Z_ROOT_COUNT; ++cell) {
         parents[cell] = cap(cell, cell, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
         int64_t delegated = z_broker_delegate(&broker, cell, parents[cell],
                                                endpoint(cell), Z_RIGHT(Z_FILE_READ));
@@ -426,7 +430,7 @@ static void generated_model(void)
     }
     uint64_t now = 0;
     for (unsigned step = 0; step < 50000; ++step) {
-        unsigned cell = random_next() % Z_CELL_COUNT;
+        unsigned cell = random_next() % Z_ROOT_COUNT;
         struct model_cell *current = &model[cell];
         unsigned choice = random_next() % 8;
         uint64_t duration = random_next() % 9;
@@ -504,17 +508,17 @@ static void generated_model(void)
             assert(delegated > 0);
             authorities[cell] = (uint64_t)delegated;
         }
-        for (unsigned index = 0; index < Z_CELL_COUNT; ++index) {
+        for (unsigned index = 0; index < Z_ROOT_COUNT; ++index) {
             assert(broker.queues[index].count == model[index].count);
             assert(waits.entries[index].kind == model[index].kind);
             assert(z_wait_runnable(&waits, &broker, index) == !model[index].kind);
             if (model[index].kind)
                 assert(waits.entries[index].deadline == model[index].deadline);
         }
-        unsigned after = random_next() % Z_CELL_COUNT;
+        unsigned after = random_next() % Z_ROOT_COUNT;
         int expected = -1;
-        for (unsigned offset = 1; offset <= Z_CELL_COUNT; ++offset) {
-            unsigned index = (after + offset) % Z_CELL_COUNT;
+        for (unsigned offset = 1; offset <= Z_ROOT_COUNT; ++offset) {
+            unsigned index = (after + offset) % Z_ROOT_COUNT;
             if (!model[index].kind) { expected = (int)index; break; }
         }
         assert(z_wait_next(&waits, &broker, after) == expected);

@@ -18,9 +18,9 @@ CFLAGS := -std=c11 -O2 -g -Wall -Wextra -Werror -ffreestanding -fno-builtin \
 ZFLAGS := -target x86_64-freestanding-none -mcpu=baseline-sse-sse2 -mno-red-zone \
           -fno-stack-check -fno-stack-protector -fno-compiler-rt -O ReleaseSmall \
           -fno-entry -T cells/cell.ld
-CELLS := block filesystem client probe
+CELLS := block filesystem client probe supervisor worker
 COBJS := $(COMMON)/ipc.o $(COMMON)/runtime.o $(COMMON)/arch.o \
-         $(COMMON)/manifest.o $(COMMON)/memory.o $(COMMON)/wait.o
+         $(COMMON)/manifest.o $(COMMON)/memory.o $(COMMON)/wait.o $(COMMON)/hosting.o
 AOBJS := $(COMMON)/entry.o $(COMMON)/traps.o
 BOBJS := $(addprefix $(COMMON)/,$(addsuffix .o,$(CELLS)))
 HEADERS := $(wildcard include/zeal/*.h)
@@ -32,6 +32,8 @@ $(COMMON) $(BUILD):
 	mkdir -p $@
 
 $(COMMON)/ipc.o: kernel/ipc.c $(HEADERS) | $(COMMON)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(COMMON)/hosting.o: kernel/hosting.c $(HEADERS) | $(COMMON)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(COMMON)/wait.o: kernel/wait.c $(HEADERS) | $(COMMON)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -48,7 +50,7 @@ $(COMMON)/entry.o: arch/x86_64/entry.S | $(COMMON)
 $(COMMON)/traps.o: arch/x86_64/traps.S | $(COMMON)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(COMMON)/libpolicy.a: policy/lib.rs policy/capability.rs | $(COMMON)
+$(COMMON)/libpolicy.a: policy/lib.rs policy/capability.rs policy/hosting.rs | $(COMMON)
 	$(RUSTC) --edition=2021 --crate-type staticlib --target x86_64-unknown-none \
 	  -C panic=abort -C opt-level=2 -C debuginfo=2 $< -o $@
 
@@ -62,10 +64,11 @@ $(COMMON)/%.o: $(COMMON)/%.bin
 
 $(BUILD)/config: FORCE | $(BUILD)
 	$(PYTHON) -c 'from pathlib import Path; p=Path("$@"); s="$(SCENARIO) $(TEST) $(SOLO)\n"; p.write_text(s) if not p.exists() or p.read_text()!=s else None'
-$(BUILD)/manifest.bin: cells/manifest.toml tools/manifest.py $(BUILD)/config \
-	$(COMMON)/block.bin $(COMMON)/filesystem.bin $(COMMON)/client.bin $(COMMON)/probe.bin | $(BUILD)
+MANIFEST_SOURCE := $(if $(filter 21 22 23,$(SCENARIO)),cells/hosting.toml,cells/manifest.toml)
+$(BUILD)/manifest.bin: $(MANIFEST_SOURCE) tools/manifest.py $(BUILD)/config \
+	$(addprefix $(COMMON)/,$(addsuffix .bin,$(CELLS))) | $(BUILD)
 	$(PYTHON) tools/manifest.py $< $@ $(COMMON)/block.bin $(COMMON)/filesystem.bin \
-	  $(COMMON)/client.bin $(COMMON)/probe.bin --scenario $(SCENARIO) --solo $(SOLO)
+	  $(COMMON)/client.bin $(COMMON)/probe.bin $(COMMON)/supervisor.bin $(COMMON)/worker.bin --scenario $(SCENARIO) --solo $(SOLO)
 $(BUILD)/manifest_data.o: $(BUILD)/manifest.bin
 	cd $(BUILD) && $(LD) -r -b binary manifest.bin -o manifest_data.o
 $(BUILD)/main.o: kernel/main.c $(HEADERS) $(BUILD)/config
@@ -77,6 +80,7 @@ $(BUILD)/kernel.elf: $(AOBJS) $(COBJS) $(BUILD)/manifest_data.o $(BOBJS) $(BUILD
 	  $(COMMON)/libpolicy.a -o $@
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 	$(OBJCOPY) -O binary $< $@
+	$(PYTHON) tools/footprint.py $(BUILD)/kernel.elf $@ --output $(BUILD)/footprint.json
 $(BUILD)/boot.bin: boot/boot.S boot/boot.ld $(BUILD)/kernel.bin
 	$(AS) --32 --defsym KERNEL_SECTORS=$$((($$(stat -c %s $(BUILD)/kernel.bin)+511)/512)) boot/boot.S -o $(BUILD)/boot.o
 	$(LD) -m elf_i386 -T boot/boot.ld $(BUILD)/boot.o -o $@
@@ -88,9 +92,9 @@ run: all
 	  -drive file=$(BUILD)/zeal.img,format=raw,if=ide -display none -serial stdio \
 	  -monitor none -nic none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=4
 
-$(COMMON)/libpolicy-host.a: policy/lib.rs policy/capability.rs | $(COMMON)
+$(COMMON)/libpolicy-host.a: policy/lib.rs policy/capability.rs policy/hosting.rs | $(COMMON)
 	$(RUSTC) --edition=2021 --crate-type staticlib -C panic=abort -C opt-level=2 $< -o $@
-$(COMMON)/policy-tests: policy/lib.rs policy/capability.rs | $(COMMON)
+$(COMMON)/policy-tests: policy/lib.rs policy/capability.rs policy/hosting.rs | $(COMMON)
 	$(RUSTC) --edition=2021 --test $< -o $@
 $(COMMON)/ipc-tests: tests/ipc.c tests/rust_shim.c kernel/ipc.c $(HEADERS) $(COMMON)/libpolicy-host.a
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
@@ -101,6 +105,11 @@ $(COMMON)/wait-tests: tests/wait.c tests/rust_shim.c kernel/wait.c kernel/ipc.c 
 	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude \
 	  tests/wait.c tests/rust_shim.c kernel/wait.c kernel/ipc.c kernel/memory.c kernel/manifest.c \
 	  $(COMMON)/libpolicy-host.a -lpthread -ldl -lm -o $@
+$(COMMON)/hosting-tests: tests/hosting.c tests/rust_shim.c kernel/hosting.c kernel/ipc.c kernel/wait.c kernel/memory.c kernel/manifest.c $(HEADERS) $(COMMON)/libpolicy-host.a
+	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
+	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude \
+	  tests/hosting.c tests/rust_shim.c kernel/hosting.c kernel/ipc.c kernel/wait.c kernel/memory.c kernel/manifest.c \
+	  $(COMMON)/libpolicy-host.a -lpthread -ldl -lm -o $@
 $(COMMON)/memory-tests: tests/memory.c kernel/memory.c kernel/manifest.c $(HEADERS)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
 	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude \
@@ -108,14 +117,16 @@ $(COMMON)/memory-tests: tests/memory.c kernel/memory.c kernel/manifest.c $(HEADE
 $(COMMON)/manifest-tests: tests/manifest.c kernel/manifest.c $(HEADERS)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
 	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude tests/manifest.c kernel/manifest.c -o $@
-test-host: $(COMMON)/policy-tests $(COMMON)/ipc-tests $(COMMON)/wait-tests $(COMMON)/memory-tests $(COMMON)/manifest-tests
+test-host: $(COMMON)/hosting-tests $(COMMON)/policy-tests $(COMMON)/ipc-tests $(COMMON)/wait-tests $(COMMON)/memory-tests $(COMMON)/manifest-tests
 	timeout 60s $(COMMON)/policy-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/ipc-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/wait-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/memory-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/manifest-tests
+	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/hosting-tests
 	timeout 60s $(ZIG) test cells/protocol.zig
 	timeout 60s $(ZIG) test cells/storage_transport.zig
+	timeout 60s $(ZIG) test cells/hosting_tests.zig
 	timeout 60s $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 test-qemu: all
 	timeout 900s $(PYTHON) tests/research.py

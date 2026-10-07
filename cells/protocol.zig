@@ -174,11 +174,11 @@ fn delivered(message: abi.Message, sender: u64) abi.Message {
     return copy;
 }
 
-test "wire layout and constants match the version two C contract" {
+test "wire layout and constants match the version four C contract" {
     try testing.expectEqual(@as(usize, 48), @sizeOf(abi.Message));
     try testing.expectEqual(@as(usize, 8), @alignOf(abi.Message));
     try testing.expectEqual(@as(usize, 16), @offsetOf(abi.Message, "payload"));
-    try testing.expectEqual(@as(usize, 24), @sizeOf(abi.BootInfo));
+    try testing.expectEqual(@as(usize, 80), @sizeOf(abi.BootInfo));
     try testing.expectEqual(@as(u64, 6), @intFromEnum(abi.Call.exit));
     try testing.expectEqual(@as(i64, -5), @intFromEnum(abi.Error.bad_address));
     try testing.expectEqual(@as(usize, 24), @sizeOf(abi.DelegateRequest));

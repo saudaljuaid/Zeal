@@ -20,7 +20,7 @@ bool z_memory_allocate(struct z_memory_pool *pool, unsigned cell,
                          uint32_t stack_budget, uint32_t writable_budget)
 {
     uint16_t stack, heap;
-    if (pool == NULL || cell >= Z_MANIFEST_CELL_MAX || pool->page_count == 0 ||
+    if (pool == NULL || cell >= Z_CELL_COUNT || pool->page_count == 0 ||
         pool->page_count > Z_MANIFEST_POOL_PAGES || pool->cells[cell].count != 0 ||
         !z_manifest_memory_pages(stack_budget, writable_budget, &stack, &heap))
         return false;
@@ -42,7 +42,7 @@ bool z_memory_allocate(struct z_memory_pool *pool, unsigned cell,
 
 void *z_memory_page(struct z_memory_pool *pool, unsigned cell, unsigned page)
 {
-    if (pool == NULL || cell >= Z_MANIFEST_CELL_MAX ||
+    if (pool == NULL || cell >= Z_CELL_COUNT ||
         page >= pool->cells[cell].count || page >= Z_MANIFEST_PAGES_PER_CELL)
         return NULL;
     unsigned physical = pool->cells[cell].pages[page];
@@ -54,7 +54,7 @@ void *z_memory_page(struct z_memory_pool *pool, unsigned cell, unsigned page)
 
 bool z_memory_reset(struct z_memory_pool *pool, unsigned cell)
 {
-    if (pool == NULL || cell >= Z_MANIFEST_CELL_MAX || pool->cells[cell].count == 0 ||
+    if (pool == NULL || cell >= Z_CELL_COUNT || pool->cells[cell].count == 0 ||
         pool->cells[cell].count > Z_MANIFEST_PAGES_PER_CELL)
         return false;
     for (unsigned i = 0; i < pool->cells[cell].count; ++i)
@@ -80,7 +80,7 @@ bool z_memory_check(const struct z_memory_pool *pool)
     if (pool == NULL || pool->page_count == 0 || pool->page_count > Z_MANIFEST_POOL_PAGES)
         return false;
     uint8_t seen[Z_MANIFEST_POOL_PAGES] = {0};
-    for (unsigned cell = 0; cell < Z_MANIFEST_CELL_MAX; ++cell) {
+    for (unsigned cell = 0; cell < Z_CELL_COUNT; ++cell) {
         const struct z_memory_allocation *allocation = &pool->cells[cell];
         if (allocation->count > Z_MANIFEST_PAGES_PER_CELL ||
             allocation->count != allocation->stack_pages + allocation->heap_pages ||
@@ -115,7 +115,7 @@ bool z_memory_copy_valid(struct z_memory_pool *pool, unsigned cell,
                          const struct z_memory_layout *layout, uint64_t address,
                          size_t length, bool write)
 {
-    if (pool == NULL || cell >= Z_MANIFEST_CELL_MAX ||
+    if (pool == NULL || cell >= Z_CELL_COUNT ||
         !z_memory_user_range(layout, address, length, write))
         return false;
     const struct z_memory_allocation *allocation = &pool->cells[cell];
