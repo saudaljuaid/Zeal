@@ -72,6 +72,33 @@ struct z_runtime {
     uint32_t next_identity, initialized;
 };
 
+/* Internal causal evidence captured from the exact checked caller buffers.
+ * This is neither a user ABI object nor an authority-bearing kernel record.
+ * Input is copied before a management operation can overwrite an overlapping
+ * output; output is copied only after successful production completion. */
+union z_management_input {
+    struct z_create_request create;
+    struct z_rebind_request rebind;
+};
+union z_management_output {
+    struct z_create_result create;
+    struct z_cell_status status;
+    struct z_domain_status domain;
+};
+struct z_management_capture {
+    union z_management_input input;
+    union z_management_output output;
+    uint64_t caller_endpoint, call, arg0, arg1, arg2;
+    bool input_copied, output_copied;
+};
+
+void z_runtime_capture_begin(struct z_runtime *, unsigned, uint64_t,
+                              uint64_t, uint64_t, uint64_t,
+                              struct z_management_capture *);
+void z_runtime_capture_end(struct z_runtime *, unsigned, uint64_t,
+                            uint64_t, uint64_t, uint64_t, int,
+                            struct z_management_capture *);
+
 int z_runtime_init(struct z_runtime *, struct z_broker *, struct z_wait_table *,
                     struct z_frame *, const struct z_manifest *,
                     const struct z_image_catalog *, size_t,

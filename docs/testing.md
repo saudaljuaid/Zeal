@@ -170,3 +170,60 @@ on success and failure.
 These tests do not establish real-hardware correctness, DMA containment,
 NVMe reset safety, SMP correctness, persistent-data integrity, extended CPU
 state preservation, or side-channel isolation.
+
+
+## Native work-contract acceptance
+
+Scenario 24 uses its own manifest, templates 3/4 and root-400 requester. The
+supported runner executes it twice and adds native `qemu64`/32 MiB and
+`max`/128 MiB platform cases, without removing any original scenario. A complete
+proof joins real worker allocation, private page/frame initialization, hardware
+ring-3 entry, exact authenticated acceptance/work delivery, recomputed results,
+checked stop/reap/resource return, retained terminal status/receipt and explicit
+service-record reap. The seven-contract workload includes two simultaneous
+backings, interleaving, offered/running cancellation with a privately dequeued
+late reply, discarded OFFER/RECEIPT response recovery, record reuse, one actual
+worker fault and fresh-authority retry, and final broker reservation return.
+
+`tests/contract_oracle.py` independently reads the tested manifest and linked
+images and reconstructs service obligations separately from kernel logical
+instances, physical page ownership, actual channels and resource domains.
+It checks copied management request/result/status/domain values, precise
+lifecycle phases/retention, complete frozen snapshots, exact issuer/owner/RPC/
+attempt identities, narrow capability rights and nonrepeating epochs. All real
+storage transfers are checked against the six original manifest grants and
+matched to `/hello`, `/alpha` and `/beta` bytes and unchanged handle generations.
+The measured interval ends at the first requester-verified current-attempt
+receipt after rebind; broker terminal publication is reported separately.
+These observed ticks include requester waits and do not establish a latency
+or CPU-budget guarantee.
+
+`cells/contract_tests.zig` and `cells/contract_dispatch_tests.zig` test the same
+production wire/core/dispatcher/transport code used by isolated cells. They cover
+scopes and bit mutations, capacities/counters, acceptance, reply/snapshot loss,
+FIFO/inbox pressure, malformed and stale results, private delivery fencing,
+terminal retention/reap, partial cleanup, one retry and second failure. C
+sanitizer cases additionally exercise approved broker/worker templates 3/4,
+broker-generation subtree cleanup and cold bootstrap, type rejection of service
+references by real kernel decoders, and the actual checked-copy capture helpers.
+
+`tests/test_contract_model.py` compiles a driver calling the production Zig core
+and compares after every generated action with an independent dictionary,
+provider/page-set and attempt-history model. Fixed seeds, actions, actual output,
+compiler logs and results remain under `build/contract-model/`. Controlled host
+callbacks model resource/transport outcomes, not another kernel or scheduler;
+actual time, memory, privilege and lifecycle mechanisms are proven by C/QEMU.
+Additional boundary sequences cover cold retirement, cleanup failure and
+RPC-counter exhaustion after successful rebind without misnaming an attempt.
+
+Live-trace removal and coordinated counterfeit controls cover every essential
+admission, backing, authority, acceptance, attempt, cancellation, settlement,
+status, storage and completion element. Missing/contradictory authoritative
+fields fail even when another record describes the intended state. Discovered
+false-positive witnesses are retained in `build/review-witnesses/` and
+`build/research/contract-witnesses/`; their transformations become permanent
+controls applied to current real traces. Results are in
+`build/research/contract-negative-controls.json`, and scenario evidence/image
+hashes are in `build/research/results.json`. Trace exhaustion and marker-only
+traces fail. CI uses the same complete target and retains transcripts, native
+images, model evidence and witnesses on both success and failure.

@@ -276,7 +276,8 @@ static int send(unsigned source, uint64_t target, uint64_t cap, uint32_t operati
 }
 static void fixture_catalog_config(uint32_t supervisor_stack, uint32_t supervisor_writable,
                             uint32_t worker_stack, uint32_t worker_writable,
-                            unsigned depth, unsigned slot_limit, unsigned page_limit, bool second_worker_image)
+                            unsigned depth, unsigned slot_limit, unsigned page_limit, bool second_worker_image,
+                            bool native_contract_templates)
 {
     ++fixture_count;
     memset(&f, 0, sizeof(f));
@@ -305,7 +306,7 @@ static void fixture_catalog_config(uint32_t supervisor_stack, uint32_t superviso
         { 200, 100, Z_RIGHT(Z_BLOCK_READ) | Z_RIGHT(Z_BLOCK_WRITE), 0 },
         { 100, 200, Z_RIGHT(Z_BLOCK_REPLY), 0 },
     };
-    const struct z_manifest_template templates[] = {
+    struct z_manifest_template templates[] = {
         { .identity = 1, .image = 5, .abi = Z_ABI_VERSION, .entry = Z_IMAGE_BASE,
           .image_budget = sizeof(f.images[4]), .stack_budget = supervisor_stack, .writable_budget = supervisor_writable,
           .boot_config = 21, .restart_limit = 3, .restart_delay = 4,
@@ -317,10 +318,20 @@ static void fixture_catalog_config(uint32_t supervisor_stack, uint32_t superviso
           .image_budget = sizeof(f.images[6]), .stack_budget = worker_stack, .writable_budget = worker_writable,
           .boot_config = 21, .restart_limit = 3, .restart_delay = 4, .bootstrap_recipe = 1 },
     };
-    const struct z_manifest_domain domains[] = {
+    struct z_manifest_domain domains[] = {
         { .owner_identity = 400, .template_mask = second_worker_image ? 7 : 3, .slot_limit = slot_limit,
           .page_limit = page_limit, .max_depth = depth, .bootstrap_recipe = 1 },
     };
+    if (native_contract_templates) {
+        assert(!second_worker_image);
+        cells[Z_PROBE].boot_config = 24;
+        templates[0].identity = 3;
+        templates[0].boot_config = 24;
+        templates[0].child_template_mask = 8;
+        templates[1].identity = 4;
+        templates[1].boot_config = 24;
+        domains[0].template_mask = 12;
+    }
     uint8_t bytes[Z_MANIFEST_ARTIFACT_MAX] = {0};
     unsigned template_count = second_worker_image ? 3 : 2;
     size_t template_bytes = template_count * sizeof(*templates);
@@ -362,7 +373,7 @@ static void fixture_config(uint32_t supervisor_stack, uint32_t supervisor_writab
                             unsigned depth, unsigned slot_limit, unsigned page_limit)
 {
     fixture_catalog_config(supervisor_stack, supervisor_writable, worker_stack,
-                            worker_writable, depth, slot_limit, page_limit, false);
+                            worker_writable, depth, slot_limit, page_limit, false, false);
 }
 static void fixture_init(void)
 {
@@ -1342,7 +1353,7 @@ static void dormant_root_polling_and_orphaned_backoff_cleanup(void)
 
 static void image_role_diagnostic_instance_and_slot_are_distinct(void)
 {
-    fixture_catalog_config(8192, 16384, 4096, 8192, 2, 4, 48, true);
+    fixture_catalog_config(8192, 16384, 4096, 8192, 2, 4, 48, true, false);
     struct z_create_result first = create(Z_PROBE, domain(Z_PROBE), 2, 0, 0);
     struct z_create_result second = create(Z_PROBE, domain(Z_PROBE), 3, 0, 0);
     struct z_boot_info a, b;
@@ -1359,6 +1370,274 @@ static void image_role_diagnostic_instance_and_slot_are_distinct(void)
     assert(z_runtime_reap(&f.runtime, Z_PROBE, first.control) == Z_OK);
     assert(z_runtime_stop(&f.runtime, Z_PROBE, second.control) == Z_OK);
     assert(z_runtime_reap(&f.runtime, Z_PROBE, second.control) == Z_OK);
+    assert_no_dynamic_charge();
+}
+
+static void assert_capture_zero(const void *bytes, size_t length)
+{
+    const unsigned char *value = bytes;
+    for (size_t i = 0; i < length; ++i) assert(value[i] == 0);
+}
+
+static void checked_management_captures_preserve_exact_buffers_and_live_scope(void)
+{
+    fixture_init();
+    uint64_t authority = domain(Z_PROBE);
+    struct z_create_request request = creation(Z_PROBE, authority, 2, 0, 0);
+    store(Z_PROBE, input_address, &request, sizeof(request));
+    struct z_management_capture captured;
+    struct z_host_table hierarchy = f.runtime.hierarchy;
+    struct z_broker before = f.broker;
+    struct z_runtime_record records[Z_CELL_COUNT];
+    memcpy(records, f.runtime.records, sizeof(records));
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CREATE, input_address,
+                              sizeof(request), input_address, &captured);
+    assert(captured.input_copied && !captured.output_copied && captured.caller_endpoint == endpoint(Z_PROBE));
+    assert(memcmp(&captured.input.create, &request, sizeof(request)) == 0);
+    assert(memcmp(&hierarchy, &f.runtime.hierarchy, sizeof(hierarchy)) == 0);
+    assert(memcmp(&before, &f.broker, sizeof(before)) == 0);
+    assert(memcmp(records, f.runtime.records, sizeof(records)) == 0);
+    // The actual C engine permits overlapping checked input/output. Capture
+    // must retain the request that existed before the successful result copy.
+    assert(z_runtime_create(&f.runtime, Z_PROBE, input_address, sizeof(request), input_address) == Z_OK);
+    struct z_create_result created;
+    load(Z_PROBE, input_address, &created, sizeof(created));
+    hierarchy = f.runtime.hierarchy; before = f.broker;
+    memcpy(records, f.runtime.records, sizeof(records));
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CREATE, input_address,
+                            sizeof(request), input_address, Z_OK, &captured);
+    assert(captured.output_copied && memcmp(&captured.input.create, &request, sizeof(request)) == 0);
+    assert(memcmp(&captured.output.create, &created, sizeof(created)) == 0);
+    assert_capture_zero((const unsigned char *)&captured.output + sizeof(created), sizeof(captured.output) - sizeof(created));
+    assert(memcmp(&hierarchy, &f.runtime.hierarchy, sizeof(hierarchy)) == 0);
+    assert(memcmp(&before, &f.broker, sizeof(before)) == 0);
+    assert(memcmp(records, f.runtime.records, sizeof(records)) == 0);
+
+    assert(z_runtime_fault(&f.runtime, created.slot, 10, 6) == Z_OK);
+    assert(z_runtime_poll(&f.runtime, created.slot, 14) == 1);
+    struct z_rebind_request rebind_input = { .authority = authority, .control = created.control,
+        .request = ++f.sequence[Z_PROBE] };
+    store(Z_PROBE, input_address, &rebind_input, sizeof(rebind_input));
+    hierarchy = f.runtime.hierarchy; before = f.broker;
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CELL_REBIND, input_address,
+                              sizeof(rebind_input), output_address, &captured);
+    assert(captured.input_copied && memcmp(&captured.input.rebind, &rebind_input, sizeof(rebind_input)) == 0);
+    assert(memcmp(&hierarchy, &f.runtime.hierarchy, sizeof(hierarchy)) == 0 && memcmp(&before, &f.broker, sizeof(before)) == 0);
+    assert(z_runtime_rebind(&f.runtime, Z_PROBE, input_address, sizeof(rebind_input), output_address) == Z_OK);
+    struct z_create_result rebound;
+    load(Z_PROBE, output_address, &rebound, sizeof(rebound));
+    hierarchy = f.runtime.hierarchy; before = f.broker;
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CELL_REBIND, input_address,
+                            sizeof(rebind_input), output_address, Z_OK, &captured);
+    assert(captured.output_copied && memcmp(&captured.output.create, &rebound, sizeof(rebound)) == 0);
+    assert(rebound.instance == created.instance && rebound.control == created.control && rebound.endpoint != created.endpoint);
+    assert(memcmp(&hierarchy, &f.runtime.hierarchy, sizeof(hierarchy)) == 0 && memcmp(&before, &f.broker, sizeof(before)) == 0);
+
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control,
+                              status_address, sizeof(struct z_cell_status), &captured);
+    assert(!captured.input_copied);
+    assert(z_runtime_status(&f.runtime, Z_PROBE, rebound.control, status_address, sizeof(struct z_cell_status)) == Z_OK);
+    struct z_cell_status cell_status;
+    load(Z_PROBE, status_address, &cell_status, sizeof(cell_status));
+    hierarchy = f.runtime.hierarchy; before = f.broker;
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control,
+                            status_address, sizeof(cell_status), Z_OK, &captured);
+    assert(captured.output_copied && memcmp(&captured.output.status, &cell_status, sizeof(cell_status)) == 0);
+    assert(memcmp(&hierarchy, &f.runtime.hierarchy, sizeof(hierarchy)) == 0 && memcmp(&before, &f.broker, sizeof(before)) == 0);
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_DOMAIN_STATUS, authority,
+                              status_address, sizeof(struct z_domain_status), &captured);
+    assert(z_runtime_domain_status(&f.runtime, Z_PROBE, authority, status_address, sizeof(struct z_domain_status)) == Z_OK);
+    struct z_domain_status domain_status;
+    load(Z_PROBE, status_address, &domain_status, sizeof(domain_status));
+    hierarchy = f.runtime.hierarchy; before = f.broker;
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_DOMAIN_STATUS, authority,
+                            status_address, sizeof(domain_status), Z_OK, &captured);
+    assert(captured.output_copied && memcmp(&captured.output.domain, &domain_status, sizeof(domain_status)) == 0);
+    assert_capture_zero((const unsigned char *)&captured.output + sizeof(domain_status), sizeof(captured.output) - sizeof(domain_status));
+    assert(memcmp(&hierarchy, &f.runtime.hierarchy, sizeof(hierarchy)) == 0 && memcmp(&before, &f.broker, sizeof(before)) == 0);
+
+    const uint64_t bad_addresses[] = {0, Z_STACK_BASE - 1, UINT64_MAX - 15, UINT64_C(0x800000000000)};
+    for (unsigned i = 0; i < sizeof(bad_addresses) / sizeof(*bad_addresses); ++i) {
+        memset(&captured, 0xcd, sizeof(captured));
+        z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CREATE, bad_addresses[i], sizeof(request), output_address, &captured);
+        assert(!captured.input_copied); assert_capture_zero(&captured.input, sizeof(captured.input));
+        z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CREATE, bad_addresses[i], sizeof(request), output_address, Z_BAD_ADDRESS, &captured);
+        assert(!captured.output_copied); assert_capture_zero(&captured.output, sizeof(captured.output));
+        z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, bad_addresses[i], sizeof(cell_status), &captured);
+        z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, bad_addresses[i], sizeof(cell_status), Z_OK, &captured);
+        assert(!captured.output_copied); assert_capture_zero(&captured.output, sizeof(captured.output));
+    }
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, Z_IMAGE_BASE, sizeof(cell_status), &captured);
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, Z_IMAGE_BASE, sizeof(cell_status), Z_OK, &captured);
+    assert(!captured.output_copied); assert_capture_zero(&captured.output, sizeof(captured.output));
+    const uint64_t bad_lengths[] = {0, 1, 31, 33, UINT64_MAX};
+    for (unsigned i = 0; i < sizeof(bad_lengths) / sizeof(*bad_lengths); ++i) {
+        z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CREATE, input_address, bad_lengths[i], output_address, &captured);
+        assert(!captured.input_copied); assert_capture_zero(&captured.input, sizeof(captured.input));
+        z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CREATE, input_address, bad_lengths[i], output_address, Z_OK, &captured);
+        assert(!captured.output_copied); assert_capture_zero(&captured.output, sizeof(captured.output));
+    }
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, status_address, sizeof(cell_status) - 1, &captured);
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, status_address, sizeof(cell_status) - 1, Z_OK, &captured);
+    assert(!captured.output_copied); assert_capture_zero(&captured.output, sizeof(captured.output));
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_DOMAIN_STATUS, authority, status_address, sizeof(domain_status) + 1, &captured);
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_DOMAIN_STATUS, authority, status_address, sizeof(domain_status) + 1, Z_OK, &captured);
+    assert(!captured.output_copied); assert_capture_zero(&captured.output, sizeof(captured.output));
+
+    const enum injection_point input_points[] = { INJECT_INPUT_RANGE, INJECT_COPY_IN };
+    const enum injection_point output_points[] = { INJECT_OUTPUT_RANGE, INJECT_COPY_IN };
+    for (unsigned i = 0; i < sizeof(input_points) / sizeof(*input_points); ++i) {
+        store(Z_PROBE, input_address, &request, sizeof(request));
+        set_injection(input_points[i], true, -1);
+        z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CREATE, input_address, sizeof(request), output_address, &captured);
+        assert(f.injection.consumed && !captured.input_copied);
+        assert_capture_zero(&captured.input, sizeof(captured.input));
+        set_injection(INJECT_NONE, false, -1);
+        z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, status_address, sizeof(cell_status), &captured);
+        set_injection(output_points[i], true, -1);
+        z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, status_address, sizeof(cell_status), Z_OK, &captured);
+        assert(f.injection.consumed && !captured.output_copied);
+        assert_capture_zero(&captured.output, sizeof(captured.output));
+        set_injection(INJECT_NONE, false, -1);
+    }
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, status_address, sizeof(cell_status), &captured);
+    set_injection(INJECT_COPY_IN, true, -1);
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control, status_address, sizeof(cell_status), Z_DENIED, &captured);
+    assert(!f.injection.consumed && !captured.output_copied);
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CELL_STATUS, rebound.control + 1, status_address, sizeof(cell_status), Z_OK, &captured);
+    assert(!f.injection.consumed && !captured.output_copied);
+    z_runtime_capture_end(&f.runtime, Z_CLIENT, Z_CELL_STATUS, rebound.control, status_address, sizeof(cell_status), Z_OK, &captured);
+    assert(!f.injection.consumed && !captured.output_copied);
+    set_injection(INJECT_NONE, false, -1);
+    assert(memcmp(&hierarchy, &f.runtime.hierarchy, sizeof(hierarchy)) == 0 && memcmp(&before, &f.broker, sizeof(before)) == 0);
+    z_runtime_capture_begin(NULL, Z_PROBE, Z_CREATE, input_address, sizeof(request), output_address, &captured);
+    assert(captured.caller_endpoint == 0 && !captured.input_copied);
+    z_runtime_capture_end(NULL, Z_PROBE, Z_CREATE, input_address, sizeof(request), output_address, Z_OK, &captured);
+    assert(!captured.output_copied);
+    z_runtime_capture_begin(&f.runtime, Z_CELL_COUNT, Z_CREATE, input_address, sizeof(request), output_address, &captured);
+    assert(captured.caller_endpoint == 0 && !captured.input_copied);
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_YIELD, UINT64_MAX, UINT64_MAX, UINT64_MAX, &captured);
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_YIELD, UINT64_MAX, UINT64_MAX, UINT64_MAX, Z_OK, &captured);
+    assert(!captured.input_copied && !captured.output_copied);
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CREATE, input_address, sizeof(request), output_address, NULL);
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_CREATE, input_address, sizeof(request), output_address, Z_OK, NULL);
+    assert(z_runtime_check(&f.runtime));
+
+    // Callback retirement is a host-only seam. A retained BACKOFF allocation
+    // must not let a diagnostic read claim bytes from a retired execution.
+    fixture_init(); authority = domain(Z_PROBE);
+    request = creation(Z_PROBE, authority, 2, 0, 0);
+    store(Z_PROBE, input_address, &request, sizeof(request));
+    set_injection(INJECT_INPUT_RANGE, false, Z_PROBE);
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_CREATE, input_address, sizeof(request), output_address, &captured);
+    assert(f.injection.consumed && !captured.input_copied);
+    assert_capture_zero(&captured.input, sizeof(captured.input));
+    assert(f.broker.policies[Z_PROBE].phase == Z_POLICY_BACKOFF && z_runtime_check(&f.runtime));
+    fixture_init(); authority = domain(Z_PROBE);
+    struct z_domain_status initial = ledger(Z_PROBE, authority);
+    z_runtime_capture_begin(&f.runtime, Z_PROBE, Z_DOMAIN_STATUS, authority, status_address, sizeof(initial), &captured);
+    set_injection(INJECT_COPY_IN, false, Z_PROBE);
+    z_runtime_capture_end(&f.runtime, Z_PROBE, Z_DOMAIN_STATUS, authority, status_address, sizeof(initial), Z_OK, &captured);
+    assert(f.injection.consumed && !captured.output_copied);
+    assert_capture_zero(&captured.output, sizeof(captured.output));
+    assert(f.broker.policies[Z_PROBE].phase == Z_POLICY_BACKOFF && z_runtime_check(&f.runtime));
+}
+
+static void native_broker_cold_retirement_and_service_reference_non_authority(void)
+{
+    fixture_catalog_config(8192, 16384, 4096, 8192, 2, 4, 48, false, true);
+    uint64_t root_domain = domain(Z_PROBE);
+    struct z_create_result broker = create(Z_PROBE, root_domain, 3, 2, 4);
+    struct z_create_result workers[2] = {
+        create(broker.slot, broker.creation, 4, 0, 0),
+        create(broker.slot, broker.creation, 4, 0, 0),
+    };
+    struct z_boot_info broker_boot;
+    assert(z_runtime_boot(&f.runtime, broker.slot, &broker_boot) == Z_OK);
+    assert(broker_boot.template_id == 3 && broker_boot.scenario == 24);
+    struct z_domain_status root = ledger(Z_PROBE, root_domain);
+    assert(root.owned_slots == 1 && root.owned_pages == 4 && root.reserved_slots == 2 && root.reserved_pages == 4);
+    struct z_domain_status child_domain = ledger(broker.slot, broker.creation);
+    assert(child_domain.owned_slots == 2 && child_domain.owned_pages == 4 && child_domain.available_slots == 0 && child_domain.available_pages == 0);
+
+    // A service reference is wholly disjoint from every management/IPC type.
+    uint64_t reference = (broker.endpoint << 32) | (UINT64_C(1) << 9) | UINT64_C(0x80);
+    struct z_host_table hierarchy = f.runtime.hierarchy;
+    unsigned pages_before = allocated_pages(), caps_before = live_caps();
+    assert(z_runtime_status(&f.runtime, Z_PROBE, reference, status_address, sizeof(struct z_cell_status)) == Z_INVALID);
+    assert(z_runtime_stop(&f.runtime, Z_PROBE, reference) == Z_INVALID);
+    assert(z_runtime_reap(&f.runtime, Z_PROBE, reference) == Z_INVALID);
+    assert(z_runtime_domain_status(&f.runtime, Z_PROBE, reference, status_address, sizeof(struct z_domain_status)) == Z_INVALID);
+    struct z_rebind_request bad_rebind = { .authority = root_domain, .control = reference, .request = UINT64_C(0x100) };
+    store(Z_PROBE, input_address, &bad_rebind, sizeof(bad_rebind));
+    assert(z_runtime_rebind(&f.runtime, Z_PROBE, input_address, sizeof(bad_rebind), output_address) == Z_INVALID);
+    struct z_create_request bad_create = creation(Z_PROBE, reference, 4, 0, 0);
+    assert(create_request(Z_PROBE, &bad_create, input_address, sizeof(bad_create), output_address) == Z_INVALID);
+    assert(send(Z_PROBE, reference, broker.channel, Z_HOST_REQUEST, 1) == Z_INVALID);
+    assert(send(Z_PROBE, broker.endpoint, reference, Z_HOST_REQUEST, 1) == Z_INVALID);
+    assert(z_broker_query(&f.broker, Z_PROBE, reference, &(struct z_cap_info){0}) == Z_INVALID);
+    assert(memcmp(&hierarchy, &f.runtime.hierarchy, sizeof(hierarchy)) == 0);
+    assert(allocated_pages() == pages_before && live_caps() == caps_before);
+
+    uint16_t private_pages[2][2];
+    for (unsigned i = 0; i < 2; ++i) {
+        assert(f.memory.cells[workers[i].slot].count == 2);
+        memcpy(private_pages[i], f.memory.cells[workers[i].slot].pages, sizeof(private_pages[i]));
+        uint64_t sentinel = UINT64_C(0xab12cd34ef560001) + i;
+        store(workers[i].slot, Z_HEAP_BASE, &sentinel, sizeof(sentinel));
+        assert(z_wait_sleep(&f.waits, &f.broker, workers[i].slot, 10, 20 + i) == Z_OK);
+        assert(send(broker.slot, workers[i].endpoint, workers[i].channel, Z_HOST_REQUEST, 10 + i) == Z_OK);
+        assert(send(workers[i].slot, broker.endpoint, f.runtime.records[workers[i].slot].parent_channel, Z_HOST_REPLY, 20 + i) == Z_OK);
+    }
+    uint64_t broker_sentinel = UINT64_C(0xabcdef1234567890);
+    store(broker.slot, Z_HEAP_BASE, &broker_sentinel, sizeof(broker_sentinel));
+    uint64_t storage_sentinel = UINT64_C(0x46d09824ab13ef75);
+    store(Z_CLIENT, Z_HEAP_BASE, &storage_sentinel, sizeof(storage_sentinel));
+    struct z_queue storage_queue = f.broker.queues[Z_FS];
+    uint64_t old_reply_cap = f.runtime.records[broker.slot].parent_channel;
+    assert(z_runtime_fault(&f.runtime, broker.slot, 10, 6) == Z_OK);
+    assert(allocated_pages() == 84 && f.memory.cells[broker.slot].count == 4);
+    assert(f.broker.policies[broker.slot].phase == Z_POLICY_BACKOFF);
+    assert(f.broker.queues[broker.slot].count == 0);
+    for (unsigned i = 0; i < 2; ++i) {
+        assert(f.runtime.records[workers[i].slot].origin == Z_RUNTIME_FREE);
+        assert(f.broker.policies[workers[i].slot].phase == Z_POLICY_DORMANT);
+        assert(f.waits.entries[workers[i].slot].kind == Z_WAIT_NONE);
+        assert(f.broker.queues[workers[i].slot].count == 0 && f.memory.cells[workers[i].slot].count == 0);
+        for (unsigned p = 0; p < 2; ++p) {
+            assert(f.memory.owners[private_pages[i][p]] == 0);
+            for (unsigned byte = 0; byte < Z_MANIFEST_PAGE_SIZE; ++byte)
+                assert(f.memory.data[private_pages[i][p]][byte] == 0);
+        }
+        assert(z_runtime_status(&f.runtime, Z_PROBE, workers[i].control, status_address, sizeof(struct z_cell_status)) == Z_STALE);
+    }
+    assert(memcmp(&storage_queue, &f.broker.queues[Z_FS], sizeof(storage_queue)) == 0);
+    uint64_t observed;
+    load(Z_CLIENT, Z_HEAP_BASE, &observed, sizeof(observed));
+    assert(observed == storage_sentinel && f.broker.policies[Z_CLIENT].generation == 1 && f.broker.policies[Z_FS].generation == 1);
+    root = ledger(Z_PROBE, root_domain);
+    assert(root.owned_slots == 1 && root.owned_pages == 4 && root.reserved_slots == 2 && root.reserved_pages == 4);
+    assert(z_runtime_poll(&f.runtime, broker.slot, 13) == 0);
+    assert(z_runtime_poll(&f.runtime, broker.slot, 14) == 1);
+    assert(z_runtime_boot(&f.runtime, broker.slot, &broker_boot) == Z_OK);
+    assert(broker_boot.generation == 2 && broker_boot.instance == broker.instance && broker_boot.template_id == 3);
+    assert(broker_boot.creation == 0 && broker_boot.parent_channel == 0 && broker_boot.endpoint != broker.endpoint);
+    load(broker.slot, Z_HEAP_BASE, &observed, sizeof(observed)); assert(observed == 0);
+    assert(send(Z_PROBE, broker.endpoint, broker.channel, Z_HOST_REQUEST, 31) == Z_STALE);
+    assert(z_broker_query(&f.broker, Z_PROBE, broker.channel, &(struct z_cap_info){0}) == Z_STALE);
+    assert(z_broker_query(&f.broker, broker.slot, old_reply_cap, &(struct z_cap_info){0}) == Z_STALE);
+    assert(z_runtime_domain_status(&f.runtime, broker.slot, broker.creation, status_address, sizeof(struct z_domain_status)) == Z_STALE);
+    struct z_create_result rebound;
+    assert(rebind(Z_PROBE, root_domain, broker.control, &rebound) == Z_OK);
+    assert(rebound.instance == broker.instance && rebound.control == broker.control && rebound.endpoint != broker.endpoint);
+    assert(rebound.channel != broker.channel && rebound.creation != broker.creation);
+    child_domain = ledger(broker.slot, rebound.creation);
+    assert(child_domain.owned_slots == 0 && child_domain.owned_pages == 0 && child_domain.available_slots == 2 && child_domain.available_pages == 4);
+    f.sequence[broker.slot] = 0;
+    struct z_create_result fresh = create(broker.slot, rebound.creation, 4, 0, 0);
+    assert(fresh.instance != workers[0].instance && fresh.control != workers[0].control && fresh.endpoint >> 8 > workers[0].endpoint >> 8);
+    assert(z_runtime_stop(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert(z_runtime_reap(&f.runtime, Z_PROBE, broker.control) == Z_OK);
     assert_no_dynamic_charge();
 }
 
@@ -1416,7 +1695,9 @@ int main(void)
     dormant_root_polling_and_orphaned_backoff_cleanup();
     image_role_diagnostic_instance_and_slot_are_distinct();
     nested_owner_and_ancestor_retirement_at_every_creation_boundary();
-    printf("C hosting: 16 groups, fixtures=%u, injected failures=%u/faults=%u, 256 recovery/cleanup/reuse cycles, 7500 independent model steps seeds=0x5ea105/0x726f6c6c6261636b/0x9e3779b97f4a7c15; production checked copies, private page ownership, reservation conservation, rollback, stale typed authority, capability pressure/exhaustion, subtree waits/queues/sibling preservation PASS\n",
+    native_broker_cold_retirement_and_service_reference_non_authority();
+    checked_management_captures_preserve_exact_buffers_and_live_scope();
+    printf("C hosting: 18 groups, fixtures=%u, injected failures=%u/faults=%u, 256 recovery/cleanup/reuse cycles, 7500 independent model steps seeds=0x5ea105/0x726f6c6c6261636b/0x9e3779b97f4a7c15; production checked copies, private page ownership, reservation conservation, rollback, stale typed authority, capability pressure/exhaustion, subtree waits/queues/sibling preservation, native broker3/worker4 cold retirement, service-reference non-authority and live checked management evidence captures PASS\n",
         fixture_count, failure_injections, fault_injections);
     return 0;
 }

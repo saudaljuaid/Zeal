@@ -46,6 +46,7 @@ static unsigned storage_stage;
 static uint64_t storage_checkpoint;
 static bool storage_done;
 static unsigned hosting_events, hosting_reports;
+static uint64_t contract_entry_generation[Z_CELL_COUNT];
 static uint64_t hosting_storage_cycles;
 static bool hosting_complete, hosting_storage_ready;
 static uint64_t hosting_last_cleanup_tick, hosting_cycle_boundary_tick;
@@ -55,6 +56,7 @@ static unsigned storage_trace_limit(void)
 {
     /* Hosting preservation observes two files through longer subtree recovery
      * and teardown intervals. Legacy scenarios retain their original limit. */
+    if (Z_SCENARIO == 24) return 2048u;
     return Z_SCENARIO >= 21 && Z_SCENARIO <= 23 ? 1024u : 512u;
 }
 
@@ -109,7 +111,7 @@ static bool hosting_trace_credit(void)
 static void trace_host_ipc(const struct z_message *message, unsigned cell,
                             uint64_t target, uint64_t capability, int result, bool delivered)
 {
-    if (Z_SCENARIO < 21 || Z_SCENARIO > 23 ||
+    if (Z_SCENARIO < 21 || Z_SCENARIO > 24 ||
         (message->operation != Z_HOST_REQUEST && message->operation != Z_HOST_REPLY) ||
         !hosting_trace_credit()) return;
     event(delivered ? "host-ipc-deliver" : result == Z_OK ? "host-ipc-enqueue" : "host-ipc-reject", cell);
@@ -117,6 +119,12 @@ static void trace_host_ipc(const struct z_message *message, unsigned cell,
     field("operation", message->operation); field("length", message->length);
     field("request", storage_word(message->payload, 8));
     field("command", storage_word(message->payload + 8, 4));
+    if (Z_SCENARIO == 24) {
+        field("version", message->payload[8]); field("service_command", message->payload[9]);
+        field("kind", message->payload[10]); field("detail", message->payload[11]);
+        field("token", storage_word(message->payload + 16, 8));
+        field("data", storage_word(message->payload + 24, 8));
+    }
     field("reserved", storage_word(message->payload + 12, 4));
     field("argument", storage_word(message->payload + 16, 8));
     field("value", storage_word(message->payload + 24, 8));
@@ -126,7 +134,7 @@ static void trace_host_ipc(const struct z_message *message, unsigned cell,
 static void runtime_trace(void *context, const struct z_runtime_event *record)
 {
     (void)context;
-    if (Z_SCENARIO < 21 || Z_SCENARIO > 23 || !hosting_trace_credit()) return;
+    if (Z_SCENARIO < 21 || Z_SCENARIO > 24 || !hosting_trace_credit()) return;
     static const char *const names[] = {
         "host-request", "host-reserve", "host-space", "host-channel", "host-publish",
         "host-abort", "host-result", "host-status", "host-stop", "host-reap",
@@ -359,6 +367,39 @@ static void load_manifest(void)
     serial_puts(" grants="); serial_hex(manifest.grant_count); serial_puts("\n");
 }
 
+/* The oracle compares the trusted admitted catalog with the emitted manifest.
+ * Catalog identity describes immutable configuration, never caller authority. */
+static void trace_contract_catalog(void)
+{
+    if (Z_SCENARIO != 24) return;
+    for (unsigned i = 0; i < manifest.template_count; ++i) {
+        const struct z_manifest_template *t = &manifest.templates[i];
+        uint16_t stack, heap;
+        if (!z_manifest_memory_pages(t->stack_budget, t->writable_budget, &stack, &heap))
+            panic("admitted template memory changed");
+        serial_puts("EVENT host-template");
+        field("template", t->identity); field("image", t->image); field("abi", t->abi);
+        field("entry", t->entry); field("image_bytes", image_lengths[t->image - 1]);
+        field("image_budget", t->image_budget); field("stack_budget", t->stack_budget);
+        field("writable_budget", t->writable_budget); field("pages", stack + heap);
+        field("config", t->boot_config); field("restart_limit", t->restart_limit);
+        field("restart_delay", t->restart_delay); field("max_depth", t->max_descendant_depth);
+        field("template_mask", t->child_template_mask); field("recipe", t->bootstrap_recipe);
+        field("reserved", t->reserved); serial_puts("\n");
+    }
+    for (unsigned i = 0; i < manifest.domain_count; ++i) {
+        const struct z_manifest_domain *d = &manifest.domains[i];
+        int owner = z_manifest_slot(&manifest, d->owner_identity);
+        serial_puts("EVENT host-root-domain");
+        field("identity", d->owner_identity); field("cell", (unsigned)owner);
+        field("endpoint", z_policy_handle(&broker.policies[owner], (unsigned)owner));
+        field("template_mask", d->template_mask); field("slot_limit", d->slot_limit);
+        field("page_limit", d->page_limit); field("max_depth", d->max_depth);
+        field("recipe", d->bootstrap_recipe); field("reserved0", d->reserved0);
+        field("reserved1", d->reserved1); serial_puts("\n");
+    }
+}
+
 static unsigned role_slot(unsigned role)
 {
     static const uint32_t identities[] = { 100, 200, 300, 400 };
@@ -473,6 +514,12 @@ static void observe_read(void)
 static int64_t hosting_management(struct z_frame *frame)
 {
     int result;
+    /* Capture the checked caller's actual request before create/rebind can
+     * overwrite an overlapping result buffer. No user turn can interleave
+     * inside this interrupt-masked, single-CPU management operation. */
+    struct z_management_capture capture = {0};
+    if (Z_SCENARIO == 24)
+        z_runtime_capture_begin(&runtime, current, frame->rax, frame->rdi, frame->rsi, frame->rdx, &capture);
     switch (frame->rax) {
     case Z_CREATE: result = z_runtime_create(&runtime, current, frame->rdi, frame->rsi, frame->rdx); break;
     case Z_CELL_STATUS: result = z_runtime_status(&runtime, current, frame->rdi, frame->rsi, frame->rdx); break;
@@ -486,10 +533,56 @@ static int64_t hosting_management(struct z_frame *frame)
     case Z_DOMAIN_STATUS: result = z_runtime_domain_status(&runtime, current, frame->rdi, frame->rsi, frame->rdx); break;
     default: return Z_INVALID;
     }
-    if (Z_SCENARIO >= 21 && Z_SCENARIO <= 23 && hosting_trace_credit()) {
+    if (Z_SCENARIO == 24)
+        z_runtime_capture_end(&runtime, current, frame->rax, frame->rdi, frame->rsi, frame->rdx, result, &capture);
+    if (Z_SCENARIO >= 21 && Z_SCENARIO <= 24 && hosting_trace_credit()) {
         event("host-call", current); field("caller_endpoint", z_policy_handle(&broker.policies[current], current));
         field("call", frame->rax); field("arg0", frame->rdi); field("arg1", frame->rsi); field("arg2", frame->rdx);
-        field("result", (uint64_t)(int64_t)result); serial_puts("\n");
+        field("result", (uint64_t)(int64_t)result);
+        if (Z_SCENARIO == 24) {
+            if (frame->rax == Z_CREATE || frame->rax == Z_CELL_REBIND) {
+                field("input_copied", capture.input_copied);
+                if (frame->rax == Z_CREATE) {
+                    field("input_authority", capture.input.create.authority); field("input_request", capture.input.create.request);
+                    field("input_template", capture.input.create.template_id); field("input_slots", capture.input.create.descendant_slots);
+                    field("input_pages", capture.input.create.descendant_pages); field("input_reserved", capture.input.create.reserved);
+                } else {
+                    field("input_authority", capture.input.rebind.authority); field("input_control", capture.input.rebind.control);
+                    field("input_request", capture.input.rebind.request); field("input_reserved", capture.input.rebind.reserved);
+                }
+                const struct z_create_result copied = capture.output.create;
+                field("output_copied", capture.output_copied);
+                field("output_instance", copied.instance); field("output_control", copied.control);
+                field("output_endpoint", copied.endpoint); field("output_channel", copied.channel);
+                field("output_creation", copied.creation); field("output_slot", copied.slot);
+                field("output_identity", copied.identity);
+            } else if (frame->rax == Z_CELL_STATUS) {
+                const struct z_cell_status copied = capture.output.status;
+                field("output_copied", capture.output_copied);
+                field("output_instance", copied.instance); field("output_control", copied.control);
+                field("output_endpoint", copied.endpoint); field("output_domain", copied.domain);
+                field("output_parent_instance", copied.parent_instance); field("output_parent_endpoint", copied.parent_endpoint);
+                field("output_generation", copied.generation); field("output_slot", copied.slot);
+                field("output_template", copied.template_id); field("output_depth", copied.depth);
+                field("output_phase", copied.phase); field("output_faults", copied.faults);
+                field("output_restarts", copied.restarts); field("output_reason", copied.reason);
+                field("output_own_pages", copied.own_pages); field("output_reserved_slots", copied.reserved_slots);
+                field("output_reserved_pages", copied.reserved_pages); field("output_available_slots", copied.available_slots);
+                field("output_available_pages", copied.available_pages);
+            } else if (frame->rax == Z_DOMAIN_STATUS) {
+                const struct z_domain_status copied = capture.output.domain;
+                field("output_copied", capture.output_copied);
+                field("output_domain", copied.domain); field("output_holder", copied.holder);
+                field("output_instance", copied.instance); field("output_slot_limit", copied.slot_limit);
+                field("output_page_limit", copied.page_limit); field("output_owned_slots", copied.owned_slots);
+                field("output_owned_pages", copied.owned_pages); field("output_reserved_slots", copied.reserved_slots);
+                field("output_reserved_pages", copied.reserved_pages); field("output_available_slots", copied.available_slots);
+                field("output_available_pages", copied.available_pages); field("output_max_depth", copied.max_depth);
+                field("output_template_mask", copied.template_mask); field("output_recipe", copied.recipe);
+                field("output_revoked", copied.revoked);
+            }
+        }
+        serial_puts("\n");
     }
     return result;
 }
@@ -500,6 +593,8 @@ static int hosting_report(struct z_frame *frame)
     unsigned code = (unsigned)frame->rdi;
     unsigned role = runtime.records[current].role;
     bool dynamic = runtime.records[current].origin == Z_RUNTIME_CHILD;
+    bool contract_broker = Z_SCENARIO == 24 && dynamic && role == Z_SUPERVISOR &&
+        runtime.records[current].template_id == 3;
     bool controller = runtime.records[current].origin == Z_RUNTIME_ROOT &&
         runtime.records[current].config.identity == 400;
     bool client = runtime.records[current].origin == Z_RUNTIME_ROOT &&
@@ -531,17 +626,39 @@ static int hosting_report(struct z_frame *frame)
     case 48: if (role != Z_WORKER || !dynamic) return Z_DENIED; name = "host-timeout"; break;
     case 49: if (!dynamic) return Z_DENIED; name = "host-storage-denied"; break;
     case 50: if (!controller) return Z_DENIED; name = "host-rebound"; break;
-    case 51: if (!controller) return Z_DENIED; name = "host-stale"; break;
+    case 51: if (!controller && !contract_broker) return Z_DENIED; name = "host-stale"; break;
     case 52: if (!controller) return Z_DENIED; name = "host-denied"; break;
     case 53: if (!controller && role != Z_SUPERVISOR) return Z_DENIED; name = "host-ledger"; break;
     case 54: if (!controller) return Z_DENIED; name = "host-fifo"; break;
-    case 55: if (!controller) return Z_DENIED; name = "host-reaped"; break;
+    case 55: if (!controller && !contract_broker) return Z_DENIED; name = "host-reaped"; break;
     case 56:
         if (!controller || frame->rsi != Z_SCENARIO || frame->rdx != 0) return Z_DENIED;
         hosting_complete = true; name = "host-complete"; break;
     case 57: if (!dynamic) return Z_DENIED; name = "host-copied"; break;
     case 58: if (role != Z_SUPERVISOR || !dynamic) return Z_DENIED; name = "host-backoff-observed"; break;
     case 59: if (!controller) return Z_DENIED; name = "host-probe-verified"; break;
+    case 70: case 71: case 72: case 73: case 74: case 75: case 76:
+    case 77: case 78: case 79: case 80: case 81: case 82: case 83: case 86: {
+        static const char *const contract_names[] = {
+            "contract-offer", "contract-input", "contract-worker", "contract-control",
+            "contract-endpoint", "contract-accepted", "contract-dispatch", "contract-attempt",
+            "contract-validated", "contract-terminal", "contract-reaped", "contract-late-rejected",
+            "contract-recovering", "contract-rebound",
+        };
+        if (!contract_broker) return Z_DENIED;
+        name = code == 86 ? "contract-deferred" : contract_names[code - 70]; break;
+    }
+    case 84:
+        if (Z_SCENARIO != 24 || !controller) return Z_DENIED;
+        name = "contract-requester-verified"; break;
+    case 87:
+        if (Z_SCENARIO != 24 || !controller || frame->rsi == 0 ||
+            (frame->rdx != 1 && frame->rdx != 5)) return Z_DENIED;
+        name = "contract-reply-lost"; break;
+    case 85:
+        if (Z_SCENARIO != 24 || !controller || frame->rsi != 24 || frame->rdx != 0)
+            return Z_DENIED;
+        hosting_complete = true; name = "contract-complete"; break;
     case 64:
         if (!client || frame->rsi == 0 || frame->rdx == 0 || frame->rsi == frame->rdx) return Z_DENIED;
         hosting_storage_ready = true; name = "hosting-storage-ready"; break;
@@ -643,8 +760,9 @@ static int64_t syscall(struct z_frame *frame)
         return result;
     }
     case Z_REPORT:
-        if (Z_SCENARIO >= 21 && Z_SCENARIO <= 23 &&
-            ((argument >= 40 && argument <= 59) || argument == 64 || argument == 65))
+        if (Z_SCENARIO >= 21 && Z_SCENARIO <= 24 &&
+            ((argument >= 40 && argument <= 59) || argument == 64 || argument == 65 ||
+             (Z_SCENARIO == 24 && argument >= 70 && argument <= 87)))
             return hosting_report(frame);
         if (argument == 7 && runtime.records[current].role == Z_PROBE) {
             ++reset_reports; event("reset-memory", current); serial_puts("\n"); return Z_OK;
@@ -751,7 +869,7 @@ static int64_t syscall(struct z_frame *frame)
 
 static void research_check(void)
 {
-    if (Z_SCENARIO >= 21 && Z_SCENARIO <= 23) {
+    if (Z_SCENARIO >= 21 && Z_SCENARIO <= 24) {
         if (finished || !hosting_complete || hosting_storage_cycles < 2 || !hosting_post_cleanup_verified) return;
         bool pass = hosting_storage_ready && hosting_events <= 2048 && hosting_reports < 256 &&
             storage_events <= storage_trace_limit() && storage_reports <= storage_trace_limit() &&
@@ -823,6 +941,25 @@ struct z_frame *kernel_trap(struct z_frame *frame)
         if (frame->vector == 32) { advance_tick(); arch_eoi(); supervisor_tick(); }
         fail_cell(current, 69, 0, frame->rsp); return schedule();
     }
+    /* Observe a hardware trap from the first actual ring-3 turn of each
+     * contract execution. This is separate from application progress reports
+     * and from a prepared frame that has not yet entered user mode. */
+    if (Z_SCENARIO == 24 && runtime.records[current].origin == Z_RUNTIME_CHILD &&
+        contract_entry_generation[current] != broker.policies[current].generation) {
+        contract_entry_generation[current] = broker.policies[current].generation;
+        if (hosting_trace_credit()) {
+            event("host-kernel-entry", current);
+            field("endpoint", z_policy_handle(&broker.policies[current], current));
+            field("instance", runtime.records[current].instance);
+            field("control", runtime.records[current].control);
+            field("template", runtime.records[current].template_id);
+            field("depth", runtime.records[current].depth);
+            field("parent_endpoint", runtime.records[current].parent_endpoint);
+            field("cs", frame->cs); field("ss", frame->ss); field("rip", frame->rip);
+            field("rsp", frame->rsp); field("rflags", frame->flags); field("vector", frame->vector);
+            serial_puts("\n");
+        }
+    }
     frames[current].flags = (frame->flags | UINT64_C(0x202)) & ~UINT64_C(0x27000);
     if (frame->vector == 32) {
         advance_tick(); arch_eoi(); if (++run_ticks[current] >= 5) fail_cell(current, 65, 0, 0);
@@ -875,6 +1012,7 @@ void kernel_main(void)
     if (z_runtime_init(&runtime, &broker, &waits, frames, &manifest, catalog,
                          sizeof(catalog) / sizeof(catalog[0]), &runtime_callbacks, NULL) != Z_OK ||
         !z_runtime_check(&runtime)) panic("runtime registry initialization failed");
+    trace_contract_catalog();
     current = role_slot(Z_SOLO >= 0 ? (unsigned)Z_SOLO : Z_BLOCK);
     if (current >= manifest.cell_count || broker.policies[current].phase != Z_POLICY_READY)
         panic("standalone selection is not active");

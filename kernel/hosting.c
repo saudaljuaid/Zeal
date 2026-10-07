@@ -13,6 +13,74 @@ static uint64_t principal(const struct z_runtime *runtime, unsigned cell)
         z_policy_handle(&runtime->broker->policies[cell], cell) : 0;
 }
 
+static bool capture_read(struct z_runtime *runtime, unsigned caller,
+                           uint64_t owner, void *destination,
+                           uint64_t source, size_t length, bool writable)
+{
+    /* The native kernel performs management with interrupts masked on one CPU.
+     * Sanitized callback fixtures may inject retirement while checking/copying;
+     * recheck the exact endpoint so those bytes never become current evidence. */
+    if (!owner || principal(runtime, caller) != owner ||
+        !runtime->callbacks->range(runtime->context, caller, source, length, writable) ||
+        principal(runtime, caller) != owner ||
+        !runtime->callbacks->copy_in(runtime->context, caller, destination, source, length))
+        return false;
+    return principal(runtime, caller) == owner;
+}
+
+static void capture_zero(void *value, size_t length)
+{
+    unsigned char *bytes = value;
+    for (size_t i = 0; i < length; ++i) bytes[i] = 0;
+}
+
+void z_runtime_capture_begin(struct z_runtime *runtime, unsigned caller,
+                              uint64_t call, uint64_t arg0, uint64_t arg1,
+                              uint64_t arg2, struct z_management_capture *capture)
+{
+    if (capture == NULL) return;
+    capture_zero(capture, sizeof(*capture));
+    capture->caller_endpoint = principal(runtime, caller);
+    capture->call = call; capture->arg0 = arg0; capture->arg1 = arg1; capture->arg2 = arg2;
+    if (call == Z_CREATE && arg1 == sizeof(struct z_create_request))
+        capture->input_copied = capture_read(runtime, caller, capture->caller_endpoint,
+                &capture->input.create, arg0, sizeof(capture->input.create), false);
+    else if (call == Z_CELL_REBIND && arg1 == sizeof(struct z_rebind_request))
+        capture->input_copied = capture_read(runtime, caller, capture->caller_endpoint,
+                &capture->input.rebind, arg0, sizeof(capture->input.rebind), false);
+    if (!capture->input_copied) capture_zero(&capture->input, sizeof(capture->input));
+}
+
+void z_runtime_capture_end(struct z_runtime *runtime, unsigned caller,
+                            uint64_t call, uint64_t arg0, uint64_t arg1,
+                            uint64_t arg2, int result,
+                            struct z_management_capture *capture)
+{
+    if (capture == NULL) return;
+    capture_zero(&capture->output, sizeof(capture->output));
+    capture->output_copied = false;
+    if (result != Z_OK || capture->call != call || capture->arg0 != arg0 ||
+        capture->arg1 != arg1 || capture->arg2 != arg2 ||
+        principal(runtime, caller) != capture->caller_endpoint || !capture->caller_endpoint)
+        return;
+    uint64_t source;
+    size_t length;
+    if ((call == Z_CREATE && arg1 == sizeof(struct z_create_request)) ||
+        (call == Z_CELL_REBIND && arg1 == sizeof(struct z_rebind_request))) {
+        source = arg2;
+        length = sizeof(struct z_create_result);
+    } else if (call == Z_CELL_STATUS && arg2 == sizeof(struct z_cell_status)) {
+        source = arg1;
+        length = sizeof(struct z_cell_status);
+    } else if (call == Z_DOMAIN_STATUS && arg2 == sizeof(struct z_domain_status)) {
+        source = arg1;
+        length = sizeof(struct z_domain_status);
+    } else return;
+    capture->output_copied = capture_read(runtime, caller, capture->caller_endpoint,
+            &capture->output, source, length, true);
+    if (!capture->output_copied) capture_zero(&capture->output, sizeof(capture->output));
+}
+
 static const struct z_image_catalog *image(const struct z_runtime *runtime,
                                            uint32_t identity)
 {

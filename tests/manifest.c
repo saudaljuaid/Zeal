@@ -94,7 +94,7 @@ static void cell_field_boundaries(void)
     reject_at(cell + 24, 0); reject_at(cell + 24, 63); reject_at(cell + 24, UINT32_MAX);
     reject_at(cell + 28, 0); reject_at(cell + 28, 4095); reject_at(cell + 28, 16385);
     reject_at(cell + 32, 0); reject_at(cell + 32, 4095); reject_at(cell + 32, 81921);
-    reject_at(cell + 36, 24); reject_at(cell + 40, 2); reject_at(cell + 44, UINT32_MAX);
+    reject_at(cell + 36, Z_MANIFEST_CONFIG_MAX + 1); reject_at(cell + 40, 2); reject_at(cell + 44, UINT32_MAX);
     base_manifest(); put32(cell + 36, 20); assert(validate());
     base_manifest(); artifact[cell + 48] = 0; assert(!validate());
     base_manifest(); artifact[cell + 48] = 'x'; artifact[cell + 49] = 0; artifact[cell + 50] = 'y'; assert(!validate());
@@ -209,7 +209,7 @@ static void sealed_template_and_domain_boundaries(void)
     reject_host_at(TEMPLATE_AT + 24, 63); reject_host_at(TEMPLATE_AT + 24, UINT32_MAX);
     reject_host_at(TEMPLATE_AT + 28, 0); reject_host_at(TEMPLATE_AT + 28, UINT32_MAX);
     reject_host_at(TEMPLATE_AT + 32, 8191); reject_host_at(TEMPLATE_AT + 32, UINT32_MAX);
-    reject_host_at(TEMPLATE_AT + 36, 24); reject_host_at(TEMPLATE_AT + 40, 0);
+    reject_host_at(TEMPLATE_AT + 36, Z_MANIFEST_CONFIG_MAX + 1); reject_host_at(TEMPLATE_AT + 40, 0);
     reject_host_at(TEMPLATE_AT + 44, 0); reject_host_at(TEMPLATE_AT + 48, 2);
     reject_host_at(TEMPLATE_AT + 48, UINT32_MAX); reject_host_at(TEMPLATE_AT + 52, 0);
     reject_host_at(TEMPLATE_AT + 52, 4); reject_host_at(TEMPLATE_AT + 56, 2);

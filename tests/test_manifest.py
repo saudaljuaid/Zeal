@@ -89,7 +89,8 @@ class ManifestCompilerTests(unittest.TestCase):
         self.images[0].write_bytes(b"x" * 65537)
         with self.assertRaises(ValueError):
             self.compile()
-        for kwargs in ({"scenario": 24}, {"solo": 4}):
+        self.images[0].write_bytes(bytes([1]) * 64)
+        for kwargs in ({"scenario": 25}, {"solo": 4}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.compile(**kwargs)
 
@@ -135,6 +136,31 @@ class ManifestCompilerTests(unittest.TestCase):
                              (400, 3, 4, 48, 2, 1, 0, 0))
         self.assertEqual(manifest.private_pages(8192, 16384, manifest.schema_layout()[0]), 4)
         self.assertEqual(manifest.private_pages(4096, 8192, manifest.schema_layout()[0]), 2)
+
+    def test_contract_catalog_is_explicit_and_does_not_change_old_hosting(self):
+        self.prepare_hosting()
+        self.text = (ROOT / "cells" / "contracts.toml").read_text()
+        artifact = self.compile(scenario=24)
+        header = manifest.struct.unpack_from("<IIIIIIIIII", artifact)
+        self.assertEqual(header, (0x4C41455A, 2, 552, 4, 6, 2, 1, 0, 0, 0))
+        at = 40 + 4 * 64 + 6 * 16
+        broker = manifest.struct.unpack_from("<IIIIQIIIIIIIIII", artifact, at)
+        worker = manifest.struct.unpack_from("<IIIIQIIIIIIIIII", artifact, at + 64)
+        self.assertEqual(broker[:5], (3, 5, 4, 0, 0x40000000))
+        self.assertEqual(broker[6:9], (8192, 16384, 24))
+        self.assertEqual(broker[11:], (1, 8, 1, 0))
+        self.assertEqual(worker[:5], (4, 6, 4, 0, 0x40000000))
+        self.assertEqual(worker[6:9], (4096, 8192, 24))
+        self.assertEqual(worker[11:], (0, 0, 1, 0))
+        self.assertEqual(manifest.struct.unpack_from("<IIIIIIII", artifact, at + 128),
+                         (400, 12, 4, 48, 2, 1, 0, 0))
+        configs = [manifest.struct.unpack_from("<I", artifact, 40 + n * 64 + 36)[0]
+                   for n in range(4)]
+        self.assertEqual(configs, [0, 0, 24, 24])
+        self.rejects(self.text.replace("template_mask = 12", "template_mask = 3"), scenario=24)
+        self.rejects(self.text.replace("child_template_mask = 8", "child_template_mask = 2"), scenario=24)
+        self.rejects(self.text.replace("bootstrap_recipe = 1", "bootstrap_recipe = 2", 1), scenario=24)
+        self.rejects(self.text, scenario=25)
 
     def test_template_and_creation_domain_rejections(self):
         self.prepare_hosting()
@@ -229,6 +255,9 @@ class ManifestCompilerTests(unittest.TestCase):
         self.prepare_hosting()
         for scenario in (21, 22, 23):
             self.assertTrue(validate(self.compile(scenario=scenario)))
+        self.text = (ROOT / "cells" / "contracts.toml").read_text()
+        self.assertTrue(validate(self.compile(scenario=24)))
+        self.text = (ROOT / "cells" / "hosting.toml").read_text()
         artifact = self.compile(scenario=21)
         templates_at = 40 + 4 * 64 + 6 * 16
         domains_at = templates_at + 2 * 64

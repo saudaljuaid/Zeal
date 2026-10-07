@@ -5,3 +5,5 @@
 /policy/target/
 __pycache__/
 *.pyc
+
+/work/

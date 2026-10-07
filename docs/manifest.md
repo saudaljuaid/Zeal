@@ -7,7 +7,10 @@ creation; it does not change the manifest or image catalog.
 
 `cells/manifest.toml` retains the four original roots and their initial grants.
 `cells/hosting.toml` additionally approves the purpose-built supervisor and worker
-and grants creation authority to root identity 400 in hosting scenarios 21–23.
+and grants creation authority to root identity 400 in hosting scenarios 21–23. The separate `cells/contracts.toml` source grants
+root 400 templates 3/4 for the native contract branch in scenario 24; old
+scenario manifests and grants retain their behavior. Configuration 24 is a
+compatible additional branch; configuration 25 remains invalid.
 Root identities 100, 200, and 300 remain the block, filesystem, and existing
 storage application. They receive no creation domains. Standalone root boots
 use the ordinary manifest, with one root active and all four root slots reserved.

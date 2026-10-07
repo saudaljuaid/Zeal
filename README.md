@@ -4,9 +4,10 @@
 
 # Zeal
 
-Zeal is an operating system under development with a modular cell architecture:
-drivers, filesystems, and applications are sealed systems that boot, fail, and
-restart independently.
+Zeal is an operating system under development with native cell composition:
+isolated executable systems, explicit authority, finite resource domains and
+observable lifecycles. Drivers, filesystems and applications are sealed cells
+that boot, fail and restart independently.
 
 Zeal runs isolated x86-64 cells configured by a versioned boot manifest. Each
 cell has private budgeted memory, a lifecycle, and revocable IPC capabilities
@@ -20,6 +21,13 @@ worker cells. A supervisor can create workers one level below itself, giving a
 bounded root → supervisor → worker hierarchy under one privileged supervisor
 and global scheduler. Delegated page/slot allowances, typed lifecycle controls,
 atomic creation, cold restart, and subtree cleanup govern these descendants.
+
+A bounded isolated work-contract broker offers actual allocated workers, begins
+work only after authenticated acceptance, independently checks scalar results,
+and returns worker resources before publishing terminal receipts. Status queries,
+checked cancellation, one fresh-authority retry and explicit record reap expose
+the relationship between purpose, permission, backing, execution and outcome.
+This slice uses two records and one approved pure work profile.
 
 ## Build and run
 
@@ -35,6 +43,7 @@ make test
 See [building](docs/building.md), [architecture](docs/architecture.md),
 [storage contracts](docs/storage.md), [wait contracts](docs/waits.md), and
 [hosting contracts](docs/hosting-policy.md), [management ABI](docs/hosting-abi.md),
+[native model](docs/zeal-model.md), [work contracts](docs/work-contracts.md),
 and [test coverage](docs/testing.md).
 
 ## Status

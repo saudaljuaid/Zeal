@@ -33,5 +33,13 @@ jobs:
             build/research/scenario-21/zeal.img
             build/research/scenario-22/zeal.img
             build/research/scenario-23/zeal.img
+            build/research/scenario-24/zeal.img
+            build/research/scenario-24/manifest.bin
+            build/research/scenario-24/kernel.elf
+            build/research/scenario-24/kernel.bin
+            build/research/contract-*.json
+            build/research/contract-witnesses/**/*
+            build/review-witnesses/**/*
+            build/contract-model/**/*
             build/research/scenario-*/footprint.json
           if-no-files-found: warn

@@ -25,7 +25,8 @@ NAMES = ["invalid instruction", "supervisor memory", "immutable code", "NX stack
          "blocking receive and timed sleep", "writable storage and generation-safe handles",
          "runtime creation, hierarchy and storage preservation",
          "subtree failure, cancellation and explicit recovery",
-         "hosting authority, pressure, rollback and slot reuse"]
+         "hosting authority, pressure, rollback and slot reuse",
+         "native work contracts, checked receipts and resource settlement"]
 
 
 def require(condition, message):
@@ -456,6 +457,9 @@ def verify_waits(events, standalone=False, demonstration=True):
 
 
 def verify(output, code, scenario):
+    if scenario == 24:
+        import contract_oracle
+        return contract_oracle.verify(output, code, scenario)
     if scenario in (21, 22, 23):
         import hosting_oracle
         return hosting_oracle.verify(output, code, scenario)
@@ -602,26 +606,34 @@ def main():
     LOGS.mkdir(parents=True, exist_ok=True)
     results = []
     negatives = []
+    contract_negatives = []
     repetitions = int(os.environ.get("RESEARCH_REPEAT", "2"))
     require(1 <= repetitions <= 20, "RESEARCH_REPEAT must be 1..20")
     try:
         for scenario in range(len(NAMES)):
             image = build(scenario)
-            for repeat in range(repetitions):
+            runs = max(2, repetitions) if scenario == 24 else repetitions
+            for repeat in range(runs):
                 label = f"scenario-{scenario:02}-run-{repeat + 1}"
                 output, code, duration = emulate(image, label)
                 evidence = verify(output, code, scenario)
                 result = {"case": label, "scenario": NAMES[scenario], "seconds": duration,
-                          "exit": code, "passed": True, "new_hosting_case": scenario >= 21,
+                          "exit": code, "passed": True, "new_hosting_case": scenario in (21, 22, 23),
+                          "new_contract_case": scenario == 24,
                           "boot_image_sha256": hashlib.sha256(image.read_bytes()).hexdigest()}
                 if evidence is not None: result["evidence"] = evidence
                 results.append(result)
-                if scenario >= 21 and repeat == 0:
+                if scenario == 24 and repeat == 0:
+                    import contract_oracle
+                    controls = contract_oracle.negative_controls(output, code, scenario)
+                    contract_negatives.append({"scenario": scenario, "controls": controls, "passed": True})
+                    print(f"PASS contract oracle {scenario}: {len(controls)} negative controls", flush=True)
+                if scenario in (21, 22, 23) and repeat == 0:
                     import hosting_oracle
                     controls = hosting_oracle.negative_controls(output, code, scenario)
                     negatives.append({"scenario": scenario, "controls": controls, "passed": True})
                     print(f"PASS hosting oracle {scenario}: {len(controls)} negative controls", flush=True)
-            print(f"PASS {scenario:02} {NAMES[scenario]} ({repetitions} runs)", flush=True)
+            print(f"PASS {scenario:02} {NAMES[scenario]} ({runs} runs)", flush=True)
         image = LOGS / "scenario-00" / "zeal.img"
         for cpu, memory in (("qemu64", "32M"), ("max", "128M")):
             label = f"platform-{cpu}-{memory}"
@@ -629,13 +641,15 @@ def main():
             verify(output, code, 0)
             results.append({"case": label, "seconds": duration, "passed": True})
             print(f"PASS {label}", flush=True)
-        for scenario, cpu, memory in ((21, "qemu64", "32M"), (22, "max", "128M")):
-            label = f"hosting-platform-{scenario}-{cpu}-{memory}"
+        for scenario, cpu, memory in ((21, "qemu64", "32M"), (22, "max", "128M"),
+                                      (24, "qemu64", "32M"), (24, "max", "128M")):
+            label = f"{'contract' if scenario == 24 else 'hosting'}-platform-{scenario}-{cpu}-{memory}"
             hosted_image = LOGS / f"scenario-{scenario}" / "zeal.img"
             output, code, duration = emulate(hosted_image, label, cpu, memory)
             evidence = verify(output, code, scenario)
             results.append({"case": label, "seconds": duration, "exit": code,
-                            "passed": True, "new_hosting_case": True, "evidence": evidence,
+                            "passed": True, "new_hosting_case": scenario in (21, 22, 23),
+                            "new_contract_case": scenario == 24, "evidence": evidence,
                             "boot_image_sha256": hashlib.sha256(hosted_image.read_bytes()).hexdigest()})
             print(f"PASS {label}", flush=True)
         output, code, duration = emulate(LOGS / "scenario-18" / "zeal.img",
@@ -705,6 +719,9 @@ def main():
         (LOGS / "hosting-negative-controls.json").write_text(json.dumps(
             {"passed": len(negatives) == 3 and all(item["passed"] for item in negatives),
              "cases": negatives}, indent=2) + "\n")
+        (LOGS / "contract-negative-controls.json").write_text(json.dumps(
+            {"passed": len(contract_negatives) == 1 and all(item["passed"] for item in contract_negatives),
+             "cases": contract_negatives}, indent=2) + "\n")
         (LOGS / "results.json").write_text(json.dumps({"passed": all(r["passed"] for r in results),
                                                      "cases": results}, indent=2) + "\n")
     print(f"Research suite: {len(results)} emulator runs passed. Logs: {LOGS}")

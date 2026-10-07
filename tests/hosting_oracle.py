@@ -285,6 +285,9 @@ class Tree:
 class Observer:
     def __init__(self, events, roots, approved, scenario):
         self.events, self.roots, self.approved, self.scenario = events, roots, approved, scenario
+        self.supervisor_template = 1
+        self.root_template_mask = 3
+        self.fault_commands = (5, 11)
         self.tree = Tree(approved)
         self.root_boots = {}
         self.transactions = {}
@@ -326,6 +329,9 @@ class Observer:
         self.accepted_requests = {}
         self.retirements = {}
         self.wakes = []
+
+    def fault_command(self, event):
+        return event.fields["command"]
 
     def principal(self, event, ready=True):
         slot, identity, generation = event.need("cell", "identity", "generation")
@@ -424,7 +430,7 @@ class Observer:
             event.need("requested_slots", "requested_pages")
             require(key[1] > 0 and key not in self.transactions and key not in self.finished_transactions,
                     "ambiguous or repeated caller-generation management request identity")
-            if f["caller"] >= 4 and self.tree.at(f["caller"]).template == 1:
+            if f["caller"] >= 4 and self.tree.at(f["caller"]).template == self.supervisor_template:
                 parent = self.tree.at(f["caller"])
                 require(parent.ready and not parent.rebind_required,
                         "restarted supervisor created without explicit fresh authority")
@@ -446,7 +452,7 @@ class Observer:
         if kind in ("reserve", "space", "channel"):
             require(f["phase"] == 0, "unpublished transaction exposed a runnable execution")
         if kind == "reserve":
-            require(f["caller"] == 3 or (f["caller"] >= 4 and self.tree.at(f["caller"]).template == 1),
+            require(f["caller"] == 3 or (f["caller"] >= 4 and self.tree.at(f["caller"]).template == self.supervisor_template),
                     "unauthorized root/image became a hosting creator")
             require(item["stage"] == "request", "reservation duplicated or out of order")
             req = item["event"].fields
@@ -580,10 +586,10 @@ class Observer:
                         e.index < event.index]
             require(hardware, "lifecycle fault lacks actual privileged hardware trap evidence")
             received = [e for e in self.delivered if e.fields["target"] == node.endpoint and
-                        e.fields["operation"] == 15 and e.fields["command"] in (5, 11) and
+                        e.fields["operation"] == 15 and self.fault_command(e) in self.fault_commands and
                         e.index < hardware[-1].index]
             require(received, "faulting dynamic execution lacks authenticated scenario fault/probe request")
-            if received[-1].fields["command"] == 5:
+            if self.fault_command(received[-1]) == self.fault_commands[0]:
                 require((hardware[-1].fields["reason"], hardware[-1].fields["error"], hardware[-1].fields["address"]) ==
                         (6, 0, 0), "deliberate ring3 invalid instruction trap has a counterfeit vector/error/address")
             node.faults += 1
@@ -878,7 +884,7 @@ class Observer:
                         grandchildren.add(found[0].fields["sender"])
                     require(len(grandchildren) == wanted, "supervisor consumed one worker reply twice")
                 if event.name == "host-nested-verified":
-                    require(node is not None and node.template == 1 and rf["command"] == 1,
+                    require(node is not None and node.template == self.supervisor_template and rf["command"] == 1,
                             "grandchild matcher ran outside the approved supervisor")
                 else:
                     require(endpoint == 0x104, "independent root owner verification came from another application")
@@ -894,7 +900,7 @@ class Observer:
                     e.index < event.index]
                 require(len(rejected) == 1, "storage denial marker lacks actual checked FS/block send rejection")
         elif event.name == "host-ledger":
-            require(endpoint == 0x104 or (node is not None and node.template == 1),
+            require(endpoint == 0x104 or (node is not None and node.template == self.supervisor_template),
                     "resource ledger report belongs to a different domain owner")
             slots = tuple((value >> (16 * i)) & 0xffff for i in range(3))
             counts = tuple((extra >> (16 * i)) & 0xffff for i in range(3))
@@ -985,7 +991,7 @@ class Observer:
                                            for n in self.tree.nodes.values()),
                     "owner claimed reap before actual terminal record release")
         elif event.name == "host-backoff-observed":
-            require(node is not None and node.template == 1 and extra == 2,
+            require(node is not None and node.template == self.supervisor_template and extra == 2,
                     "supervisor did not inspect grandchild delayed backoff")
             worker = self.tree.at((value & 255) - 1)
             require(worker.endpoint == value and worker.parent_instance == node.instance and
@@ -1039,7 +1045,7 @@ class Observer:
                 "domain query lacks exact typed current-generation logical holder")
         if node is None:
             require(endpoint == 0x104 and (f["slot_limit"], f["page_limit"], f["max_depth"],
-                    f["template_mask"], f["recipe"]) == (4, 48, 2, 3, 1),
+                    f["template_mask"], f["recipe"]) == (4, 48, 2, self.root_template_mask, 1),
                     "configured root creation allowance differs from sealed root400 domain")
             if self.root_domain is None:
                 require(not self.published and not f["revoked"], "root domain was anchored after publication/revocation")
@@ -1047,10 +1053,10 @@ class Observer:
                 self.tree.object_epochs.add(handle >> 8)
                 self.tree.maximum_epoch = max(self.tree.maximum_epoch, handle >> 8)
                 self.domains[handle] = {"holder": endpoint, "instance": 0, "slots": 4, "pages": 48,
-                    "max_depth": 2, "mask": 3, "recipe": 1, "revoked": False, "valid": True, "parent": None}
+                    "max_depth": 2, "mask": self.root_template_mask, "recipe": 1, "revoked": False, "valid": True, "parent": None}
             require(handle == self.root_domain, "root creation-domain handle changed without generation retirement")
         else:
-            require(node.template == 1 and handle == node.creation, "domain query leaked another instance's authority")
+            require(node.template == self.supervisor_template and handle == node.creation, "domain query leaked another instance's authority")
         require(handle in self.domains and self.domains[handle]["valid"], "domain query revived retired creation epoch")
         entitlement = self.domains[handle]
         require((f["slot_limit"], f["page_limit"], f["max_depth"], f["template_mask"], f["recipe"], f["revoked"]) ==
