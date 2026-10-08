@@ -1,0 +1,137 @@
+version = 2
+
+[[cell]]
+identity = 100
+name = "block"
+image = 1
+abi = 4
+entry = 0x40000000
+image_budget = 65536
+stack_budget = 16384
+writable_budget = 81920
+boot_config = 0
+restart_limit = 3
+restart_delay = 4
+
+[[cell]]
+identity = 200
+name = "filesystem"
+image = 2
+abi = 4
+entry = 0x40000000
+image_budget = 65536
+stack_budget = 16384
+writable_budget = 81920
+boot_config = 0
+restart_limit = 3
+restart_delay = 4
+
+[[cell]]
+identity = 300
+name = "client"
+image = 3
+abi = 4
+entry = 0x40000000
+image_budget = 65536
+stack_budget = 16384
+writable_budget = 81920
+boot_config = 0
+restart_limit = 3
+restart_delay = 4
+
+[[cell]]
+identity = 400
+name = "probe"
+image = 4
+abi = 4
+entry = 0x40000000
+image_budget = 65536
+stack_budget = 16384
+writable_budget = 81920
+boot_config = 25
+restart_limit = 3
+restart_delay = 4
+
+[[grant]]
+holder = 100
+target = 200
+rights = ["read_reply", "block_reply"]
+
+[[grant]]
+holder = 200
+target = 100
+rights = ["read", "block_read", "block_write"]
+
+[[grant]]
+holder = 200
+target = 200
+rights = ["file_read", "snapshot_read", "snapshot_reply", "snapshot_release", "delegate"]
+
+[[grant]]
+holder = 200
+target = 300
+rights = ["file_reply", "cap_offer", "file_result"]
+
+[[grant]]
+holder = 300
+target = 200
+rights = ["file_read", "cap_ack", "file_open", "file_chunk_read", "file_write", "file_close"]
+
+[[grant]]
+holder = 400
+target = 200
+rights = ["file_open", "file_chunk_read", "file_write", "file_close", "snapshot_control", "snapshot_read"]
+
+[[grant]]
+holder = 200
+target = 400
+rights = ["file_result", "snapshot_reply"]
+
+[[grant]]
+holder = 400
+target = 300
+rights = ["host_request"]
+
+[[grant]]
+holder = 300
+target = 400
+rights = ["cap_offer", "host_reply"]
+
+# Catalog images are immutable approved programs, never prebooted runtime children.
+[[template]]
+identity = 5
+image = 5
+abi = 4
+entry = 0x40000000
+image_budget = 65536
+stack_budget = 8192
+writable_budget = 16384
+boot_config = 25
+restart_limit = 3
+restart_delay = 4
+max_descendant_depth = 1
+child_template_mask = 32
+bootstrap_recipe = 2
+
+[[template]]
+identity = 6
+image = 6
+abi = 4
+entry = 0x40000000
+image_budget = 65536
+stack_budget = 4096
+writable_budget = 8192
+boot_config = 25
+restart_limit = 3
+restart_delay = 4
+max_descendant_depth = 0
+child_template_mask = 0
+bootstrap_recipe = 2
+
+[[domain]]
+owner_identity = 400
+template_mask = 48
+slot_limit = 4
+page_limit = 48
+max_depth = 2
+bootstrap_recipe = 2

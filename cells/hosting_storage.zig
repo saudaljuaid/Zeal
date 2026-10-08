@@ -20,13 +20,16 @@ fn word(bytes: *const [8]u8) u64 {
     return result;
 }
 
-const Workload = struct {
+pub const Workload = struct {
     sequence: wire.Sequence = .{},
+    alpha_expected: []const u8 = alpha,
+    analysis_mode: bool = false,
+    deferred: @import("hosting_transport.zig").Inbox = .{},
     filesystem: u64,
     block: u64,
     handles: [3]u64 = .{ 0, 0, 0 },
 
-    fn call(self: *Workload, operation: abi.Operation, handle: u64, offset: u32, count: u32, data: []const u8, name: []const u8) wire.Header {
+    pub fn call(self: *Workload, operation: abi.Operation, handle: u64, offset: u32, count: u32, data: []const u8, name: []const u8) wire.Header {
         const id = self.sequence.take() orelse {
             require(false);
             unreachable;
@@ -37,6 +40,10 @@ const Workload = struct {
             var message: abi.Message = undefined;
             require(syscall.receiveWait(&message, 10) == 0);
             require(syscall.lookup(.filesystem) == self.filesystem and syscall.lookup(.block) == self.block);
+            if (self.analysis_mode and message.operation == @intFromEnum(abi.Operation.hosting_request)) {
+                require(self.deferred.push(message));
+                continue;
+            }
             if (wire.decodeReply(&message, .file_result, self.filesystem, id)) |reply| {
                 require(reply.offset == offset and (operation == .file_open or reply.handle == handle));
                 return reply;
@@ -46,13 +53,13 @@ const Workload = struct {
         unreachable;
     }
 
-    fn open(self: *Workload, name: []const u8) u64 {
+    pub fn open(self: *Workload, name: []const u8) u64 {
         const reply = self.call(.file_open, 0, 0, 0, &.{}, name);
         require(reply.value == 0 and reply.handle != 0);
         return reply.handle;
     }
 
-    fn writeFile(self: *Workload, handle: u64, bytes: []const u8) void {
+    pub fn writeFile(self: *Workload, handle: u64, bytes: []const u8) void {
         var offset: u32 = 0;
         while (offset < bytes.len) {
             const count: u32 = @intCast(@min(8, bytes.len - offset));
@@ -62,7 +69,7 @@ const Workload = struct {
         }
     }
 
-    fn readFile(self: *Workload, handle: u64, bytes: []const u8, pause: bool) void {
+    pub fn readFile(self: *Workload, handle: u64, bytes: []const u8, pause: bool) void {
         var offset: u32 = 0;
         while (offset < bytes.len) {
             const count: u32 = @intCast(@min(8, bytes.len - offset));
@@ -77,9 +84,9 @@ const Workload = struct {
         require(eof.value == 0);
     }
 
-    fn cycle(self: *Workload, serial: u64, pause: bool) void {
+    pub fn cycle(self: *Workload, serial: u64, pause: bool) void {
         self.readFile(self.handles[0], storage.hello, pause);
-        self.readFile(self.handles[1], alpha, pause);
+        self.readFile(self.handles[1], self.alpha_expected, pause);
         self.readFile(self.handles[2], beta, pause);
         syscall.reportValues(65, serial, 7);
     }

@@ -192,7 +192,7 @@ static void storage_rights_are_per_operation(void)
         assert(z_broker_receive(&broker, Z_FS, &output) == Z_OK);
         assert(output.operation == operation && output.sender == endpoint(Z_CLIENT));
     }
-    for (unsigned operation = Z_HOST_REQUEST; operation <= Z_HOST_REPLY; ++operation) {
+    for (unsigned operation = Z_HOST_REQUEST; operation <= Z_SNAPSHOT_RELEASE; ++operation) {
         write = message(operation, 1);
         assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), file, &write) == Z_DENIED);
     }
@@ -200,7 +200,7 @@ static void storage_rights_are_per_operation(void)
     uint64_t reply = grant(Z_FS, Z_CLIENT, Z_RIGHT(Z_FILE_RESULT));
     assert(z_broker_send(&broker, Z_FS, endpoint(Z_CLIENT), reply, &write) == Z_OK);
     assert(z_broker_receive(&broker, Z_CLIENT, &output) == Z_OK);
-    for (unsigned operation = 0; operation <= Z_HOST_REPLY + 1; operation += Z_HOST_REPLY + 1) {
+    for (unsigned operation = 0; operation <= Z_SNAPSHOT_RELEASE + 1; operation += Z_SNAPSHOT_RELEASE + 1) {
         write = message(operation, 1);
         assert(z_broker_send(&broker, Z_CLIENT, endpoint(Z_FS), file, &write) == Z_INVALID);
     }

@@ -16,6 +16,7 @@
 #define Z_HOST_STOP 2u
 #define Z_HOST_REAP 4u
 #define Z_HOST_RECIPE_RPC 1u
+#define Z_HOST_RECIPE_SNAPSHOT 2u
 #define Z_HOST_INSTANCE_TAG 0x40u
 #define Z_HOST_CONTROL_TAG 0x50u
 #define Z_HOST_DOMAIN_TAG 0x60u

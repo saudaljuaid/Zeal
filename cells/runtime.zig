@@ -36,7 +36,9 @@ pub fn run(comptime role: abi.Role) noreturn {
         .block => @import("storage_runtime.zig").block(),
         .filesystem => filesystem(info.generation),
         .client => client(info.scenario),
-        .probe => if (info.scenario == 24)
+        .probe => if (info.scenario == 25)
+            @import("analysis_requester.zig").run(info)
+        else if (info.scenario == 24)
             @import("contract_requester.zig").run(info)
         else if (info.scenario >= 21 and info.scenario <= 23)
             @import("hosting_controller.zig").run(info)
@@ -48,7 +50,7 @@ pub fn run(comptime role: abi.Role) noreturn {
 
 fn filesystem(generation: u64) noreturn {
     var state: protocol.Filesystem = .{};
-    var storage_server = @import("storage_runtime.zig").Server.init(generation);
+    var storage_server = @import("storage_runtime.zig").Server.initAt(generation, syscall.lookup(.filesystem));
     var demo_phase: u8 = if (generation == 1) 0 else 4;
     var child: u64 = 0;
     var parent: u64 = 0;
@@ -129,6 +131,7 @@ fn observeMemory() void {
 }
 
 fn client(scenario: u64) noreturn {
+    if (scenario == 25) @import("analysis_storage.zig").run();
     if (scenario == 24) @import("hosting_storage.zig").run();
     if (scenario >= 21 and scenario <= 23) @import("hosting_storage.zig").run();
     const stack: *volatile u64 = @ptrFromInt(abi.stack_base + 128);

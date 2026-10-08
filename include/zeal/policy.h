@@ -79,6 +79,11 @@ _Static_assert(sizeof(struct z_cap_root) == 32, "root policy ABI");
 _Static_assert(sizeof(struct z_cap_table) == 2064, "table policy ABI");
 
 void z_caps_init(struct z_cap_table *table);
+/* Privileged sealed recipe extension. This never accepts an arbitrary service
+ * endpoint: filesystem must be the exact current manifest root in slot 1. */
+int32_t z_caps_snapshot_channel(struct z_cap_table *, const struct z_policy_state *,
+                                uint64_t parent, uint64_t child, uint64_t filesystem, uint32_t template_id,
+                                uint64_t *read_cap, uint64_t *reply_cap);
 int32_t z_caps_configure(struct z_cap_table *table,
                          const struct z_boot_grant *grants, uint32_t count);
 int32_t z_caps_refresh(struct z_cap_table *table, const struct z_policy_state *states);

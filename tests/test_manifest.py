@@ -191,6 +191,25 @@ class ManifestCompilerTests(unittest.TestCase):
         self.rejects(self.text, scenario=20)
         self.rejects(self.text + self.text[self.text.index("[[domain]]"):], scenario=21)
 
+    def test_snapshot_catalog_recipe_is_explicit_and_old_catalogs_stay_unselected(self):
+        self.prepare_hosting()
+        self.text = (ROOT / "cells" / "analysis.toml").read_text()
+        artifact = self.compile(scenario=25)
+        header = manifest.struct.unpack_from("<IIIIIIIIII", artifact)
+        self.assertEqual(header[3:7], (4, 9, 2, 1))
+        at = 40 + 4 * 64 + 9 * 16
+        broker = manifest.struct.unpack_from("<IIIIQIIIIIIIIII", artifact, at)
+        worker = manifest.struct.unpack_from("<IIIIQIIIIIIIIII", artifact, at + 64)
+        self.assertEqual((broker[0], broker[1], broker[-2], worker[0], worker[1], worker[-2]), (5, 5, 2, 6, 6, 2))
+        self.assertEqual(manifest.struct.unpack_from("<IIIIIIII", artifact, at + 128), (400, 48, 4, 48, 2, 2, 0, 0))
+        for scenario in (21, 24):
+            self.rejects(self.text, scenario=scenario)
+        replacements = (("identity = 5\nimage = 5", "identity = 3\nimage = 5"),
+                        ("image = 6", "image = 5"), ("child_template_mask = 32", "child_template_mask = 8"),
+                        ("template_mask = 48", "template_mask = 12"), ("bootstrap_recipe = 2", "bootstrap_recipe = 1"))
+        for old, new in replacements:
+            self.rejects(self.text.replace(old, new, 1), scenario=25)
+
     def test_rounding_boundaries_and_fixed_template_configurations(self):
         constants, _ = manifest.schema_layout()
         for stack, writable, pages in ((4096, 4096, 1), (4097, 8194, 4),
@@ -257,6 +276,8 @@ class ManifestCompilerTests(unittest.TestCase):
             self.assertTrue(validate(self.compile(scenario=scenario)))
         self.text = (ROOT / "cells" / "contracts.toml").read_text()
         self.assertTrue(validate(self.compile(scenario=24)))
+        self.text = (ROOT / "cells" / "analysis.toml").read_text()
+        self.assertTrue(validate(self.compile(scenario=25)))
         self.text = (ROOT / "cells" / "hosting.toml").read_text()
         artifact = self.compile(scenario=21)
         templates_at = 40 + 4 * 64 + 6 * 16

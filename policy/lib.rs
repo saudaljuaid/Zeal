@@ -7,8 +7,8 @@ mod hosting;
 
 // ABI v4 adds bounded hosting management and narrow RPC operation rights.
 pub const Z_ABI_VERSION: u32 = 4;
-pub const Z_OPERATION_MAX: u32 = 16;
-pub const Z_RIGHT_OPERATIONS: u32 = 65535;
+pub const Z_OPERATION_MAX: u32 = 20;
+pub const Z_RIGHT_OPERATIONS: u32 = 1048575;
 pub const Z_SLEEP: u64 = 11;
 pub const Z_RECV_WAIT: u64 = 12;
 pub const Z_TIMEOUT: i64 = -8;

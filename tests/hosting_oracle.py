@@ -283,7 +283,8 @@ class Tree:
 
 
 class Observer:
-    def __init__(self, events, roots, approved, scenario):
+    def __init__(self, events, roots, approved, scenario, bootstrap_recipe=1):
+        self.bootstrap_recipe = bootstrap_recipe
         self.events, self.roots, self.approved, self.scenario = events, roots, approved, scenario
         self.supervisor_template = 1
         self.root_template_mask = 3
@@ -399,7 +400,7 @@ class Observer:
         f = event.fields
         event.need("recipe", *[f"{direction}_{name}" for direction in ("parent", "child")
                    for name in ("holder", "target", "issuer", "rights", "derivation", "epoch")])
-        require(f["recipe"] == 1, "channel lacks explicit current creation-policy bootstrap recipe")
+        require(f["recipe"] == self.bootstrap_recipe, "channel lacks explicit current creation-policy bootstrap recipe")
         for direction, cap, holder, target, rights in (("parent", parent_cap, node.parent_endpoint, node.endpoint, 1 << 14),
                 ("child", child_cap, node.endpoint, node.parent_endpoint, 1 << 15)):
             require((f[direction + "_holder"], f[direction + "_target"], f[direction + "_issuer"],
@@ -410,7 +411,7 @@ class Observer:
         require(parent_epoch > self.maximum_capability_epoch and child_epoch == parent_epoch + 1,
                 "atomic channel pair reused or reordered the global nonrepeating capability epoch counter")
         for cap in (parent_cap, child_cap):
-            require(1 <= cap & 255 <= 32 and cap >> 8 > 0 and cap not in self.capabilities_seen,
+            require(1 <= cap & 255 <= 32 and 0 < cap >> 8 <= ((1 << 63) - 1) >> 8 and cap not in self.capabilities_seen,
                     "fresh narrow channel reused a capability epoch")
             require(cap >> 8 not in self.capability_epochs, "two capability entries share a supposedly unique epoch")
             self.capability_epochs.add(cap >> 8)
@@ -466,7 +467,7 @@ class Observer:
             entitlement = self.domains[req["parent_cap"]]
             require(entitlement["valid"] and not entitlement["revoked"] and
                     entitlement["holder"] == f["caller_endpoint"] and
-                    entitlement["mask"] & (1 << (f["template"] - 1)) and entitlement["recipe"] == 1,
+                    entitlement["mask"] & (1 << (f["template"] - 1)) and entitlement["recipe"] == self.bootstrap_recipe,
                     "creation escaped exact-holder live unrevoked template/recipe entitlement")
             require(f["request"] > self.accepted_requests.get(f["caller_endpoint"], 0),
                     "creation reused a request retired by earlier create/rebind preparation")
@@ -538,7 +539,7 @@ class Observer:
                 self.domains[node.creation] = {"holder": node.endpoint, "instance": node.instance,
                     "slots": node.allowance_slots, "pages": node.allowance_pages,
                     "max_depth": min(entitlement["max_depth"], node.depth + template["depth"]),
-                    "mask": entitlement["mask"] & template["mask"], "recipe": 1, "revoked": False,
+                    "mask": entitlement["mask"] & template["mask"], "recipe": self.bootstrap_recipe, "revoked": False,
                     "valid": True, "parent": item["authority"]}
             self.published.append(event)
             item["stage"] = "publish"
@@ -734,7 +735,7 @@ class Observer:
                 self.domains[node.creation] = {"holder": node.endpoint, "instance": node.instance,
                     "slots": node.allowance_slots, "pages": node.allowance_pages,
                     "max_depth": min(ancestor["max_depth"], node.depth + self.approved[node.template]["depth"]),
-                    "mask": ancestor["mask"] & self.approved[node.template]["mask"], "recipe": 1,
+                    "mask": ancestor["mask"] & self.approved[node.template]["mask"], "recipe": self.bootstrap_recipe,
                     "revoked": False, "valid": True, "parent": parent_domain}
             self.channel(node, f["parent_cap"], f["child_cap"], event)
             node.rebind_required = False
@@ -1045,7 +1046,7 @@ class Observer:
                 "domain query lacks exact typed current-generation logical holder")
         if node is None:
             require(endpoint == 0x104 and (f["slot_limit"], f["page_limit"], f["max_depth"],
-                    f["template_mask"], f["recipe"]) == (4, 48, 2, self.root_template_mask, 1),
+                    f["template_mask"], f["recipe"]) == (4, 48, 2, self.root_template_mask, self.bootstrap_recipe),
                     "configured root creation allowance differs from sealed root400 domain")
             if self.root_domain is None:
                 require(not self.published and not f["revoked"], "root domain was anchored after publication/revocation")
@@ -1053,7 +1054,7 @@ class Observer:
                 self.tree.object_epochs.add(handle >> 8)
                 self.tree.maximum_epoch = max(self.tree.maximum_epoch, handle >> 8)
                 self.domains[handle] = {"holder": endpoint, "instance": 0, "slots": 4, "pages": 48,
-                    "max_depth": 2, "mask": self.root_template_mask, "recipe": 1, "revoked": False, "valid": True, "parent": None}
+                    "max_depth": 2, "mask": self.root_template_mask, "recipe": self.bootstrap_recipe, "revoked": False, "valid": True, "parent": None}
             require(handle == self.root_domain, "root creation-domain handle changed without generation retirement")
         else:
             require(node.template == self.supervisor_template and handle == node.creation, "domain query leaked another instance's authority")

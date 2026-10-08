@@ -18,7 +18,7 @@ def schema_layout():
                 "IMAGE_MAX", "STACK_MIN", "STACK_MAX", "HEAP_MAX", "WRITABLE_MAX",
                 "POOL_PAGES", "ROOT_POOL_PAGES", "PAGES_PER_CELL", "CONFIG_MAX", "RESTART_LIMIT",
                 "RESTART_DELAY", "RIGHTS", "ACTIVE", "IMAGE_COUNT_MAX", "TEMPLATE_MAX", "DOMAIN_MAX",
-                "DYNAMIC_SLOTS", "DYNAMIC_PAGES", "DEPTH_MAX", "BOOTSTRAP_RPC"}
+                "DYNAMIC_SLOTS", "DYNAMIC_PAGES", "DEPTH_MAX", "BOOTSTRAP_RPC", "BOOTSTRAP_SNAPSHOT"}
     if not required <= constants.keys():
         raise ValueError(f"unsupported schema constants: {sorted(required - constants.keys())}")
     formats, current = {}, None
@@ -195,8 +195,13 @@ def compile_manifest(source, output, image_paths, scenario=0, solo=-1):
         depth = u(item["max_descendant_depth"], 32, "template depth")
         mask = u(item["child_template_mask"], 32, "template child mask")
         recipe = u(item["bootstrap_recipe"], 32, "bootstrap recipe")
-        if depth >= constants["DEPTH_MAX"] or recipe != constants["BOOTSTRAP_RPC"] or ((depth == 0) != (mask == 0)):
+        if depth >= constants["DEPTH_MAX"] or recipe not in (constants["BOOTSTRAP_RPC"], constants["BOOTSTRAP_SNAPSHOT"]) or ((depth == 0) != (mask == 0)):
             raise ValueError("unsupported template depth, child entitlement, or bootstrap recipe")
+        if recipe == constants["BOOTSTRAP_SNAPSHOT"] and (config != 25 or
+                (ident, image, depth, mask) not in ((5, 5, 1, 32), (6, 6, 0, 0))):
+            raise ValueError("snapshot recipe requires explicitly approved scenario25 templates5/6")
+        if recipe == constants["BOOTSTRAP_RPC"] and config == 25:
+            raise ValueError("scenario25 requires explicit snapshot recipe; old templates remain unchanged")
         child_masks.append(mask)
         recipes[ident] = recipe
         templates_out.append(struct.pack(formats["template"], ident, image, abi, 0, entry, budget,
@@ -216,8 +221,10 @@ def compile_manifest(source, output, image_paths, scenario=0, solo=-1):
         if owner not in creators or mask == 0 or mask & ~template_mask:
             raise ValueError("domain references an unknown root or unapproved template")
         image, config, flags = creators[owner]
-        if owner != 400 or image != 4 or flags != constants["ACTIVE"] or not 21 <= config <= constants["CONFIG_MAX"] or owner in owners or not 1 <= slots <= constants["DYNAMIC_SLOTS"] or not 1 <= allowance <= constants["DYNAMIC_PAGES"] or not 1 <= depth <= constants["DEPTH_MAX"] or recipe != constants["BOOTSTRAP_RPC"]:
+        if owner != 400 or image != 4 or flags != constants["ACTIVE"] or not 21 <= config <= constants["CONFIG_MAX"] or owner in owners or not 1 <= slots <= constants["DYNAMIC_SLOTS"] or not 1 <= allowance <= constants["DYNAMIC_PAGES"] or not 1 <= depth <= constants["DEPTH_MAX"] or recipe not in (constants["BOOTSTRAP_RPC"], constants["BOOTSTRAP_SNAPSHOT"]):
             raise ValueError("unsupported root creator, scenario, or descendant allowance")
+        if recipe == constants["BOOTSTRAP_SNAPSHOT"] and (config != 25 or mask != 48):
+            raise ValueError("snapshot domain requires explicit scenario25 template entitlement")
         if any(recipe != value for ident, value in recipes.items() if mask & (1 << (ident - 1))):
             raise ValueError("root domain and allowed templates require the same explicit bootstrap recipe")
         owners.add(owner)

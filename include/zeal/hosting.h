@@ -14,6 +14,7 @@ struct z_runtime_record {
     struct z_manifest_cell config;
     uint64_t instance, control, parent_instance, parent_endpoint;
     uint64_t creation, parent_channel;
+    uint64_t storage_endpoint, storage_read, storage_reply;
     uint32_t origin, published, parent_slot, template_id;
     uint32_t depth, allocated_pages, reserved_slots, reserved_pages;
     uint32_t last_reason, role;

@@ -41,5 +41,15 @@ jobs:
             build/research/contract-witnesses/**/*
             build/review-witnesses/**/*
             build/contract-model/**/*
+            build/analysis-model/**/*
+            build/analysis-contract-model/**/*
+            build/research/scenario-25/zeal.img
+            build/research/scenario-25/manifest.bin
+            build/research/scenario-25/kernel.elf
+            build/research/scenario-25/kernel.bin
+            build/research/analysis-*.json
+            build/research/analysis-counterfeit-witnesses/**/*
+            build/research/analysis-code-disassembly/**/*
+            build/research/analysis-code-disassembly/**/*
             build/research/scenario-*/footprint.json
           if-no-files-found: warn

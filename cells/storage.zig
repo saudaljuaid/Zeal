@@ -67,6 +67,9 @@ pub const File = struct {
     name_length: u8 = 0,
     name: [name_limit]u8 = [_]u8{0} ** name_limit,
     length: u32 = 0,
+    // Full-width content revision. A capture also fences length and dependency.
+    // Exhaustion prevents a new write before the block can change.
+    revision: u64 = 1,
 };
 
 pub const Handle = struct {
@@ -227,6 +230,8 @@ pub const Fs = struct {
         const active = self.handle(owner, token) orelse return .{ .status = .stale };
         if (self.block == 0) return .{ .status = .stale };
         if (self.files[active.file].readonly) return .{ .status = .denied };
+        if (count != 0 and self.files[active.file].revision == 0xffffffffffffffff)
+            return .{ .status = .no_space };
         if (count > chunk_size) return .{ .status = .too_large };
         const end = rangeEnd(offset, count) orelse return .{ .status = .invalid };
         if (offset > file_size or end > file_size) return .{ .status = .too_large };
@@ -254,6 +259,7 @@ pub const Fs = struct {
         const check = self.prepareWrite(transfer.owner, transfer.token, offset, transfer.count);
         if (check.status != .ok or check.end != transfer.end or check.address != transfer.address) return .stale;
         self.files[active.file].length = @max(self.files[active.file].length, transfer.end);
+        if (transfer.count != 0) self.files[active.file].revision += 1;
         return .ok;
     }
 };

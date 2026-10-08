@@ -64,7 +64,7 @@ $(COMMON)/%.o: $(COMMON)/%.bin
 
 $(BUILD)/config: FORCE | $(BUILD)
 	$(PYTHON) -c 'from pathlib import Path; p=Path("$@"); s="$(SCENARIO) $(TEST) $(SOLO)\n"; p.write_text(s) if not p.exists() or p.read_text()!=s else None'
-MANIFEST_SOURCE := $(if $(filter 24,$(SCENARIO)),cells/contracts.toml,$(if $(filter 21 22 23,$(SCENARIO)),cells/hosting.toml,cells/manifest.toml))
+MANIFEST_SOURCE := $(if $(filter 25,$(SCENARIO)),cells/analysis.toml,$(if $(filter 24,$(SCENARIO)),cells/contracts.toml,$(if $(filter 21 22 23,$(SCENARIO)),cells/hosting.toml,cells/manifest.toml)))
 $(BUILD)/manifest.bin: $(MANIFEST_SOURCE) tools/manifest.py $(BUILD)/config \
 	$(addprefix $(COMMON)/,$(addsuffix .bin,$(CELLS))) | $(BUILD)
 	$(PYTHON) tools/manifest.py $< $@ $(COMMON)/block.bin $(COMMON)/filesystem.bin \
@@ -129,6 +129,8 @@ test-host: $(COMMON)/hosting-tests $(COMMON)/policy-tests $(COMMON)/ipc-tests $(
 	timeout 60s $(ZIG) test cells/hosting_tests.zig
 	timeout 60s $(ZIG) test cells/contract_tests.zig
 	timeout 60s $(ZIG) test cells/contract_dispatch_tests.zig
+	timeout 60s $(ZIG) test cells/snapshot_tests.zig
+	timeout 60s $(ZIG) test cells/analysis_tests.zig
 	timeout 60s $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 test-qemu: all
 	timeout 900s $(PYTHON) tests/research.py

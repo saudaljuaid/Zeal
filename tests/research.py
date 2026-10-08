@@ -26,7 +26,8 @@ NAMES = ["invalid instruction", "supervisor memory", "immutable code", "NX stack
          "runtime creation, hierarchy and storage preservation",
          "subtree failure, cancellation and explicit recovery",
          "hosting authority, pressure, rollback and slot reuse",
-         "native work contracts, checked receipts and resource settlement"]
+         "native work contracts, checked receipts and resource settlement",
+         "purpose-scoped immutable storage and verified hosted byte analysis"]
 
 
 def require(condition, message):
@@ -457,6 +458,9 @@ def verify_waits(events, standalone=False, demonstration=True):
 
 
 def verify(output, code, scenario):
+    if scenario == 25:
+        import analysis_oracle
+        return analysis_oracle.verify(output, code, scenario)
     if scenario == 24:
         import contract_oracle
         return contract_oracle.verify(output, code, scenario)
@@ -607,22 +611,28 @@ def main():
     results = []
     negatives = []
     contract_negatives = []
+    analysis_negatives = []
     repetitions = int(os.environ.get("RESEARCH_REPEAT", "2"))
     require(1 <= repetitions <= 20, "RESEARCH_REPEAT must be 1..20")
     try:
         for scenario in range(len(NAMES)):
             image = build(scenario)
-            runs = max(2, repetitions) if scenario == 24 else repetitions
+            runs = max(2, repetitions) if scenario in (24, 25) else repetitions
             for repeat in range(runs):
                 label = f"scenario-{scenario:02}-run-{repeat + 1}"
                 output, code, duration = emulate(image, label)
                 evidence = verify(output, code, scenario)
                 result = {"case": label, "scenario": NAMES[scenario], "seconds": duration,
                           "exit": code, "passed": True, "new_hosting_case": scenario in (21, 22, 23),
-                          "new_contract_case": scenario == 24,
+                          "new_contract_case": scenario == 24, "new_analysis_case": scenario == 25,
                           "boot_image_sha256": hashlib.sha256(image.read_bytes()).hexdigest()}
                 if evidence is not None: result["evidence"] = evidence
                 results.append(result)
+                if scenario == 25 and repeat == 0:
+                    import analysis_oracle
+                    controls = analysis_oracle.negative_controls(output, code, scenario)
+                    analysis_negatives.append({"scenario": scenario, "controls": controls, "passed": True})
+                    print(f"PASS analysis oracle {scenario}: {len(controls)} negative controls", flush=True)
                 if scenario == 24 and repeat == 0:
                     import contract_oracle
                     controls = contract_oracle.negative_controls(output, code, scenario)
@@ -642,14 +652,15 @@ def main():
             results.append({"case": label, "seconds": duration, "passed": True})
             print(f"PASS {label}", flush=True)
         for scenario, cpu, memory in ((21, "qemu64", "32M"), (22, "max", "128M"),
-                                      (24, "qemu64", "32M"), (24, "max", "128M")):
-            label = f"{'contract' if scenario == 24 else 'hosting'}-platform-{scenario}-{cpu}-{memory}"
+                                      (24, "qemu64", "32M"), (24, "max", "128M"),
+                                      (25, "qemu64", "32M"), (25, "max", "128M")):
+            label = f"{'analysis' if scenario == 25 else 'contract' if scenario == 24 else 'hosting'}-platform-{scenario}-{cpu}-{memory}"
             hosted_image = LOGS / f"scenario-{scenario}" / "zeal.img"
             output, code, duration = emulate(hosted_image, label, cpu, memory)
             evidence = verify(output, code, scenario)
             results.append({"case": label, "seconds": duration, "exit": code,
                             "passed": True, "new_hosting_case": scenario in (21, 22, 23),
-                            "new_contract_case": scenario == 24, "evidence": evidence,
+                            "new_contract_case": scenario == 24, "new_analysis_case": scenario == 25, "evidence": evidence,
                             "boot_image_sha256": hashlib.sha256(hosted_image.read_bytes()).hexdigest()})
             print(f"PASS {label}", flush=True)
         output, code, duration = emulate(LOGS / "scenario-18" / "zeal.img",
@@ -722,6 +733,9 @@ def main():
         (LOGS / "contract-negative-controls.json").write_text(json.dumps(
             {"passed": len(contract_negatives) == 1 and all(item["passed"] for item in contract_negatives),
              "cases": contract_negatives}, indent=2) + "\n")
+        (LOGS / "analysis-negative-controls.json").write_text(json.dumps(
+            {"passed": len(analysis_negatives) == 1 and all(item["passed"] for item in analysis_negatives),
+             "cases": analysis_negatives}, indent=2) + "\n")
         (LOGS / "results.json").write_text(json.dumps({"passed": all(r["passed"] for r in results),
                                                      "cases": results}, indent=2) + "\n")
     print(f"Research suite: {len(results)} emulator runs passed. Logs: {LOGS}")

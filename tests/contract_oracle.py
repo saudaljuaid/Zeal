@@ -81,7 +81,7 @@ def manifest_records(path):
     return root_records, approved, hashlib.sha256(data).hexdigest()
 
 
-def linked_images(path):
+def linked_images(path, include_payload=False):
     """Read the cell extents from the tested linked ELF, not current build/common."""
     data = pathlib.Path(path).read_bytes()
     require(len(data) >= 64 and data[:7] == b"\x7fELF\x02\x01\x01", "tested kernel is not little-endian ELF64")
@@ -122,6 +122,8 @@ def linked_images(path):
         require(offset + size <= len(data), "linked approved image bytes are truncated")
         payload = data[offset:offset + size]
         images[template] = {"image_bytes": size, "image_sha256": hashlib.sha256(payload).hexdigest()}
+        if include_payload:
+            images[template]["payload"] = payload
     return images
 
 
@@ -221,7 +223,7 @@ class Obligation:
 class Observer(host.Observer):
     def __init__(self, events, roots, approved):
         super().__init__(events, roots, approved, 24)
-        self.supervisor_template, self.root_template_mask, self.fault_commands = 3, 12, (7,)
+        self.supervisor_template, self.worker_template, self.root_template_mask, self.fault_commands = 3, 4, 12, (7,)
         self.obligations = {}
         self.live_records = {}
         self.offer_keys = {}
@@ -873,9 +875,9 @@ class Observer(host.Observer):
                 "authoritative creation caller/publication phase contradicts actual runnable boundary")
         if kind == "request":
             endpoint, caller = self.principal(event)
-            require((f["template"] == 3 and endpoint == 0x104 and
+            require((f["template"] == self.supervisor_template and endpoint == 0x104 and
                      (f["requested_slots"], f["requested_pages"]) == (2, 4)) or
-                    (f["template"] == 4 and caller is not None and caller.template == 3 and
+                    (f["template"] == self.worker_template and caller is not None and caller.template == self.supervisor_template and
                      (f["requested_slots"], f["requested_pages"]) == (0, 0)),
                     "actual native profile broker/worker requested allowance differs from fixed two-slot/four-page backing")
             require(f["cell"] == f["caller"] and f["endpoint"] == f["caller_endpoint"] == endpoint and
@@ -895,7 +897,7 @@ class Observer(host.Observer):
                     "creation stage changed its actual prepared transaction object")
         if kind == "reserve":
             require((f["template"], f["pages"], f["reserved_slots"], f["reserved_pages"]) in
-                    ((3, 4, 2, 4), (4, 2, 0, 0)),
+                    ((self.supervisor_template, 4, 2, 4), (self.worker_template, 2, 0, 0)),
                     "actual native profile created different private/delegated resource commitments")
         if kind in ("reserve", "space"):
             require(f["parent_cap"] == f["child_cap"] == 0,

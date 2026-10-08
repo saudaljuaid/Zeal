@@ -230,6 +230,7 @@ static void abort_creation(struct z_runtime *runtime, unsigned caller,
     unsigned cell = transaction->slot;
     struct z_runtime_record record = runtime->records[cell];
     z_caps_drop_channel(&runtime->broker->capabilities, parent_cap, child_cap);
+    z_caps_drop_channel(&runtime->broker->capabilities, record.storage_read, record.storage_reply);
     z_wait_cancel(runtime->waits, cell);
     runtime->broker->queues[cell] = (struct z_queue){0};
     runtime->callbacks->space_release(runtime->context, cell);
@@ -238,6 +239,43 @@ static void abort_creation(struct z_runtime *runtime, unsigned caller,
     runtime->frames[cell] = (struct z_frame){0};
     trace(runtime, Z_RUNTIME_ABORT, caller, cell, transaction->request_id, result,
             transaction, &record, parent_cap, child_cap, NULL, 0, record.allocated_pages);
+}
+
+static uint64_t filesystem_endpoint(const struct z_runtime *runtime)
+{
+    /* Root role locates the one sealed dependency; configured recipe and
+     * capability entitlement authorize admission. No caller-selected target. */
+    const struct z_runtime_record *record = &runtime->records[Z_FS];
+    return record->origin == Z_RUNTIME_ROOT && record->role == Z_FS ?
+        principal(runtime, Z_FS) : 0;
+}
+
+static const struct z_cap_entry *installed_cap(const struct z_runtime *runtime,
+                                               uint64_t handle)
+{
+    unsigned low = (unsigned)(handle & 255);
+    if (!low || low > Z_CAPACITY) return NULL;
+    const struct z_cap_entry *entry = &runtime->broker->capabilities.entries[low - 1];
+    return entry->live && entry->epoch == handle >> 8 ? entry : NULL;
+}
+
+static bool storage_connection_current(const struct z_runtime *runtime,
+                                        uint64_t child, uint64_t filesystem,
+                                        uint64_t read_cap, uint64_t reply_cap, uint32_t template_id)
+{
+    if (!filesystem || filesystem_endpoint(runtime) != filesystem) return false;
+    const struct z_cap_entry *read = installed_cap(runtime, read_cap);
+    const struct z_cap_entry *reply = installed_cap(runtime, reply_cap);
+    return read != NULL && reply != NULL &&
+        read->holder == child && read->target == filesystem && read->issuer == filesystem &&
+        read->rights == (Z_RIGHT(Z_SNAPSHOT_READ) |
+            (template_id == 5 ? Z_RIGHT(Z_SNAPSHOT_RELEASE) : 0)) && read->parent != 0 &&
+        reply->holder == filesystem && reply->target == child && reply->issuer == filesystem &&
+        reply->rights == Z_RIGHT(Z_SNAPSHOT_REPLY) && reply->parent == 0 &&
+        z_caps_check(&runtime->broker->capabilities, runtime->broker->policies,
+            filesystem, read->parent, filesystem,
+            Z_RIGHT(Z_SNAPSHOT_READ) | Z_RIGHT(Z_SNAPSHOT_REPLY) |
+            Z_RIGHT(Z_SNAPSHOT_RELEASE) | Z_RIGHT_DELEGATE) == Z_OK;
 }
 
 int z_runtime_create(struct z_runtime *runtime, unsigned caller,
@@ -298,7 +336,8 @@ int z_runtime_create(struct z_runtime *runtime, unsigned caller,
     }
     trace(runtime, Z_RUNTIME_SPACE, caller, cell, request.request, Z_OK,
             &transaction, NULL, 0, 0, NULL, 0, 0);
-    if (transaction.bootstrap_recipe != Z_HOST_RECIPE_RPC) {
+    if (transaction.bootstrap_recipe != Z_HOST_RECIPE_RPC &&
+        transaction.bootstrap_recipe != Z_HOST_RECIPE_SNAPSHOT) {
         result = Z_DENIED; goto rollback;
     }
     result = z_caps_channel(&runtime->broker->capabilities, runtime->broker->policies,
@@ -307,6 +346,16 @@ int z_runtime_create(struct z_runtime *runtime, unsigned caller,
     runtime->records[cell].parent_channel = child_cap;
     trace(runtime, Z_RUNTIME_CHANNEL, caller, cell, request.request, Z_OK,
             &transaction, NULL, parent_cap, child_cap, NULL, 0, 0);
+    if (transaction.bootstrap_recipe == Z_HOST_RECIPE_SNAPSHOT) {
+        struct z_runtime_record *record = &runtime->records[cell];
+        record->storage_endpoint = filesystem_endpoint(runtime);
+        result = z_caps_snapshot_channel(&runtime->broker->capabilities, runtime->broker->policies,
+            owner, transaction.endpoint, record->storage_endpoint, transaction.template_id,
+            &record->storage_read, &record->storage_reply);
+        if (result != Z_OK) goto rollback;
+        trace(runtime, Z_RUNTIME_CHANNEL, caller, cell, request.request, Z_OK,
+            &transaction, NULL, record->storage_read, record->storage_reply, NULL, 0, 0);
+    }
     struct z_create_result created = {
         .instance = transaction.instance, .control = transaction.control,
         .endpoint = transaction.endpoint, .channel = parent_cap,
@@ -316,6 +365,10 @@ int z_runtime_create(struct z_runtime *runtime, unsigned caller,
     if (!runtime->callbacks->copy_out(runtime->context, caller, output, &created, sizeof(created))) {
         result = Z_BAD_ADDRESS; goto rollback;
     }
+    if (transaction.bootstrap_recipe == Z_HOST_RECIPE_SNAPSHOT &&
+        !storage_connection_current(runtime, transaction.endpoint,
+            runtime->records[cell].storage_endpoint, runtime->records[cell].storage_read,
+            runtime->records[cell].storage_reply, transaction.template_id)) { result = Z_STALE; goto rollback; }
     /* Single publication point. No callback or user turn lies between the
      * checked result copy and READY publication. The final policy check still
      * rejects a parent retired by an injected host callback during copying. */
@@ -405,6 +458,9 @@ static void cleanup(struct z_runtime *runtime, unsigned target, uint32_t mask,
                 runtime->records[cell].published = 0;
                 runtime->records[cell].parent_channel = 0;
                 runtime->records[cell].creation = 0;
+                runtime->records[cell].storage_endpoint = 0;
+                runtime->records[cell].storage_read = 0;
+                runtime->records[cell].storage_reply = 0;
                 if (!keep) {
                     runtime->records[cell].allocated_pages = 0;
                     runtime->records[cell].reserved_slots = 0;
@@ -573,9 +629,16 @@ int z_runtime_rebind(struct z_runtime *runtime, unsigned caller,
                                request.control, request.authority, request.request, &transaction);
     if (result != Z_OK) return result;
     uint64_t parent_cap = 0, child_cap = 0;
+    uint64_t filesystem = 0, read_cap = 0, reply_cap = 0;
     result = z_caps_channel(&runtime->broker->capabilities, runtime->broker->policies,
                              owner, transaction.endpoint, &parent_cap, &child_cap);
     if (result != Z_OK) goto rollback;
+    if (transaction.bootstrap_recipe == Z_HOST_RECIPE_SNAPSHOT) {
+        filesystem = filesystem_endpoint(runtime);
+        result = z_caps_snapshot_channel(&runtime->broker->capabilities, runtime->broker->policies,
+            owner, transaction.endpoint, filesystem, transaction.template_id, &read_cap, &reply_cap);
+        if (result != Z_OK) goto rollback;
+    }
     struct z_create_result rebound = {
         .instance = transaction.instance, .control = transaction.control,
         .endpoint = transaction.endpoint, .channel = parent_cap,
@@ -589,7 +652,9 @@ int z_runtime_rebind(struct z_runtime *runtime, unsigned caller,
     if (principal(runtime, caller) != owner ||
         z_host_query(&runtime->hierarchy, runtime->broker->policies,
                        owner, request.control, &current) != Z_OK ||
-        current.instance != transaction.instance || current.endpoint != transaction.endpoint) {
+        current.instance != transaction.instance || current.endpoint != transaction.endpoint ||
+        (transaction.bootstrap_recipe == Z_HOST_RECIPE_SNAPSHOT &&
+            !storage_connection_current(runtime, transaction.endpoint, filesystem, read_cap, reply_cap, transaction.template_id))) {
         result = Z_STALE; goto rollback;
     }
     struct z_runtime_record *record = &runtime->records[transaction.slot];
@@ -605,13 +670,19 @@ int z_runtime_rebind(struct z_runtime *runtime, unsigned caller,
         }
     }
     z_caps_drop_channel(&runtime->broker->capabilities, old_child_cap, 0);
+    z_caps_drop_channel(&runtime->broker->capabilities, record->storage_read, record->storage_reply);
+    record->storage_endpoint = filesystem; record->storage_read = read_cap; record->storage_reply = reply_cap;
     record->parent_channel = child_cap; record->creation = transaction.domain;
     transaction.request_id = request.request;
     trace(runtime, Z_RUNTIME_REBIND, caller, transaction.slot, request.request, Z_OK,
             &transaction, NULL, parent_cap, child_cap, NULL, 0, 0);
+    if (transaction.bootstrap_recipe == Z_HOST_RECIPE_SNAPSHOT)
+        trace(runtime, Z_RUNTIME_REBIND, caller, transaction.slot, request.request, Z_OK,
+            &transaction, NULL, read_cap, reply_cap, NULL, 0, 0);
     return Z_OK;
 rollback:
     z_caps_drop_channel(&runtime->broker->capabilities, parent_cap, child_cap);
+    z_caps_drop_channel(&runtime->broker->capabilities, read_cap, reply_cap);
     /* Architecture callbacks can inject owner/child/unrelated faults in host
      * tests. Never restore a table snapshot over mandatory subtree cleanup.
      * Rebind changes only a surviving child's execution-scoped domain token.

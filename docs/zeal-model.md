@@ -37,11 +37,12 @@ giving an existing mechanism a new name.
   profile/input. Incorrect owner, reference, generation, profile or input cannot
   start work. An exact duplicate is a narrow control-path idempotence rule.
 * **Receipt:** a finite account of an authenticated current-attempt delivery and
-  independently recomputed scalar result. It names the actual execution and
+  independently recomputed scalar or bounded binary-file result. It names the actual execution and
   attempt. It is neither a signature nor proof of arbitrary program correctness.
 * **Settlement:** a terminal lifecycle/resource transition, with separate worker
   page release, kernel control/slot reap and service-record reap. Successful
-  terminal publication follows actual worker cleanup. It is not payment.
+  terminal publication follows actual worker cleanup; byte analysis also requires
+  exact reader retirement and snapshot-byte release. It is not payment.
 * **Causal evidence:** bounded records joining authenticated requester input,
   actual worker backing/entry, acceptance, dispatch/delivery, verification,
   cleanup, terminal status and record reap. An application success marker alone
@@ -68,7 +69,10 @@ The existing foundations are exercised by `tests/hosting.c` under ASan/UBSan,
 Rust policy tests, `cells/hosting_tests.zig`, and QEMU scenarios 21–23 with the
 independent `tests/hosting_oracle.py`. The contract slice uses
 `cells/contract_core.zig`, `cells/contract_wire.zig`, its production host tests,
-the isolated runtime and the dedicated scenario 24 oracle. The complete
+the isolated runtime and the dedicated scenario 24 oracle. Scenario 25 adds
+actual immutable file capture, checked hosted service admission, byte analysis,
+independent recomputation and separate input/authority release points using that
+same broker; see `docs/file-analysis-contracts.md`. The complete
 supported gate remains `make test`; host models and emulator evidence establish
 different parts of the claim. Detailed protocol and test boundaries are in
 `docs/work-contracts.md` and `docs/testing.md`.
@@ -85,6 +89,7 @@ different parts of the claim. Detailed protocol and test boundaries are in
 | Contract broker | 2 records total, including unreaped terminal records |
 | Broker descendant backing | 2 slots and 4 pages; broker's own 4 pages separate |
 | Worker recovery | At most 1 retry per accepted contract |
+| Immutable input records | 2 × 128 bytes; 2 reader bindings per record |
 
 Preallocated sealed-image backing, page tables, frames, physical-pool storage
 and kernel tables are finite static overhead. Private page credit is not a bill
@@ -100,31 +105,31 @@ IMPLEMENTED means the specific finite behavior described by source and its
 tests. FOUNDATION identifies an existing mechanism useful to a larger design.
 FUTURE is a design direction, not a current API or guarantee. The following
 table keeps all three boundaries explicit. Work-contract evidence refers to
-the production core/runtime and scenario 24; authority/resource foundations
+the production core/runtime and scenarios 24–25; authority/resource foundations
 refer to the policy, C lifecycle engine and existing hosting tests above.
 
 | Idea | IMPLEMENTED slice | FOUNDATION | FUTURE |
 | --- | --- | --- | --- |
-| A. Intent-based composition | Fixed profile and explicit acceptance | Typed connections and finite domains | Arbitrary intent solving and declarative application graphs |
+| A. Intent-based composition | Approved scalar/byte profiles and exact immutable-input acceptance | Typed connections and finite domains | Arbitrary intent solving and declarative application graphs |
 | B. Resource passports | Actual slot/page backing and status | Manifest budgets, domains and capability rights | Portable inspectable declarations through arbitrary descendants; comprehensive metering |
-| C. Revocable collaboration | Generation-safe channels and checked cleanup | Holder/target/issuer checks and revocation | General adoption and live migration |
-| D. Verified work markets | One approved broker, fixed profile and capacity | Offers separated from acceptance | Provider matching, pricing, bidding, remote providers and distributed agreement |
-| E. Causal work receipts | Exact attempt/execution and scalar recomputation | Immutable images and externally hashed test artifacts | Rich configuration provenance, consumed-resource records and checkable dependency graphs |
-| F. Transactional composition | Individual atomic creation/rollback and finite contract transitions | Checked publication and cleanup | Atomic admission/publication of entire dependency graphs |
+| C. Revocable collaboration | Generation-safe channels, object-reader revocation and checked cleanup | Holder/target/issuer checks and revocation | General adoption and live migration |
+| D. Verified work markets | One approved broker, two pure profiles and fixed capacity | Offers separated from acceptance | Provider matching, pricing, bidding, remote providers and distributed agreement |
+| E. Causal work receipts | Exact input/attempt/execution and actual-byte/scalar recomputation | Immutable images and externally hashed test artifacts | Rich configuration provenance, consumed-resource records and checkable dependency graphs |
+| F. Transactional composition | Atomic approved route creation/rollback, coherent bounded capture and finite contract transitions | Checked publication and cleanup | Atomic admission/publication of entire dependency graphs |
 | G. Public failure domains | Worker recovery under a live broker; cold-cleared broker records | Owner-generation subtree retirement | General obligation survival and recovery policies |
-| H. Replaceable providers | Approved immutable worker with automatic restart | Explicit fresh-generation rebind | Implementation hot swap and provider migration |
-| I. Reproducible envelopes | Sealed templates, fixed scalar profile and finite authority/resources | Manifest/image checks | Arbitrary executables, timing reproduction and persistent checkpoints |
+| H. Replaceable providers | Approved immutable worker with one same-input retry | Explicit fresh-generation rebind | Implementation hot swap and provider migration |
+| I. Reproducible envelopes | Sealed templates, approved pure profiles and finite authority/resources | Manifest/image checks | Arbitrary executables, timing reproduction and persistent checkpoints |
 | J. Resource causality | Backing/status and structured evidence | Real domain queries and lifecycle traces | Desktop, terminal or graphical resource manager |
-| K. Obligation graphs | Individual contract causality | Parentage and explicit authority edges | Distinct data, authority, reservation and failure edges; cycles and atomic acceptance |
-| L. Authority following purpose | Service policy restricts one profile | Kernel capabilities enforce actual IPC/lifecycle rights | Purpose-bearing grants with defined enforcement and revocation |
+| K. Obligation graphs | Individual contract and one immutable-input dependency causality | Parentage and explicit authority edges | Distinct data, authority, reservation and failure edges; cycles and atomic acceptance |
+| L. Authority following purpose | FS policy restricts exact immutable object/reader; broker restricts approved profiles | Kernel capabilities enforce actual IPC/lifecycle rights | Purpose-bearing grants with defined enforcement and revocation |
 | M. Alternatives before commitment | Offer and acceptance are observable separate acts | Allocated offer backing | Discovery, comparisons and cross-provider commitment |
 | N. Result versus attempt | Stable contract across one worker restart; exact attempt identity | Stable logical worker/control, changing execution endpoint | Authorized provider replacement and richer logical obligations |
-| O. Authority return at completion | Worker retirement/resource return before successful terminal publication | Generation revocation, wait cancellation, stop/reap | Revocation dependency tracking for rights shared among providers |
+| O. Authority return at completion | Input byte/binding and worker authority/resource return before successful terminal publication | Generation revocation, wait cancellation, stop/reap | Revocation dependency tracking for rights shared among providers |
 | P. Cost of waiting | Offered/running/recovering backing and finite waits | Slot/page commitments | Owner-approved restructuring; CPU, energy or monetary measurements |
-| Q. Checking boundary | Deterministic recomputation | Exact authenticated delivery and input-sensitive work | Witness profiles, redundant providers, external verifiers and semantic proofs |
+| Q. Checking boundary | Actual captured-byte and scalar recomputation | Exact authenticated delivery and input-sensitive work | Witness profiles, redundant providers, external verifiers and semantic proofs |
 | R. Explainable rejection | Bounded protocol errors and terminal reasons | Existing precise management errors | Automatic planning and human-facing diagnostic interfaces |
 | S. Bounded experiments | Provider faults coexist with independent storage verification | Isolation, attenuated authority and small domains | General trials, live promotion and implementation replacement |
-| T. Owner commitments | One authenticated root requester | Explicit ownership and lifecycle control | Human identity/consent interfaces, federation and durable audit |
+| T. Owner commitments | One authenticated root requester and handle/snapshot ownership | Explicit ownership and lifecycle control | Human identity/consent interfaces, federation and durable audit |
 
 For a future document transformation, an application could propose a bounded
 source reader, transform provider, checker and preview provider. Each connection

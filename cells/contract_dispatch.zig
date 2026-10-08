@@ -41,7 +41,7 @@ pub fn backingReleased(worker: abi.CreateResult, status: abi.CellStatus) bool {
 pub fn admissionFence(worker: abi.CreateResult, status: abi.CellStatus, parent: u64) ?core.Fence {
     if (status.phase != 1 or status.instance != worker.instance or status.control != worker.control or
         status.endpoint != worker.endpoint or status.generation != worker.endpoint >> 8 or status.slot != worker.slot or
-        status.parent_endpoint != parent or status.template_id != 4 or status.depth != 2 or status.own_pages != 2 or
+        status.parent_endpoint != parent or (status.template_id != 4 and status.template_id != 6) or status.depth != 2 or status.own_pages != 2 or
         status.reserved_slots != 0 or status.reserved_pages != 0 or status.faults == 0xffffffff) return null;
     return .{ .generation = status.generation, .faults = status.faults, .restarts = status.restarts };
 }
@@ -80,7 +80,7 @@ pub fn dispatch(table: *core.Broker, message: *const abi.Message, seam: anytype)
     const record: *const core.Record = switch (packet.command) {
         .offer => blk: {
             const previous = table.next_serial;
-            const offered = table.offer(sender, packet.id, packet.data, packet.detail, seam) catch |reason| return rejected(packet, reason);
+            const offered = (if (packet.detail == 2) table.offerAnalysis(sender, packet.id, packet.data, packet.token, seam) else table.offer(sender, packet.id, packet.data, packet.detail, seam)) catch |reason| return rejected(packet, reason);
             new_offer = table.next_serial != previous;
             break :blk offered;
         },
@@ -95,7 +95,7 @@ pub fn dispatch(table: *core.Broker, message: *const abi.Message, seam: anytype)
             break :blk found;
         },
         .cancel => table.cancel(sender, packet.token, seam) catch |reason| return rejected(packet, reason),
-        .reap, .work, .fault, .bootstrap => unreachable,
+        .reap, .work, .fault, .bootstrap, .input, .analysis_tuple, .input_length, .rebind_input, .authorize_input => unreachable,
     };
     return .{ .snapshot = .{ .request = packet, .value = table.snapshot(record), .new_offer = new_offer } };
 }

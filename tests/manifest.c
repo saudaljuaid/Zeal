@@ -109,9 +109,9 @@ static void grant_and_catalog_boundaries(void)
 {
     const size_t grant = HEADER_SIZE + 4 * 64;
     reject_at(grant, 999); reject_at(grant + 4, 999);
-    reject_at(grant + 8, 0); reject_at(grant + 8, 0x10000); reject_at(grant + 8, UINT32_MAX);
+    reject_at(grant + 8, 0); reject_at(grant + 8, 0x100000); reject_at(grant + 8, UINT32_MAX);
     reject_at(grant + 8, Z_RIGHT_DELEGATE);
-    for (unsigned operation = Z_BLOCK_READ; operation <= Z_HOST_REPLY; ++operation) {
+    for (unsigned operation = Z_BLOCK_READ; operation <= Z_SNAPSHOT_RELEASE; ++operation) {
         base_manifest(); put32(grant + 8, Z_RIGHT(operation)); assert(validate());
     }
     reject_at(grant + 12, 1);

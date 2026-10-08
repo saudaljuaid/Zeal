@@ -4,6 +4,8 @@ Scenario 24 implements one isolated broker (approved template 3, supervisor
 image 5) beneath authenticated root identity 400. Its approved leaf workers use
 template 4, worker image 6. These templates are declared in `cells/contracts.toml`;
 existing templates 1/2 and scenarios 21–23 keep their original behavior.
+Scenario 25 explicitly selects templates 5/6 and profile 2 using the same core;
+see [immutable-input byte analysis](file-analysis-contracts.md).
 ABI 4 and manifest 2 remain compatible. No kernel syscall, privileged contract
 object or second creation engine is added.
 
@@ -21,7 +23,7 @@ The broker obtains its self endpoint, parent requester, template, logical
 instance and creation domain from trusted BootInfo. Requests authenticate the
 exact parent endpoint generation through kernel IPC. A role, image, numeric
 identity, contract reference or matching input does not grant authority.
-The broker holds request/reply bootstrap channels only; workers have a narrow
+For scenario 24, the broker holds request/reply bootstrap channels only; workers have a narrow
 reply-only channel to their owner and no filesystem/raw block rights.
 
 Profile 1 selects the approved two-page worker, fixed scalar input/result rule,

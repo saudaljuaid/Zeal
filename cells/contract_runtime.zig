@@ -8,6 +8,8 @@ const dispatcher = @import("contract_dispatch.zig");
 const hosting = @import("hosting_runtime.zig");
 const app = @import("hosting_app.zig");
 const transport = @import("contract_transport.zig");
+const analysis = @import("analysis_wire.zig");
+const snapshot_client = @import("snapshot_client.zig");
 comptime {
     _ = @import("memory.zig");
 }
@@ -33,7 +35,7 @@ fn boot(role: abi.Role) abi.BootInfo {
     var info: abi.BootInfo = undefined;
     require(syscall.boot(&info) == 0 and info.abi == abi.version and info.role == @intFromEnum(role) and
         info.endpoint != 0 and info.generation != 0 and info.instance != 0 and info.parent_endpoint != 0 and
-        info.scenario == scenario and info.reserved == 0);
+        (info.scenario == scenario or info.scenario == 25) and info.reserved == 0);
     return info;
 }
 fn bind(info: *abi.BootInfo, creation: bool) void {
@@ -125,7 +127,8 @@ const Service = struct {
     table: core.Broker,
     management: wire.Sequence = .{},
     inbox: transport.Inbox = .{},
-    deferred: transport.Replies = .{},
+    deferred: union(enum) { scalar: transport.Replies, analysis: analysis.Results } = .{ .scalar = .{} },
+    snapshot_rpc: snapshot_client.Client = .{},
     announced: [2]bool = .{ false, false },
     waiting: [2]u16 = .{ 0, 0 },
     waiting_rpc: [2]u64 = .{ 0, 0 },
@@ -140,19 +143,19 @@ const Service = struct {
         if (syscall.domainStatus(self.info.creation, &status) != 0 or status.holder != self.info.endpoint or
             status.instance != self.info.instance or status.reserved_slots != 0 or status.reserved_pages != 0 or
             status.slot_limit != 2 or status.page_limit != 4 or status.revoked != 0 or
-            status.template_mask != 8 or status.recipe != 1) return null;
+            status.template_mask != (if (self.info.scenario == 25) @as(u32, 32) else 8) or status.recipe != (if (self.info.scenario == 25) @as(u32, 2) else 1)) return null;
         return .{ .owned_slots = status.owned_slots, .owned_pages = status.owned_pages, .available_slots = status.available_slots, .available_pages = status.available_pages };
     }
     pub fn create(self: *Service) ?core.Backing {
         const id = self.management.take() orelse return null;
-        const request: abi.CreateRequest = .{ .authority = self.info.creation, .request = id, .template_id = worker_template };
+        const request: abi.CreateRequest = .{ .authority = self.info.creation, .request = id, .template_id = if (self.info.scenario == 25) 6 else worker_template };
         var child: abi.CreateResult = undefined;
         if (syscall.create(&request, &child) != 0) return null;
         var status: abi.CellStatus = undefined;
         var cap: abi.CapabilityInfo = undefined;
         if (syscall.status(child.control, &status) != 0 or status.instance != child.instance or status.endpoint != child.endpoint or
             status.own_pages != 2 or status.parent_endpoint != self.info.endpoint or status.parent_instance != self.info.instance or
-            status.template_id != worker_template or status.depth != 2 or status.phase != 1 or child.creation != 0 or
+            status.template_id != (if (self.info.scenario == 25) @as(u32, 6) else worker_template) or status.depth != 2 or status.phase != 1 or child.creation != 0 or
             syscall.query(child.channel, &cap) != 0 or cap.holder != self.info.endpoint or cap.target != child.endpoint or
             cap.rights != abi.right(.hosting_request) or cap.parent != 0)
         {
@@ -169,7 +172,8 @@ const Service = struct {
                     require(syscall.sleep(1) == 0);
                     return child;
                 }
-                if ((message.sender == self.info.parent_endpoint or wire.decodeWork(&message, message.sender, wire.reply_operation) != null) and
+                if ((message.sender == self.info.parent_endpoint or wire.decodeWork(&message, message.sender, wire.reply_operation) != null or
+                    (self.info.scenario == 25 and wire.decode(&message, message.sender, wire.reply_operation) != null)) and
                     !self.inbox.push(message)) break;
             } else if (received != @intFromEnum(abi.Error.timeout)) break;
         }
@@ -207,10 +211,66 @@ const Service = struct {
             copied.sender = self.info.endpoint;
             break :blk wire.decodeWork(&copied, self.info.endpoint, wire.request_operation) orelse return false;
         };
+        if (self.info.scenario == 25) {
+            const record = self.table.status(self.info.parent_endpoint, packet.token) catch return false;
+            var input = wire.encode(wire.request_operation, .{ .id = packet.id, .command = .input, .detail = packet.detail, .token = packet.token, .data = record.input_issuer });
+            const serial = wire.tokenSerial(packet.token);
+            const delay: u64 = if (serial == 1) 32 else if (serial == 4 or serial == 6) 32 else 0;
+            const fault: u64 = if (serial == 5 and packet.detail == 1) 1 else 0;
+            var length = wire.encode(wire.request_operation, .{ .id = packet.id, .command = .input_length, .detail = packet.detail, .token = packet.token, .data = @as(u64, record.input_length) | (delay << 16) | (fault << 24) });
+            if (hosting.sendBounded(child.endpoint, &input, child.channel) != 0 or hosting.sendBounded(child.endpoint, &length, child.channel) != 0) return false;
+        }
         if (packet.detail == 1) report(75, packet.token, packet.data);
         report(76, packet.token, packet.id);
         report(77, packet.token, packet.detail);
         return hosting.sendBounded(child.endpoint, &message, child.channel) == 0;
+    }
+    fn collectInput(self: *Service, issuer: u64, token: u64) ?analysis.Tuple {
+        if (issuer != syscall.lookup(.filesystem)) return null;
+        const route = syscall.find(issuer, abi.right(.snapshot_read) | abi.right(.snapshot_release));
+        var cap: abi.CapabilityInfo = undefined;
+        if (route <= 0 or syscall.query(@intCast(route), &cap) != 0 or cap.holder != self.info.endpoint or cap.target != issuer or
+            cap.rights != abi.right(.snapshot_read) | abi.right(.snapshot_release) or cap.parent == 0 or cap.reserved != 0) return null;
+        var bytes = [_]u8{0} ** 128;
+        var offset: u16 = 0;
+        while (offset <= 128) {
+            const reply = self.snapshot_rpc.readWith(.{ .issuer = issuer, .token = token }, offset, 8, &self.inbox) orelse return null;
+            if (reply.status != .ok or reply.offset != offset or reply.count > 8 or offset + reply.count > 128) return null;
+            if (reply.count == 0) return analysis.calculate(bytes[0..offset]);
+            @memcpy(bytes[offset..][0..reply.count], reply.data[0..reply.count]);
+            offset += reply.count;
+            if (reply.count != 8) {
+                const eof = self.snapshot_rpc.readWith(.{ .issuer = issuer, .token = token }, offset, 8, &self.inbox) orelse return null;
+                if (eof.status != .ok or eof.count != 0) return null;
+                return analysis.calculate(bytes[0..offset]);
+            }
+        }
+        return null;
+    }
+    pub fn prepareInput(self: *Service, issuer: u64, token: u64) ?u16 {
+        if (self.info.scenario != 25) return null;
+        return (self.collectInput(issuer, token) orelse return null).length;
+    }
+    pub fn verifyInput(self: *Service, issuer: u64, token: u64) ?analysis.Tuple {
+        return self.collectInput(issuer, token);
+    }
+    pub fn cancellationPending(self: *Service, token: u64) bool {
+        for (0..self.inbox.count) |offset| {
+            const message = &self.inbox.messages[(self.inbox.head + offset) % self.inbox.messages.len];
+            const packet = wire.decodeRequest(message, self.info.parent_endpoint) orelse continue;
+            if (packet.command == .cancel and packet.token == token) return true;
+        }
+        return false;
+    }
+    pub fn releaseInput(self: *Service, record: core.Record, successful: bool) bool {
+        const reply = self.snapshot_rpc.releaseWithBound(.{ .issuer = record.input_issuer, .token = record.input }, if (successful) record.worker.endpoint else 0, &self.inbox) orelse return false;
+        if (reply.status != .ok or reply.count != 0) return false;
+        report(95, record.token, record.input);
+        return true;
+    }
+    pub fn validatedAnalysis(_: *Service, record: core.Record, result: analysis.Tuple) void {
+        report(78, record.token, result.digest);
+        report(93, record.token, result.counts());
     }
     pub fn validated(self: *Service, token: u64, child: core.Backing, rpc: u64, attempt: u8, input: u64, result: u64) void {
         _ = self;
@@ -236,6 +296,33 @@ const Service = struct {
         var cap: abi.CapabilityInfo = undefined;
         if (syscall.query(child.channel, &cap) != 0 or cap.holder != self.info.endpoint or cap.target != child.endpoint or
             cap.rights != abi.right(.hosting_request) or cap.parent != 0 or child.channel == old.channel) return null;
+        if (self.info.scenario == 25) {
+            const token = self.tokenFor(old.control);
+            var notice = wire.encode(wire.reply_operation, .{ .id = request.request, .command = .rebind_input, .kind = .response, .token = token, .data = child.endpoint });
+            if (hosting.sendBounded(self.info.parent_endpoint, &notice, self.info.parent_channel) != 0) return null;
+            var authorized = false;
+            for (0..16) |_| {
+                var incoming: abi.Message = undefined;
+                const received = syscall.receiveWait(&incoming, 10);
+                if (received == @intFromEnum(abi.Error.timeout)) continue;
+                if (received != 0) break;
+                if (wire.decode(&incoming, self.info.parent_endpoint, wire.request_operation)) |ack| {
+                    if (ack.command == .cancel and ack.kind == .request and ack.token == token and ack.detail == 0 and ack.data == 0) {
+                        _ = self.table.cancel(self.info.parent_endpoint, token, self) catch {};
+                        _ = self.inbox.push(incoming);
+                        return null;
+                    }
+                    if (ack.command == .authorize_input and ack.kind == .request and ack.id == request.request and
+                        ack.token == token and ack.data == child.endpoint and ack.detail == 0)
+                    {
+                        authorized = true;
+                        break;
+                    }
+                }
+                if (!self.inbox.push(incoming)) break;
+            }
+            if (!authorized) return null;
+        }
         report(83, self.tokenFor(old.control), child.endpoint);
         return child;
     }
@@ -253,6 +340,10 @@ const Service = struct {
         report(72, record.token, record.worker.instance);
         report(73, record.token, record.worker.control);
         report(74, record.token, record.worker.endpoint);
+        if (record.profile == analysis.profile) {
+            report(90, record.token, record.input_issuer);
+            report(91, record.token, record.input_length);
+        }
         self.ledger();
     }
     fn terminalEvidence(self: *Service) void {
@@ -270,6 +361,12 @@ const Service = struct {
             // STATUS/OFFER resynchronization never creates another worker.
             if (hosting.sendBounded(self.info.parent_endpoint, message, self.info.parent_channel) != 0) return;
         }
+        if (snapshot.profile_id == analysis.profile) {
+            var issuer = wire.encode(wire.reply_operation, .{ .id = packet.id, .command = packet.command, .kind = .snapshot, .detail = 8, .token = snapshot.token, .data = snapshot.input_issuer });
+            var counts = wire.encode(wire.reply_operation, .{ .id = packet.id, .command = packet.command, .kind = .snapshot, .detail = 9, .token = snapshot.token, .data = @as(u64, snapshot.input_length) | (@as(u64, snapshot.newlines) << 16) });
+            if (hosting.sendBounded(self.info.parent_endpoint, &issuer, self.info.parent_channel) != 0) return;
+            _ = hosting.sendBounded(self.info.parent_endpoint, &counts, self.info.parent_channel);
+        }
     }
     fn failureReply(self: *Service, packet: wire.Packet, failure: core.Error) void {
         const code = dispatcher.failureCode(failure);
@@ -277,6 +374,13 @@ const Service = struct {
         _ = hosting.sendBounded(self.info.parent_endpoint, &message, self.info.parent_channel);
     }
     fn handleRequest(self: *Service, message: *const abi.Message) void {
+        if (wire.decode(message, self.info.parent_endpoint, wire.request_operation)) |packet| {
+            const approved: u8 = if (self.info.scenario == 25) analysis.profile else wire.profile;
+            if ((packet.command == .offer or packet.command == .accept) and packet.detail != approved) {
+                self.failureReply(packet, error.invalid);
+                return;
+            }
+        }
         const result = dispatcher.dispatch(&self.table, message, self);
         self.terminalEvidence();
         switch (result) {
@@ -294,11 +398,14 @@ const Service = struct {
                 self.announced[slot] = false;
                 // Private delivery storage has its own release point. A reaped
                 // predecessor cannot occupy the successor's delivery slot.
-                if (self.deferred.release(packet.token)) |old_message| {
-                    const old = wire.decodeWork(&old_message, old_message.sender, wire.reply_operation).?;
-                    _ = self.table.deliver(&old_message, self) catch {
-                        report(81, old.token, old.id);
-                    };
+                if (self.info.scenario == 25) self.deferred.analysis.release(packet.token);
+                if (self.info.scenario != 25) {
+                    if (self.deferred.scalar.release(packet.token)) |old_message| {
+                        const old = wire.decodeWork(&old_message, old_message.sender, wire.reply_operation).?;
+                        _ = self.table.deliver(&old_message, self) catch {
+                            report(81, old.token, old.id);
+                        };
+                    }
                 }
                 report(80, packet.token, wire.tokenSerial(packet.token));
                 var reply = wire.encode(wire.reply_operation, .{ .id = packet.id, .command = .reap, .kind = .response, .token = packet.token });
@@ -307,8 +414,24 @@ const Service = struct {
         }
     }
     fn deferReply(self: *Service, message: abi.Message) void {
+        if (self.info.scenario == 25) {
+            const envelope = wire.decode(&message, message.sender, wire.reply_operation) orelse return;
+            if (envelope.command != .work and envelope.command != .analysis_tuple) return;
+            const record = self.table.status(self.info.parent_endpoint, envelope.token) catch {
+                report(81, envelope.token, envelope.id);
+                return;
+            };
+            if (record.state != .running or record.worker.endpoint != message.sender or record.rpc != envelope.id or record.attempt != envelope.detail) {
+                report(81, envelope.token, envelope.id);
+                return;
+            }
+            if (self.deferred.analysis.push(&message)) |candidate| {
+                if (self.deferred.analysis.hold(candidate)) report(86, candidate.token, candidate.id) else report(81, candidate.token, candidate.id);
+            }
+            return;
+        }
         const packet = wire.decodeWork(&message, message.sender, wire.reply_operation) orelse return;
-        switch (self.deferred.hold(&self.table, message)) {
+        switch (self.deferred.scalar.hold(&self.table, message)) {
             .accepted => report(86, packet.token, packet.id),
             .rejected, .full => report(81, packet.token, packet.id),
         }
@@ -341,7 +464,13 @@ const Service = struct {
                 require(record.terminal());
                 continue;
             };
-            if (previous == .running and record.state == .recovering) report(82, record.token, endpoint);
+            if (previous == .running and record.state == .recovering) {
+                if (self.info.scenario == 25) {
+                    if (self.deferred.analysis.contains(record.token)) report(81, record.token, record.rpc);
+                    self.deferred.analysis.release(record.token);
+                }
+                report(82, record.token, endpoint);
+            }
         }
         self.terminalEvidence();
     }
@@ -349,7 +478,19 @@ const Service = struct {
         // Reconcile retirement first: an old dequeued result cannot settle a
         // faulted attempt merely because its bounded private window matured.
         self.observeLifecycle(true);
-        for (self.deferred.advance()) |pending| {
+        if (self.info.scenario == 25) {
+            for (self.deferred.analysis.advance()) |pending| {
+                const candidate = pending orelse continue;
+                _ = self.table.deliverAnalysis(candidate, self) catch {
+                    report(81, candidate.token, candidate.id);
+                    continue;
+                };
+                self.terminalEvidence();
+            }
+            self.terminalEvidence();
+            return;
+        }
+        for (self.deferred.scalar.advance()) |pending| {
             const message = pending orelse continue;
             const packet = wire.decodeWork(&message, message.sender, wire.reply_operation).?;
             _ = self.table.deliver(&message, self) catch {
@@ -364,11 +505,11 @@ const Service = struct {
 
 pub fn broker() noreturn {
     var info = boot(.supervisor);
-    require(info.template_id == broker_template and info.depth == 1);
+    require((info.template_id == broker_template or info.template_id == 5) and info.depth == 1);
     const sentinel = initialize(info);
     bind(&info, true);
     deniedStorage(info);
-    var service: Service = .{ .info = info, .table = core.Broker.init(info.endpoint, info.parent_endpoint), .sentinel = sentinel };
+    var service: Service = .{ .info = info, .table = core.Broker.init(info.endpoint, info.parent_endpoint), .sentinel = sentinel, .deferred = if (info.scenario == 25) .{ .analysis = .{} } else .{ .scalar = .{} } };
     service.ledger();
     while (true) {
         var message: abi.Message = undefined;

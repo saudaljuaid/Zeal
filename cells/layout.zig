@@ -18,7 +18,7 @@ pub fn main() !void {
             @intFromEnum(abi.Call.sleep),
             @intFromEnum(abi.Call.recv_wait),
             abi.delegate_right,
-            @intFromEnum(abi.Operation.hosting_reply),
+            @intFromEnum(abi.Operation.snapshot_release),
             abi.operation_rights,
             abi.instance_tag,
             abi.control_tag,
@@ -33,7 +33,7 @@ pub fn main() !void {
             @intFromEnum(abi.Call.rebind),
         })).len;
     used += (try std.fmt.bufPrint(buffer[used..],
-        "\"creation_revoke\":{d},\"domain_status\":{d},\"file_read_right\":{d},\"cap_ack_right\":{d},\"block_read_right\":{d},\"block_write_right\":{d},\"block_reply_right\":{d},\"file_open_right\":{d},\"file_chunk_read_right\":{d},\"file_write_right\":{d},\"file_close_right\":{d},\"file_result_right\":{d},\"hosting_request_right\":{d},\"hosting_reply_right\":{d},\"role_block\":{d},\"role_filesystem\":{d},\"role_client\":{d},\"role_probe\":{d},\"role_supervisor\":{d},\"role_worker\":{d},\"message_size\":{d},\"message_align\":{d},\"message_sender\":{d},\"message_operation\":{d},",
+        "\"creation_revoke\":{d},\"domain_status\":{d},\"file_read_right\":{d},\"cap_ack_right\":{d},\"block_read_right\":{d},\"block_write_right\":{d},\"block_reply_right\":{d},\"file_open_right\":{d},\"file_chunk_read_right\":{d},\"file_write_right\":{d},\"file_close_right\":{d},\"file_result_right\":{d},\"hosting_request_right\":{d},\"hosting_reply_right\":{d},\"snapshot_control_right\":{d},\"snapshot_read_right\":{d},\"snapshot_reply_right\":{d},\"snapshot_release_right\":{d},\"role_block\":{d},\"role_filesystem\":{d},\"role_client\":{d},\"role_probe\":{d},\"role_supervisor\":{d},\"role_worker\":{d},\"message_size\":{d},\"message_align\":{d},\"message_sender\":{d},\"message_operation\":{d},",
         .{
             @intFromEnum(abi.Call.creation_revoke),
             @intFromEnum(abi.Call.domain_status),
@@ -49,6 +49,10 @@ pub fn main() !void {
             abi.right(.file_result),
             abi.right(.hosting_request),
             abi.right(.hosting_reply),
+            abi.right(.snapshot_control),
+            abi.right(.snapshot_read),
+            abi.right(.snapshot_reply),
+            abi.right(.snapshot_release),
             @intFromEnum(abi.Role.block),
             @intFromEnum(abi.Role.filesystem),
             @intFromEnum(abi.Role.client),

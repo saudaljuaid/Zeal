@@ -266,7 +266,9 @@ impl Table {
         for t in templates {
             if t.identity == 0 || t.identity > OBJECTS as u32 || t.pages == 0 || t.pages > 20
                 || t.max_descendant_depth > 1 || t.child_template_mask & !255 != 0
-                || t.bootstrap_recipe != 1 || t.reserved != 0
+                || !matches!(t.bootstrap_recipe, 1 | 2) || t.reserved != 0
+                || (t.bootstrap_recipe == 2 && !((t.identity == 5 && t.max_descendant_depth == 1 && t.child_template_mask == 32)
+                    || (t.identity == 6 && t.max_descendant_depth == 0 && t.child_template_mask == 0)))
                 || ((t.max_descendant_depth == 0) != (t.child_template_mask == 0))
                 || mask & (1 << (t.identity - 1)) != 0 { return INVALID; }
             mask |= 1 << (t.identity - 1);
@@ -279,7 +281,9 @@ impl Table {
             if r.slot >= ROOTS as u32 || self.root_mask & (1 << r.slot) == 0
                 || owners & (1 << r.slot) != 0 || r.template_mask == 0 || r.template_mask & !mask != 0
                 || r.slot_limit > 4 || r.page_limit > (PAGES - self.root_pages).min(48) || r.max_depth == 0
-                || r.max_depth > 2 || r.bootstrap_recipe != 1 || r.reserved0 != 0 || r.reserved1 != 0
+                || r.max_depth > 2 || !matches!(r.bootstrap_recipe, 1 | 2) || r.reserved0 != 0 || r.reserved1 != 0
+                || (r.bootstrap_recipe == 2 && (r.slot != 3 || r.template_mask != 48))
+                || templates.iter().any(|t| r.template_mask & (1 << (t.identity - 1)) != 0 && t.bootstrap_recipe != r.bootstrap_recipe)
                 || endpoint(states, states[r.slot as usize].handle(r.slot)).is_none() { return INVALID; }
             owners |= 1 << r.slot;
             total_slots += r.slot_limit;
@@ -343,7 +347,7 @@ impl Table {
         let pd = self.domains[p];
         if request.request_id <= pd.last_request { return Err(STALE); }
         let t = self.templates[request.template_id as usize - 1];
-        if t.identity == 0 || pd.template_mask & (1 << (request.template_id - 1)) == 0 { return Err(DENIED); }
+        if t.identity == 0 || t.bootstrap_recipe != pd.recipe || pd.template_mask & (1 << (request.template_id - 1)) == 0 { return Err(DENIED); }
         let depth = if parent < ROOTS { 1 } else {
             let n = self.record_slot(parent).ok_or(DENIED)?;
             if self.records[n].phase != ACTIVE || self.records[n].generation != caller >> 8 { return Err(DENIED); }
@@ -573,8 +577,8 @@ impl Table {
         let p = self.active_domain(states, caller, creation)?;
         if request_id <= self.domains[p].last_request { return Err(STALE); }
         let r = self.records[n];
-        if r.phase != ACTIVE || r.parent_domain as usize != p || r.recipe != 1
-            || self.domains[p].recipe != 1 || self.domains[p].template_mask & (1 << (r.template_id - 1)) == 0
+        if r.phase != ACTIVE || r.parent_domain as usize != p || !matches!(r.recipe, 1 | 2)
+            || self.domains[p].recipe != r.recipe || self.domains[p].template_mask & (1 << (r.template_id - 1)) == 0
             || endpoint(states, states[r.slot as usize].handle(r.slot)).is_none() { return Err(DENIED); }
         if r.domain != NO_PARENT {
             let d = r.domain as usize;
@@ -643,7 +647,8 @@ impl Table {
                 || r.parent_instance != self.instance(r.parent_slot as usize)
                 || r.parent_endpoint & 255 != r.parent_slot as u64 + 1 || r.generation == 0
                 || r.generation > GENERATION_MAX || r.phase > TERMINAL || r.rights & !(QUERY | STOP | REAP) != 0
-                || r.rights & QUERY == 0 { return false; }
+                || r.rights & QUERY == 0 || !matches!(r.recipe, 1 | 2)
+                || r.recipe != self.templates[r.template_id as usize - 1].bootstrap_recipe { return false; }
             for handle in [r.instance, r.control, r.transaction] {
                 if handle == 0 { continue; }
                 let epoch = handle >> 8;
@@ -689,7 +694,7 @@ impl Table {
                 if epoch >= self.next_epoch || epochs[..epoch_count].contains(&epoch) { return false; }
                 epochs[epoch_count] = epoch; epoch_count += 1;
             }
-            if d.holder_slot >= SLOTS as u32 || d.revoked > 1 || d.max_depth > 2 || d.recipe != 1
+            if d.holder_slot >= SLOTS as u32 || d.revoked > 1 || d.max_depth > 2 || !matches!(d.recipe, 1 | 2)
                 || d.template_mask & !self.template_mask != 0 || d.slot_limit > 4 || d.page_limit > PAGES
                 || d.owned_slots != owned_slots[n] || d.owned_pages != owned_pages[n]
                 || d.reserved_slots != reserved_slots[n] || d.reserved_pages != reserved_pages[n]
@@ -699,12 +704,13 @@ impl Table {
             if d.parent == NO_PARENT {
                 if d.holder_slot >= ROOTS as u32 || n != d.holder_slot as usize || d.instance != 0 { return false; }
                 let root = self.roots[n];
-                if root.template_mask == 0 || d.template_mask & !root.template_mask != 0 || d.max_depth > root.max_depth
+                if root.template_mask == 0 || d.recipe != root.bootstrap_recipe || d.template_mask & !root.template_mask != 0 || d.max_depth > root.max_depth
                     || d.slot_limit > root.slot_limit || d.page_limit > root.page_limit { return false; }
                 root_slots += d.slot_limit;
                 root_pages += d.page_limit;
             } else {
                 if d.parent >= OBJECTS as u32 || self.domains[d.parent as usize].holder == 0
+                    || d.recipe != self.domains[d.parent as usize].recipe
                     || d.template_mask & !self.domains[d.parent as usize].template_mask != 0
                     || d.max_depth > self.domains[d.parent as usize].max_depth { return false; }
                 let owner = match self.records.iter().find(|r| r.phase != FREE && r.domain as usize == n

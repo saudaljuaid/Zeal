@@ -277,7 +277,7 @@ static int send(unsigned source, uint64_t target, uint64_t cap, uint32_t operati
 static void fixture_catalog_config(uint32_t supervisor_stack, uint32_t supervisor_writable,
                             uint32_t worker_stack, uint32_t worker_writable,
                             unsigned depth, unsigned slot_limit, unsigned page_limit, bool second_worker_image,
-                            bool native_contract_templates)
+                            unsigned native_contract_templates)
 {
     ++fixture_count;
     memset(&f, 0, sizeof(f));
@@ -300,7 +300,7 @@ static void fixture_catalog_config(uint32_t supervisor_stack, uint32_t superviso
             .boot_config = i == Z_PROBE ? 21 : 0, .restart_limit = 3, .restart_delay = 4,
             .name = { 'r', 'o', 'o', 't', (uint8_t)('0' + i), 0 } };
     }
-    const struct z_manifest_grant grants[] = {
+    struct z_manifest_grant grants[] = {
         { 200, 200, Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE, 0 },
         { 300, 200, Z_RIGHT(Z_FILE_READ) | Z_RIGHT(Z_FILE_WRITE), 0 },
         { 200, 100, Z_RIGHT(Z_BLOCK_READ) | Z_RIGHT(Z_BLOCK_WRITE), 0 },
@@ -322,7 +322,7 @@ static void fixture_catalog_config(uint32_t supervisor_stack, uint32_t superviso
         { .owner_identity = 400, .template_mask = second_worker_image ? 7 : 3, .slot_limit = slot_limit,
           .page_limit = page_limit, .max_depth = depth, .bootstrap_recipe = 1 },
     };
-    if (native_contract_templates) {
+    if (native_contract_templates == 1) {
         assert(!second_worker_image);
         cells[Z_PROBE].boot_config = 24;
         templates[0].identity = 3;
@@ -331,6 +331,15 @@ static void fixture_catalog_config(uint32_t supervisor_stack, uint32_t superviso
         templates[1].identity = 4;
         templates[1].boot_config = 24;
         domains[0].template_mask = 12;
+    }
+    if (native_contract_templates == 2) {
+        assert(!second_worker_image);
+        cells[Z_PROBE].boot_config = 25;
+        templates[0].identity = 5; templates[0].boot_config = 25;
+        templates[0].child_template_mask = 32; templates[0].bootstrap_recipe = 2;
+        templates[1].identity = 6; templates[1].boot_config = 25; templates[1].bootstrap_recipe = 2;
+        domains[0].template_mask = 48; domains[0].bootstrap_recipe = 2;
+        grants[0].rights |= Z_RIGHT(Z_SNAPSHOT_READ) | Z_RIGHT(Z_SNAPSHOT_REPLY) | Z_RIGHT(Z_SNAPSHOT_RELEASE);
     }
     uint8_t bytes[Z_MANIFEST_ARTIFACT_MAX] = {0};
     unsigned template_count = second_worker_image ? 3 : 2;
@@ -1722,6 +1731,206 @@ static void nested_owner_and_ancestor_retirement_at_every_creation_boundary(void
     assert(probes == 36);
 }
 
+static void snapshot_fixture(void)
+{
+    fixture_catalog_config(8192, 16384, 4096, 8192, 2, 4, 48, false, 2);
+}
+static void check_snapshot_routes(struct z_create_result child, uint32_t rights)
+{
+    const struct z_runtime_record *r = &f.runtime.records[child.slot];
+    assert(r->storage_endpoint == endpoint(Z_FS));
+    struct z_cap_info info;
+    assert(z_caps_query(&f.broker.capabilities, f.broker.policies, child.endpoint, r->storage_read, &info) == Z_OK);
+    assert(info.holder == child.endpoint && info.target == endpoint(Z_FS) && info.rights == rights && info.parent != 0);
+    const struct z_cap_entry *read = &f.broker.capabilities.entries[(r->storage_read & 255) - 1];
+    const struct z_cap_entry *reply = &f.broker.capabilities.entries[(r->storage_reply & 255) - 1];
+    const struct z_cap_entry *entitlement = &f.broker.capabilities.entries[(info.parent & 255) - 1];
+    assert(read->issuer == endpoint(Z_FS) && reply->issuer == endpoint(Z_FS));
+    assert(entitlement->epoch == info.parent >> 8 && read->epoch == r->storage_read >> 8);
+    assert(reply->epoch == r->storage_reply >> 8 && reply->epoch > read->epoch);
+    assert(entitlement->parent == 0 && entitlement->holder == endpoint(Z_FS));
+    assert(entitlement->target == endpoint(Z_FS) && entitlement->issuer == endpoint(Z_FS));
+    assert(z_caps_query(&f.broker.capabilities, f.broker.policies, endpoint(Z_FS), r->storage_reply, &info) == Z_OK);
+    assert(info.holder == endpoint(Z_FS) && info.target == child.endpoint && info.rights == Z_RIGHT(Z_SNAPSHOT_REPLY) && info.parent == 0);
+    for (unsigned op = 1; op <= Z_SNAPSHOT_RELEASE; ++op)
+        if (!(rights & Z_RIGHT(op)))
+            assert(z_caps_check(&f.broker.capabilities, f.broker.policies, child.endpoint, r->storage_read, endpoint(Z_FS), Z_RIGHT(op)) == Z_DENIED);
+    assert(z_caps_check(&f.broker.capabilities, f.broker.policies, child.endpoint, r->storage_read, endpoint(Z_BLOCK), Z_RIGHT(Z_SNAPSHOT_READ)) == Z_DENIED);
+    assert(z_caps_check(&f.broker.capabilities, f.broker.policies, endpoint(Z_PROBE), r->storage_read, endpoint(Z_FS), Z_RIGHT(Z_SNAPSHOT_READ)) == Z_DENIED);
+}
+static void snapshot_admission_exact_routes_rebind_and_retirement(void)
+{
+    snapshot_fixture();
+    uint64_t root = domain(Z_PROBE);
+    struct z_create_result broker = create(Z_PROBE, root, 5, 2, 4);
+    struct z_create_result worker = create(broker.slot, broker.creation, 6, 0, 0);
+    check_snapshot_routes(broker, Z_RIGHT(Z_SNAPSHOT_READ) | Z_RIGHT(Z_SNAPSHOT_RELEASE));
+    check_snapshot_routes(worker, Z_RIGHT(Z_SNAPSHOT_READ));
+    assert(live_caps() == 12 && allocated_pages() == 86);
+    uint64_t read = f.runtime.records[worker.slot].storage_read;
+    uint64_t reply = f.runtime.records[worker.slot].storage_reply;
+    uint64_t broker_read = f.runtime.records[broker.slot].storage_read;
+    assert(send(worker.slot, endpoint(Z_FS), read, Z_SNAPSHOT_READ, 1) == Z_OK);
+    assert(send(Z_FS, worker.endpoint, reply, Z_SNAPSHOT_REPLY, 2) == Z_OK);
+    struct z_create_result rebound;
+    assert(rebind(broker.slot, broker.creation, worker.control, &rebound) == Z_OK);
+    check_snapshot_routes(rebound, Z_RIGHT(Z_SNAPSHOT_READ));
+    assert(f.runtime.records[worker.slot].storage_read != read && f.runtime.records[worker.slot].storage_reply != reply);
+    assert(send(worker.slot, endpoint(Z_FS), read, Z_SNAPSHOT_READ, 3) == Z_STALE);
+    assert(send(Z_FS, worker.endpoint, reply, Z_SNAPSHOT_REPLY, 4) == Z_STALE);
+    struct z_message message;
+    assert(z_broker_receive(&f.broker, Z_FS, &message) == Z_AGAIN);
+    assert(z_broker_receive(&f.broker, worker.slot, &message) == Z_AGAIN);
+    assert(z_caps_check(&f.broker.capabilities, f.broker.policies, broker.endpoint, broker_read, endpoint(Z_FS), Z_RIGHT(Z_SNAPSHOT_READ)) == Z_OK);
+    assert(live_caps() == 12);
+    read = f.runtime.records[worker.slot].storage_read;
+    reply = f.runtime.records[worker.slot].storage_reply;
+    assert(z_runtime_fault(&f.runtime, worker.slot, 0, 14) == Z_OK);
+    assert(live_caps() == 8 && z_runtime_poll(&f.runtime, worker.slot, 4) == 1);
+    assert(f.runtime.records[worker.slot].storage_read == 0);
+    assert(z_broker_find(&f.broker, worker.slot, endpoint(Z_FS), Z_RIGHT(Z_SNAPSHOT_READ)) == Z_DENIED);
+    assert(rebind(broker.slot, broker.creation, worker.control, &rebound) == Z_OK);
+    assert(rebound.endpoint != worker.endpoint);
+    check_snapshot_routes(rebound, Z_RIGHT(Z_SNAPSHOT_READ));
+    assert(send(worker.slot, endpoint(Z_FS), read, Z_SNAPSHOT_READ, 5) == Z_STALE);
+    assert(send(Z_FS, rebound.endpoint, reply, Z_SNAPSHOT_REPLY, 6) == Z_STALE);
+    assert(z_runtime_stop(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert(z_runtime_reap(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert_no_dynamic_charge();
+}
+static void snapshot_admission_failures_and_exhaustion(void)
+{
+    const enum injection_point points[] = { INJECT_SPACE_PARTIAL, INJECT_FRAME, INJECT_COPY_OUT };
+    for (unsigned i = 0; i < sizeof(points) / sizeof(*points); ++i) {
+        snapshot_fixture(); uint64_t root = domain(Z_PROBE);
+        struct z_create_request request = creation(Z_PROBE, root, 5, 2, 4);
+        set_injection(points[i], true, -1);
+        assert(create_request(Z_PROBE, &request, input_address, sizeof(request), output_address) != Z_OK);
+        assert_no_dynamic_charge();
+    }
+    snapshot_fixture(); uint64_t root = domain(Z_PROBE);
+    uint64_t entitlement = (uint64_t)z_broker_find(&f.broker, Z_FS, endpoint(Z_FS), Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+    assert(z_caps_revoke(&f.broker.capabilities, f.broker.policies, endpoint(Z_FS), entitlement) == Z_OK);
+    struct z_create_request request = creation(Z_PROBE, root, 5, 2, 4);
+    assert(create_request(Z_PROBE, &request, input_address, sizeof(request), output_address) == Z_DENIED);
+    assert(allocated_pages() == 80 && live_caps() == 3 && f.runtime.hierarchy.domains[Z_PROBE].owned_slots == 0);
+    for (unsigned pressure = 0; pressure < 4; ++pressure) {
+        snapshot_fixture(); root = domain(Z_PROBE);
+        entitlement = (uint64_t)z_broker_find(&f.broker, Z_FS, endpoint(Z_FS), Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+        uint64_t delegates[Z_CAPACITY] = {0}; unsigned count = 0;
+        while (live_caps() < Z_CAPACITY - pressure) {
+            int64_t cap = z_broker_delegate(&f.broker, Z_FS, entitlement, endpoint(Z_FS), Z_RIGHT(Z_FILE_READ));
+            assert(cap > 0); delegates[count++] = (uint64_t)cap;
+        }
+        request = creation(Z_PROBE, root, 5, 2, 4);
+        unsigned before = live_caps();
+        assert(create_request(Z_PROBE, &request, input_address, sizeof(request), output_address) == Z_NO_SPACE);
+        assert(allocated_pages() == 80 && live_caps() == before && f.runtime.hierarchy.domains[Z_PROBE].owned_slots == 0);
+        for (unsigned i = 0; i < count; ++i)
+            assert(z_caps_revoke(&f.broker.capabilities, f.broker.policies, endpoint(Z_FS), delegates[i]) == Z_OK);
+        assert_no_dynamic_charge();
+    }
+    for (unsigned remaining = 0; remaining < 3; ++remaining) {
+        snapshot_fixture(); root = domain(Z_PROBE);
+        f.broker.capabilities.next_epoch = (uint64_t)Z_POLICY_GENERATION_MAX - remaining;
+        request = creation(Z_PROBE, root, 5, 2, 4);
+        assert(create_request(Z_PROBE, &request, input_address, sizeof(request), output_address) == Z_NO_SPACE);
+        assert_no_dynamic_charge();
+    }
+    snapshot_fixture(); root = domain(Z_PROBE);
+    request = creation(Z_PROBE, root, 5, 2, 4);
+    set_injection(INJECT_COPY_OUT, false, Z_FS);
+    assert(create_request(Z_PROBE, &request, input_address, sizeof(request), output_address) == Z_STALE);
+    assert(allocated_pages() == 80 && live_caps() == 0 && z_runtime_check(&f.runtime));
+    assert(z_runtime_poll(&f.runtime, Z_FS, 4) == 1 && z_broker_refresh(&f.broker) == Z_OK);
+    assert_no_dynamic_charge();
+    snapshot_fixture(); root = domain(Z_PROBE);
+    assert(z_runtime_fault(&f.runtime, Z_FS, 0, 14) == Z_OK);
+    request = creation(Z_PROBE, root, 5, 2, 4);
+    assert(create_request(Z_PROBE, &request, input_address, sizeof(request), output_address) == Z_STALE);
+    assert(allocated_pages() == 80 && live_caps() == 0 && z_runtime_check(&f.runtime));
+    assert(z_runtime_poll(&f.runtime, Z_FS, 4) == 1 && z_broker_refresh(&f.broker) == Z_OK);
+    assert_no_dynamic_charge();
+    snapshot_fixture(); root = domain(Z_PROBE);
+    struct z_create_result broker = create(Z_PROBE, root, 5, 2, 4);
+    uint64_t old_read = f.runtime.records[broker.slot].storage_read;
+    uint64_t old_reply = f.runtime.records[broker.slot].storage_reply;
+    set_injection(INJECT_COPY_OUT, true, -1);
+    struct z_create_result rebound;
+    assert(rebind(Z_PROBE, root, broker.control, &rebound) == Z_BAD_ADDRESS);
+    assert(f.runtime.records[broker.slot].storage_read == old_read && f.runtime.records[broker.slot].storage_reply == old_reply);
+    assert(live_caps() == 8 && allocated_pages() == 84);
+    set_injection(INJECT_NONE, false, -1);
+    assert(z_runtime_stop(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert(z_runtime_reap(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert_no_dynamic_charge();
+    snapshot_fixture(); root = domain(Z_PROBE);
+    broker = create(Z_PROBE, root, 5, 2, 4);
+    old_read = f.runtime.records[broker.slot].storage_read;
+    old_reply = f.runtime.records[broker.slot].storage_reply;
+    set_injection(INJECT_COPY_OUT, false, Z_FS);
+    assert(rebind(Z_PROBE, root, broker.control, &rebound) == Z_STALE);
+    assert(allocated_pages() == 84 && live_caps() == 2 && z_runtime_check(&f.runtime));
+    set_injection(INJECT_NONE, false, -1);
+    assert(z_runtime_poll(&f.runtime, Z_FS, 4) == 1 && z_broker_refresh(&f.broker) == Z_OK);
+    assert(z_broker_find(&f.broker, broker.slot, endpoint(Z_FS), Z_RIGHT(Z_SNAPSHOT_READ)) == Z_DENIED);
+    assert(send(broker.slot, endpoint(Z_FS), old_read, Z_SNAPSHOT_READ, 7) == Z_STALE);
+    assert(send(Z_FS, broker.endpoint, old_reply, Z_SNAPSHOT_REPLY, 8) == Z_STALE);
+    assert(rebind(Z_PROBE, root, broker.control, &rebound) == Z_OK);
+    check_snapshot_routes(rebound, Z_RIGHT(Z_SNAPSHOT_READ) | Z_RIGHT(Z_SNAPSHOT_RELEASE));
+    assert(z_runtime_stop(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert(z_runtime_reap(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert_no_dynamic_charge();
+}
+
+static void snapshot_rebind_pressure_epochs_and_domain_revocation_preserve_predecessors(void)
+{
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        unsigned cases = mode == 0 ? 4 : mode == 1 ? 3 : 1;
+        for (unsigned boundary = 0; boundary < cases; ++boundary) {
+            snapshot_fixture();
+            uint64_t root = domain(Z_PROBE);
+            struct z_create_result broker = create(Z_PROBE, root, 5, 2, 4);
+            struct z_create_result worker = create(broker.slot, broker.creation, 6, 0, 0);
+            uint64_t old_read = f.runtime.records[worker.slot].storage_read;
+            uint64_t old_reply = f.runtime.records[worker.slot].storage_reply;
+            uint64_t old_parent = f.runtime.records[worker.slot].parent_channel;
+            uint64_t broker_read = f.runtime.records[broker.slot].storage_read;
+            uint64_t delegates[Z_CAPACITY] = {0}; unsigned count = 0;
+            if (mode == 0) {
+                uint64_t entitlement = (uint64_t)z_broker_find(&f.broker, Z_FS, endpoint(Z_FS), Z_RIGHT(Z_FILE_READ) | Z_RIGHT_DELEGATE);
+                while (live_caps() < Z_CAPACITY - boundary) {
+                    int64_t cap = z_broker_delegate(&f.broker, Z_FS, entitlement, endpoint(Z_FS), Z_RIGHT(Z_FILE_READ));
+                    assert(cap > 0); delegates[count++] = (uint64_t)cap;
+                }
+            } else if (mode == 1) f.broker.capabilities.next_epoch = (uint64_t)Z_POLICY_GENERATION_MAX - boundary;
+            else assert(z_runtime_revoke(&f.runtime, broker.slot, broker.creation) == Z_OK);
+            unsigned before_caps = live_caps();
+            uint64_t previous_request = f.runtime.hierarchy.domains[(broker.creation & 255) - Z_HOST_DOMAIN_TAG - 1].last_request;
+            struct z_create_result replacement;
+            assert(rebind(broker.slot, broker.creation, worker.control, &replacement) == (mode == 2 ? Z_DENIED : Z_NO_SPACE));
+            assert(f.runtime.records[worker.slot].storage_read == old_read);
+            assert(f.runtime.records[worker.slot].storage_reply == old_reply);
+            assert(f.runtime.records[worker.slot].parent_channel == old_parent);
+            assert(live_caps() == before_caps && allocated_pages() == 86 && z_runtime_check(&f.runtime));
+            check_snapshot_routes(worker, Z_RIGHT(Z_SNAPSHOT_READ));
+            assert(z_caps_check(&f.broker.capabilities, f.broker.policies, broker.endpoint, broker_read,
+                endpoint(Z_FS), Z_RIGHT(Z_SNAPSHOT_READ) | Z_RIGHT(Z_SNAPSHOT_RELEASE)) == Z_OK);
+            if (mode != 2) assert(f.runtime.hierarchy.domains[(broker.creation & 255) - Z_HOST_DOMAIN_TAG - 1].last_request > previous_request);
+            assert(send(worker.slot, endpoint(Z_FS), old_read, Z_SNAPSHOT_READ, 9) == Z_OK);
+            assert(send(Z_FS, worker.endpoint, old_reply, Z_SNAPSHOT_REPLY, 10) == Z_OK);
+            struct z_message message;
+            assert(z_broker_receive(&f.broker, Z_FS, &message) == Z_OK && message.sender == worker.endpoint);
+            assert(z_broker_receive(&f.broker, worker.slot, &message) == Z_OK && message.sender == endpoint(Z_FS));
+            for (unsigned i = 0; i < count; ++i)
+                assert(z_caps_revoke(&f.broker.capabilities, f.broker.policies, endpoint(Z_FS), delegates[i]) == Z_OK);
+            assert(z_runtime_stop(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+            assert(z_runtime_reap(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+            assert_no_dynamic_charge();
+        }
+    }
+}
+
 int main(void)
 {
     real_creation_identity_backing_channels_and_denied_storage();
@@ -1743,7 +1952,10 @@ int main(void)
     native_broker_cold_retirement_and_service_reference_non_authority();
     checked_management_captures_preserve_exact_buffers_and_live_scope();
     terminal_status_preserves_retirement_counters_between_result_sample_and_stop();
-    printf("C hosting: 19 groups, fixtures=%u, injected failures=%u/faults=%u, 256 recovery/cleanup/reuse cycles, 7500 independent model steps seeds=0x5ea105/0x726f6c6c6261636b/0x9e3779b97f4a7c15; production checked copies, private page ownership, reservation conservation, rollback, stale typed authority, capability pressure/exhaustion, subtree waits/queues/sibling preservation, native broker3/worker4 cold retirement, service-reference non-authority, live checked management captures and result-to-stop retirement counter fencing PASS\n",
+    snapshot_admission_exact_routes_rebind_and_retirement();
+    snapshot_admission_failures_and_exhaustion();
+    snapshot_rebind_pressure_epochs_and_domain_revocation_preserve_predecessors();
+    printf("C hosting: 22 groups, fixtures=%u, injected failures=%u/faults=%u, 256 recovery/cleanup/reuse cycles, 7500 independent model steps seeds=0x5ea105/0x726f6c6c6261636b/0x9e3779b97f4a7c15; production checked copies, private page ownership, reservation conservation, rollback, stale typed authority, capability pressure/exhaustion, subtree waits/queues/sibling preservation, native broker3/worker4 cold retirement, service-reference non-authority, live checked management captures and result-to-stop retirement counter fencing PASS\n",
         fixture_count, failure_injections, fault_injections);
     return 0;
 }

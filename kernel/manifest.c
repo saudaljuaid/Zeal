@@ -242,8 +242,18 @@ bool z_manifest_validate(const void *data, size_t length,
             config->restart_delay != Z_MANIFEST_RESTART_DELAY)
             return fail(error, Z_MANIFEST_LIFECYCLE_ERROR);
         if (config->max_descendant_depth >= Z_MANIFEST_DEPTH_MAX ||
-            config->bootstrap_recipe != Z_MANIFEST_BOOTSTRAP_RPC ||
+            (config->bootstrap_recipe != Z_MANIFEST_BOOTSTRAP_RPC &&
+                config->bootstrap_recipe != Z_MANIFEST_BOOTSTRAP_SNAPSHOT) ||
             ((config->max_descendant_depth == 0) != (config->child_template_mask == 0)))
+            return fail(error, Z_MANIFEST_TEMPLATE_ERROR);
+        if (config->bootstrap_recipe == Z_MANIFEST_BOOTSTRAP_RPC && config->boot_config == 25)
+            return fail(error, Z_MANIFEST_TEMPLATE_ERROR);
+        if (config->bootstrap_recipe == Z_MANIFEST_BOOTSTRAP_SNAPSHOT &&
+            (config->boot_config != 25 ||
+                !((config->identity == 5 && config->image == 5 &&
+                    config->max_descendant_depth == 1 && config->child_template_mask == 32) ||
+                  (config->identity == 6 && config->image == 6 &&
+                    config->max_descendant_depth == 0 && config->child_template_mask == 0))))
             return fail(error, Z_MANIFEST_TEMPLATE_ERROR);
     }
     for (unsigned i = 0; i < template_count; ++i)
@@ -276,7 +286,11 @@ bool z_manifest_validate(const void *data, size_t length,
             domain->slot_limit == 0 || domain->slot_limit > Z_MANIFEST_DYNAMIC_SLOTS ||
             domain->page_limit == 0 || domain->page_limit > Z_MANIFEST_DYNAMIC_PAGES ||
             domain->max_depth == 0 || domain->max_depth > Z_MANIFEST_DEPTH_MAX ||
-            domain->bootstrap_recipe != Z_MANIFEST_BOOTSTRAP_RPC)
+            (domain->bootstrap_recipe != Z_MANIFEST_BOOTSTRAP_RPC &&
+                domain->bootstrap_recipe != Z_MANIFEST_BOOTSTRAP_SNAPSHOT) ||
+            (domain->bootstrap_recipe == Z_MANIFEST_BOOTSTRAP_RPC && creator->boot_config == 25) ||
+            (domain->bootstrap_recipe == Z_MANIFEST_BOOTSTRAP_SNAPSHOT &&
+                (creator->boot_config != 25 || domain->template_mask != 48)))
             return fail(error, Z_MANIFEST_DOMAIN_ERROR);
         for (unsigned j = 0; j < i; ++j)
             if (parsed.domains[j].owner_identity == domain->owner_identity)

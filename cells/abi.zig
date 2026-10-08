@@ -5,7 +5,7 @@ pub const stack_size: usize = 0x4000;
 pub const memory_base: usize = 0x40030000;
 pub const payload_size = 32;
 pub const version = 4;
-pub const operation_rights: u32 = 0xffff;
+pub const operation_rights: u32 = 0xfffff;
 pub const wait_max_ticks: u64 = 1000;
 pub const delegate_right: u32 = 1 << 31;
 
@@ -39,6 +39,10 @@ pub const Operation = enum(u32) {
     file_result,
     hosting_request,
     hosting_reply,
+    snapshot_control,
+    snapshot_read,
+    snapshot_reply,
+    snapshot_release,
 };
 
 pub fn right(operation: Operation) u32 {
@@ -85,6 +89,8 @@ pub const host_stop_right: u32 = 2;
 pub const host_reap_right: u32 = 4;
 pub const supervisor_template: u32 = 1;
 pub const worker_template: u32 = 2;
+pub const analysis_broker_template: u32 = 5;
+pub const analysis_worker_template: u32 = 6;
 
 pub const CreateRequest = extern struct {
     authority: u64,
@@ -166,7 +172,11 @@ pub const CapabilityInfo = extern struct {
 comptime {
     if (version != 4 or @intFromEnum(Operation.file_result) != 14 or
         @intFromEnum(Operation.hosting_reply) != 16 or
-        operation_rights != (right(.hosting_reply) << 1) - 1)
+        @intFromEnum(Operation.snapshot_control) != 17 or
+        @intFromEnum(Operation.snapshot_read) != 18 or
+        @intFromEnum(Operation.snapshot_reply) != 19 or
+        @intFromEnum(Operation.snapshot_release) != 20 or
+        operation_rights != (right(.snapshot_release) << 1) - 1)
         @compileError("storage operation ABI differs from include/zeal/abi.h");
     if (@intFromEnum(Call.sleep) != 11 or @intFromEnum(Call.recv_wait) != 12 or
         @intFromEnum(Error.timeout) != -8 or wait_max_ticks != 1000)

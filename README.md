@@ -23,11 +23,14 @@ and global scheduler. Delegated page/slot allowances, typed lifecycle controls,
 atomic creation, cold restart, and subtree cleanup govern these descendants.
 
 A bounded isolated work-contract broker offers actual allocated workers, begins
-work only after authenticated acceptance, independently checks scalar results,
+work only after authenticated acceptance, independently checks scalar or immutable-file byte-analysis results,
 and returns worker resources before publishing terminal receipts. Status queries,
 checked cancellation, one fresh-authority retry and explicit record reap expose
 the relationship between purpose, permission, backing, execution and outcome.
-This slice uses two records and one approved pure work profile.
+Two finite records support approved pure profiles. Purpose-scoped storage
+admission lets a hosted worker read one captured input of at most 128 bytes and
+return its checked length, newline count and noncryptographic digest. Explicit
+reader retirement and input/contract reap expose separate completion lifetimes.
 
 ## Build and run
 
@@ -43,7 +46,8 @@ make test
 See [building](docs/building.md), [architecture](docs/architecture.md),
 [storage contracts](docs/storage.md), [wait contracts](docs/waits.md), and
 [hosting contracts](docs/hosting-policy.md), [management ABI](docs/hosting-abi.md),
-[native model](docs/zeal-model.md), [work contracts](docs/work-contracts.md),
+[native model](docs/zeal-model.md), [work contracts](docs/work-contracts.md), [file analysis](docs/file-analysis-contracts.md),
+[immutable inputs](docs/storage-inputs.md), [storage admission](docs/storage-admission.md),
 and [test coverage](docs/testing.md).
 
 ## Status

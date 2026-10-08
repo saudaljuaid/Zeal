@@ -238,3 +238,45 @@ Successful native settlement additionally joins its READY admission
 generation/fault/restart stamp to the identical post-STOP terminal stamp before
 reap. Controlled production-seam and C cases exercise intervening fault/restart,
 including unchanged execution generation with an increased fault count.
+
+## Immutable input and byte-analysis checks
+
+Scenario 25 adds an explicit composition using snapshot admission recipe 2 and
+byte-analysis profile 2. The complete `make test` target keeps all earlier
+scenarios and controls, runs scenario 25 at least twice, and also runs it with
+`qemu64` / 32 MiB and `max` / 128 MiB. Its Python observer reconstructs actual
+source RAM bytes from matched filesystem/block writes and reads, then joins the
+owner's live file handle, coherent immutable capture, checked request and reply
+routes, backed offer, exact acceptance, ordered worker chunks and EOF, full
+length/newline/FNV-1a tuple, independent broker and owner byte collections,
+retirement fence, input release, worker stop/reap, and explicit metadata reap.
+Full privileged raw packet words must agree with every decoded wire field.
+A correct progress marker cannot excuse a contradictory raw word.
+
+The new host drivers invoke production `Fs`, `Block`, snapshot `Table`, and the
+shared `Broker.offerAnalysis` / `deliverAnalysis` methods after every action.
+The independent Python representation uses named file dictionaries, address
+maps, full issuer/serial input identities, reader placement maps, provider
+objects, page identity sets, and obligation/attempt histories. Generated actions
+cover source writes and lost acknowledgements, partial capture, coherent
+revision failure, exact/altered transaction replay, table pressure, owner and
+service retirement, current and predecessor readers, revocation, close/reap and
+record reuse. Separate combined sequences compare accepted analysis, source
+mutation, each result component, cancellation, fault/retry, stale attempts,
+unrelated obligations, admission/stop counter fences, partial cleanup, and
+nonwrapping counters. Binary cases cover lengths 0/1/7/8/9/127/128, rejected
+129-byte metadata, NUL and non-ASCII bytes, newline bytes, exact EOF and extent
+arithmetic. These finite host comparisons complement the emulator evidence;
+they do not claim emulator proof of intrusive dependency races.
+
+Actions, actual reports, compiler/runtime errors, model summaries, seeds and
+first failing witnesses, including owner generation/transaction watermarks and current reader route masks, remain under `build/analysis-model` and
+`build/analysis-contract-model`. The external observer records its counterfeit
+controls in `build/research/analysis-negative-controls.json`; any unexpectedly
+accepted counterfeit is retained under
+`build/research/analysis-counterfeit-witnesses` before the checker is repaired.
+The complete gate and evidence archive preserve these paths on success and
+failure. Scenario 25 explicitly budgets 4,096 privileged hosting/progress trace
+credits, 384 progress reports, and 8,192 ordinary/snapshot IPC trace credits and
+service reports; earlier compositions retain their original trace budgets.
+Exhausted trace credit fails validation.

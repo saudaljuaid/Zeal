@@ -53,7 +53,10 @@ u64 below occupies eight bytes and each u32 occupies four; order is significant.
 
 The original message remains 48 bytes with a 32-byte payload. Operations 15 and
 16 are hosting request and hosting reply; the operation-rights mask is now
-`0x0000ffff`. All preexisting operation and syscall numbers are stable. Initial
+`0x000fffff`. Operations 17–20 are snapshot control, read, reply and
+checker release. They are provisioned only by explicit new grants and the
+approved scenario-25 recipe; see [checked storage admission](storage-admission.md).
+All preexisting operation and syscall numbers are stable. Initial
 root storage grants retain their narrow rights. Bootstrap data names the
 child's own endpoint, logical instance, diagnostic identity, and exact parent
 endpoint; dynamic applications do not infer themselves from a root role lookup.

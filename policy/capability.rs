@@ -395,6 +395,69 @@ impl Table {
         }
         self.prune();
     }
+
+    fn snapshot_channel(&mut self, states: &[State; CELLS as usize], parent: u64,
+                        child: u64, filesystem: u64, template_id: u32) -> Result<(u64, u64), i32> {
+        const READ: u32 = 1 << 17;
+        const REPLY: u32 = 1 << 18;
+        const RELEASE: u32 = 1 << 19;
+        let rights = match template_id { 5 => READ | RELEASE, 6 => READ, _ => return Err(DENIED as i32) };
+        if endpoint(states, parent).is_none() { return Err(AGAIN as i32); }
+        // The sealed recipe has one service dependency: the exact current
+        // filesystem root. Neither a role lookup nor a supplied endpoint can
+        // substitute for its configured root entitlement.
+        if endpoint(states, filesystem) != Some(1) || self.root_count as usize > ROOTS {
+            return Err(STALE as i32);
+        }
+        let entitlement = self.roots[..self.root_count as usize].iter().find(|root|
+            root.grant.holder == 1 && root.grant.target == 1 && root.grant.reserved == 0
+                && root.grant.rights & (READ | REPLY | RELEASE | DELEGATE) == (READ | REPLY | RELEASE | DELEGATE)
+                && root.holder_generation == filesystem >> 8
+                && root.target_generation == filesystem >> 8).ok_or(DENIED as i32)?;
+        let authority = self.entries.iter().enumerate().find(|(slot, entry)|
+            entry.live == 1 && entry.holder == filesystem && entry.target == filesystem
+                && entry.issuer == filesystem && entry.parent == 0
+                && entry.rights == entitlement.grant.rights
+                && self.active(states, self.handle(*slot)).is_ok())
+            .map(|(slot, _)| self.handle(slot)).ok_or(DENIED as i32)?;
+        let low = (child & 255) as usize;
+        let generation = child >> 8;
+        if low <= MANIFEST_ROOT_CELLS as usize || low > CELLS as usize
+            || generation == 0 || generation > GENERATION_MAX || child == parent {
+            return Err(INVALID as i32);
+        }
+        let state = &states[low - 1];
+        if !state.valid() || !((state.phase == super::DORMANT && generation > state.generation)
+            || (state.phase == READY && state.generation == generation)) {
+            return Err(STALE as i32);
+        }
+        if self.entries.iter().filter(|entry| entry.live == 0).count() < 2
+            || self.next_epoch == 0 || self.next_epoch >= GENERATION_MAX {
+            return Err(NO_SPACE as i32);
+        }
+        let read = self.insert(child, filesystem, rights, authority, filesystem)
+            .map_err(|error| error as i32)?;
+        // Retargeting is confined to this sealed reply leg, not general
+        // delegation. The issuer is the entitled current filesystem itself.
+        let reply = self.insert(filesystem, child, REPLY, 0, filesystem)
+            .map_err(|error| error as i32)?;
+        Ok((read, reply))
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn z_caps_snapshot_channel(table: *mut Table,
+    states: *const [State; CELLS as usize], parent: u64, child: u64, filesystem: u64, template_id: u32,
+    read_cap: *mut u64, reply_cap: *mut u64) -> i32 {
+    let (table, states) = match (table.as_mut(), states.as_ref()) {
+        (Some(table), Some(states)) if !read_cap.is_null() && !reply_cap.is_null()
+            && read_cap != reply_cap => (table, states),
+        _ => return INVALID as i32,
+    };
+    match table.snapshot_channel(states, parent, child, filesystem, template_id) {
+        Ok((read, reply)) => { ptr::write(read_cap, read); ptr::write(reply_cap, reply); 0 }
+        Err(error) => error,
+    }
 }
 
 #[no_mangle]
@@ -585,7 +648,7 @@ mod tests {
             assert_eq!(table.check(&states, client, child, fs, right), DENIED as i32);
             assert_eq!(table.delegate(&states, fs, parent, client, right), DENIED);
         }
-        for rights in [0, DELEGATE, 1 << 16, 1 << 30, u32::MAX] {
+        for rights in [0, DELEGATE, 1 << 20, 1 << 30, u32::MAX] {
             assert!(!valid_rights(rights));
             assert_eq!(table.find(&states, client, fs, rights), INVALID);
         }
@@ -699,5 +762,97 @@ mod tests {
             assert_eq!(z_caps_refresh_epoch_status(ptr::null(), &states), INVALID as i32);
             assert_eq!(z_caps_refresh_epoch_status(&original, ptr::null()), INVALID as i32);
         }
+    }
+
+    fn snapshot_entitled(states: &[State; CELLS as usize]) -> Table {
+        let mut table = Table::new();
+        assert_eq!(table.configure(&[Grant { holder: 1, target: 1,
+            rights: (1 << 17) | (1 << 18) | (1 << 19) | DELEGATE, reserved: 0 }]), 0);
+        assert_eq!(table.refresh(states), 0);
+        table
+    }
+
+    #[test]
+    fn sealed_snapshot_recipe_uses_exact_entitlement_endpoint_rights_and_derivation() {
+        let states = states();
+        let fs = states[1].handle(1);
+        let parent = states[3].handle(3);
+        let child = states[4].handle(4);
+        for template in [5, 6] {
+            let mut table = snapshot_entitled(&states);
+            let (read, reply) = table.snapshot_channel(&states, parent, child, fs, template).unwrap();
+            let rights = (1 << 17) | if template == 5 { 1 << 19 } else { 0 };
+            assert_eq!(table.check(&states, child, read, fs, rights), 0);
+            assert_eq!(table.check(&states, fs, reply, child, 1 << 18), 0);
+            let r = table.entries[table.slot(read).unwrap()];
+            let s = table.entries[table.slot(reply).unwrap()];
+            assert_eq!((r.issuer, r.parent, s.issuer, s.parent), (fs, table.handle(0), fs, 0));
+            assert!(r.epoch > table.entries[0].epoch && s.epoch > r.epoch);
+            for operation in 1..=super::super::Z_OPERATION_MAX {
+                let right = 1 << (operation - 1);
+                if right & rights == 0 { assert_eq!(table.check(&states, child, read, fs, right), DENIED as i32); }
+            }
+            assert_eq!(table.delegate(&states, child, read, parent, 1 << 17), DENIED);
+            assert_eq!(table.check(&states, parent, read, fs, 1 << 17), DENIED as i32);
+            table.drop_channel(read, reply);
+            assert_eq!(table.entries.iter().filter(|e| e.live == 1).count(), 1);
+        }
+    }
+
+    #[test]
+    fn sealed_snapshot_recipe_rejects_missing_wrong_stale_scope_pressure_and_epochs_atomically() {
+        let states = states();
+        let fs = states[1].handle(1);
+        let parent = states[3].handle(3);
+        let child = states[4].handle(4);
+        let mut absent = Table::new();
+        assert_eq!(absent.snapshot_channel(&states, parent, child, fs, 6), Err(DENIED as i32));
+        for (service, worker, template) in [(states[0].handle(0), child, 6), (fs + 256, child, 6),
+            (fs, child + 256, 6), (fs, parent, 6), (fs, child, 4), (fs, child, 0)] {
+            let mut table = snapshot_entitled(&states);
+            let before = table.clone();
+            assert!(table.snapshot_channel(&states, parent, worker, service, template).is_err());
+            assert_eq!(table, before);
+        }
+        for free in 0..2 {
+            let mut table = snapshot_entitled(&states);
+            let authority = table.handle(0);
+            while table.entries.iter().filter(|e| e.live == 0).count() > free {
+                assert!(table.delegate(&states, fs, authority, fs, 1 << 17) > 0);
+            }
+            let before = table.clone();
+            assert_eq!(table.snapshot_channel(&states, parent, child, fs, 6), Err(NO_SPACE as i32));
+            assert_eq!(table, before);
+        }
+        for epoch in [0, GENERATION_MAX, GENERATION_MAX + 1] {
+            let mut table = snapshot_entitled(&states); table.next_epoch = epoch;
+            let before = table.clone();
+            assert_eq!(table.snapshot_channel(&states, parent, child, fs, 6), Err(NO_SPACE as i32));
+            assert_eq!(table, before);
+        }
+        let mut table = snapshot_entitled(&states); table.next_epoch = GENERATION_MAX - 1;
+        assert!(table.snapshot_channel(&states, parent, child, fs, 6).is_ok());
+        assert_eq!(table.next_epoch, GENERATION_MAX + 1);
+    }
+
+    #[test]
+    fn sealed_snapshot_recipe_retires_dependency_and_prepared_generation_never_aliases() {
+        let mut states = states();
+        let fs = states[1].handle(1);
+        let parent = states[3].handle(3);
+        states[4].phase = super::super::DORMANT;
+        let child = (2 << 8) | 5;
+        let mut table = snapshot_entitled(&states);
+        let (read, reply) = table.snapshot_channel(&states, parent, child, fs, 6).unwrap();
+        assert_eq!(table.check(&states, fs, reply, child, 1 << 18), STALE as i32);
+        states[4].phase = READY; states[4].generation = 2;
+        assert_eq!(table.check(&states, child, read, fs, 1 << 17), 0);
+        states[1].fault(0); table.invalidate(1); assert!(states[1].poll(4));
+        assert_eq!(table.refresh(&states), 0);
+        assert_eq!(table.check(&states, child, read, states[1].handle(1), 1 << 17), STALE as i32);
+        assert_eq!(table.check(&states, states[1].handle(1), reply, child, 1 << 18), STALE as i32);
+        assert_eq!(table.snapshot_channel(&states, parent, child, fs, 6), Err(STALE as i32));
+        let (fresh, _) = table.snapshot_channel(&states, parent, child, states[1].handle(1), 6).unwrap();
+        assert_ne!(fresh, read);
     }
 }

@@ -71,6 +71,12 @@ express a relative descendant depth: one for the supervisor, zero for the
 worker. The runtime policy intersects the ancestor mask with the supervisor's
 child mask and limits delegated depth by both the ancestor and template.
 
+Scenario 25 uses `cells/analysis.toml`, templates 5/6 and explicit recipe 2.
+It admits snapshot-only worker reads and separate broker checking/release routes
+through the current filesystem. [Storage admission](storage-admission.md) states
+the endpoint, entitlement, rollback and retirement boundary. Old sources cannot
+silently select this behavior. ABI 4 and manifest 2 layouts remain stable.
+
 Bootstrap recipe 1 entitles narrowly checked parent/child RPC. Both the root
 creation domain and selected template must explicitly carry that recipe;
 selecting an image alone does not create channel authority. Dynamic programs
