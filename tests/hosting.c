@@ -1373,6 +1373,51 @@ static void image_role_diagnostic_instance_and_slot_are_distinct(void)
     assert_no_dynamic_charge();
 }
 
+static void terminal_status_preserves_retirement_counters_between_result_sample_and_stop(void)
+{
+    fixture_catalog_config(8192, 16384, 4096, 8192, 2, 4, 48, false, true);
+    struct z_create_result broker = create(Z_PROBE, domain(Z_PROBE), 3, 2, 4);
+    struct z_create_result affected = create(broker.slot, broker.creation, 4, 0, 0);
+    struct z_create_result sibling = create(broker.slot, broker.creation, 4, 0, 0);
+    uint64_t sentinel = UINT64_C(0x86d204a19b35ef70), observed;
+    store(sibling.slot, Z_HEAP_BASE, &sentinel, sizeof(sentinel));
+    assert(z_wait_sleep(&f.waits, &f.broker, sibling.slot, 0, 100) == Z_OK);
+    assert(send(sibling.slot, broker.endpoint, f.runtime.records[sibling.slot].parent_channel, Z_HOST_REPLY, 71) == Z_OK);
+    struct z_wait_entry sibling_wait = f.waits.entries[sibling.slot];
+    struct z_queue replies = f.broker.queues[broker.slot];
+    struct z_cell_status sampled = status(broker.slot, affected.control);
+    assert(sampled.phase == Z_POLICY_READY && sampled.own_pages == 2 && sampled.faults == 0 && sampled.restarts == 0);
+    // The actual kernel fault happens after a result-admission status sample,
+    // before the owner's checked stop. Stop cannot erase this evidence.
+    assert(z_runtime_fault(&f.runtime, affected.slot, 10, 6) == Z_OK);
+    assert(z_runtime_stop(&f.runtime, broker.slot, affected.control) == Z_OK);
+    struct z_cell_status stopped = status(broker.slot, affected.control);
+    assert(stopped.phase == Z_POLICY_STOPPED && stopped.own_pages == 0);
+    assert(stopped.generation == sampled.generation && stopped.faults == sampled.faults + 1 && stopped.restarts == sampled.restarts);
+    assert(z_runtime_reap(&f.runtime, broker.slot, affected.control) == Z_OK);
+    assert(memcmp(&sibling_wait, &f.waits.entries[sibling.slot], sizeof(sibling_wait)) == 0);
+    assert(memcmp(&replies, &f.broker.queues[broker.slot], sizeof(replies)) == 0);
+    load(sibling.slot, Z_HEAP_BASE, &observed, sizeof(observed)); assert(observed == sentinel);
+    struct z_domain_status credit = ledger(broker.slot, broker.creation);
+    assert(credit.owned_slots == 1 && credit.owned_pages == 2 && credit.available_slots == 1 && credit.available_pages == 2);
+
+    affected = create(broker.slot, broker.creation, 4, 0, 0);
+    sampled = status(broker.slot, affected.control);
+    assert(z_runtime_fault(&f.runtime, affected.slot, 20, 6) == Z_OK);
+    assert(z_runtime_poll(&f.runtime, affected.slot, 24) == 1);
+    assert(z_runtime_stop(&f.runtime, broker.slot, affected.control) == Z_OK);
+    stopped = status(broker.slot, affected.control);
+    assert(stopped.generation == sampled.generation + 1 && stopped.faults == sampled.faults + 1 && stopped.restarts == sampled.restarts + 1);
+    assert(stopped.own_pages == 0 && z_runtime_poll(&f.runtime, affected.slot, 1000) == 0);
+    assert(z_runtime_reap(&f.runtime, broker.slot, affected.control) == Z_OK);
+    assert(memcmp(&sibling_wait, &f.waits.entries[sibling.slot], sizeof(sibling_wait)) == 0);
+    assert(memcmp(&replies, &f.broker.queues[broker.slot], sizeof(replies)) == 0);
+    load(sibling.slot, Z_HEAP_BASE, &observed, sizeof(observed)); assert(observed == sentinel);
+    assert(z_runtime_stop(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert(z_runtime_reap(&f.runtime, Z_PROBE, broker.control) == Z_OK);
+    assert_no_dynamic_charge();
+}
+
 static void assert_capture_zero(const void *bytes, size_t length)
 {
     const unsigned char *value = bytes;
@@ -1697,7 +1742,8 @@ int main(void)
     nested_owner_and_ancestor_retirement_at_every_creation_boundary();
     native_broker_cold_retirement_and_service_reference_non_authority();
     checked_management_captures_preserve_exact_buffers_and_live_scope();
-    printf("C hosting: 18 groups, fixtures=%u, injected failures=%u/faults=%u, 256 recovery/cleanup/reuse cycles, 7500 independent model steps seeds=0x5ea105/0x726f6c6c6261636b/0x9e3779b97f4a7c15; production checked copies, private page ownership, reservation conservation, rollback, stale typed authority, capability pressure/exhaustion, subtree waits/queues/sibling preservation, native broker3/worker4 cold retirement, service-reference non-authority and live checked management evidence captures PASS\n",
+    terminal_status_preserves_retirement_counters_between_result_sample_and_stop();
+    printf("C hosting: 19 groups, fixtures=%u, injected failures=%u/faults=%u, 256 recovery/cleanup/reuse cycles, 7500 independent model steps seeds=0x5ea105/0x726f6c6c6261636b/0x9e3779b97f4a7c15; production checked copies, private page ownership, reservation conservation, rollback, stale typed authority, capability pressure/exhaustion, subtree waits/queues/sibling preservation, native broker3/worker4 cold retirement, service-reference non-authority, live checked management captures and result-to-stop retirement counter fencing PASS\n",
         fixture_count, failure_injections, fault_injections);
     return 0;
 }

@@ -51,6 +51,7 @@ static uint64_t hosting_storage_cycles;
 static bool hosting_complete, hosting_storage_ready;
 static uint64_t hosting_last_cleanup_tick, hosting_cycle_boundary_tick;
 static bool hosting_post_cleanup_verified;
+static void research_check(bool hosting_cycle_boundary);
 
 static unsigned storage_trace_limit(void)
 {
@@ -678,7 +679,9 @@ static int hosting_report(struct z_frame *frame)
     field("instance", runtime.records[current].instance);
     field("template", runtime.records[current].template_id); field("depth", runtime.records[current].depth);
     field("parent_endpoint", runtime.records[current].parent_endpoint);
-    serial_puts("\n"); return Z_OK;
+    serial_puts("\n");
+    if (code == 65) research_check(true);
+    return Z_OK;
 }
 
 static int64_t syscall(struct z_frame *frame)
@@ -867,10 +870,14 @@ static int64_t syscall(struct z_frame *frame)
     }
 }
 
-static void research_check(void)
+static void research_check(bool hosting_cycle_boundary)
 {
     if (Z_SCENARIO >= 21 && Z_SCENARIO <= 24) {
-        if (finished || !hosting_complete || hosting_storage_cycles < 2 || !hosting_post_cleanup_verified) return;
+        /* A PIT can arrive after an FS reply but before the client's byte
+         * verification report. Complete only at the client's fully verified
+         * cycle boundary; every required conservation/readiness check remains. */
+        if (finished || !hosting_cycle_boundary || !hosting_complete ||
+            hosting_storage_cycles < 2 || !hosting_post_cleanup_verified) return;
         bool pass = hosting_storage_ready && hosting_events <= 2048 && hosting_reports < 256 &&
             storage_events <= storage_trace_limit() && storage_reports <= storage_trace_limit() &&
             z_runtime_check(&runtime);
@@ -924,7 +931,7 @@ static struct z_frame *schedule(void)
             event("idle-wake", current); field("entered", entered); field("reason", 6);
             serial_puts("\n");
         }
-        supervisor_tick(); research_check();
+        supervisor_tick(); research_check(false);
     }
 }
 
@@ -963,7 +970,7 @@ struct z_frame *kernel_trap(struct z_frame *frame)
     frames[current].flags = (frame->flags | UINT64_C(0x202)) & ~UINT64_C(0x27000);
     if (frame->vector == 32) {
         advance_tick(); arch_eoi(); if (++run_ticks[current] >= 5) fail_cell(current, 65, 0, 0);
-        supervisor_tick(); research_check();
+        supervisor_tick(); research_check(false);
     } else if (frame->vector == 128) {
         run_ticks[current] = 0; frames[current].rax = (uint64_t)syscall(frame);
     } else if (frame->vector < 32) {

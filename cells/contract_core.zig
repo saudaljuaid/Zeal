@@ -6,6 +6,8 @@ pub const capacity = 2;
 pub const Backing = abi.CreateResult;
 pub const State = wire.State;
 pub const Reason = wire.Reason;
+pub const Fence = struct { generation: u64, faults: u32, restarts: u32 };
+pub const Settlement = struct { cleaned: bool, stable: bool };
 pub const Error = error{ denied, invalid, stale, no_space, exhausted, resource, transport, cleanup, not_terminal, not_ready };
 pub const Domain = struct {
     owned_slots: u32, owned_pages: u32, available_slots: u32, available_pages: u32,
@@ -152,11 +154,16 @@ pub const Broker = struct {
         if (slots <= 1 and pages <= 2) { record.backing_slots = @intCast(slots); record.backing_pages = @intCast(pages); }
     }
     fn finish(self: *Broker, record: *Record, state: State, reason: Reason, seam: anytype) Error!void {
+        _ = try self.finishCandidate(record, state, reason, null, seam);
+    }
+    fn finishCandidate(self: *Broker, record: *Record, state: State, reason: Reason, fence: ?Fence, seam: anytype) Error!bool {
         record.verified = false;
         record.result = 0;
         if (record.cleanup_attempts >= 2) return Error.cleanup;
         record.cleanup_attempts += 1;
-        if (!seam.settle(record.worker)) {
+        const settlement: Settlement = if (fence) |admitted| seam.settleCandidate(record.worker, admitted) else
+            .{ .cleaned = seam.settle(record.worker), .stable = true };
+        if (!settlement.cleaned) {
             record.state = .failed;
             record.reason = .lifecycle;
             self.refreshCharges(record, seam);
@@ -169,8 +176,14 @@ pub const Broker = struct {
         if (!self.conserved(domain) or record.backing_slots != 0 or record.backing_pages != 0) {
             record.state = .failed; record.reason = .lifecycle; return Error.cleanup;
         }
+        if (!settlement.stable) {
+            record.state = .failed;
+            record.reason = .lifecycle;
+            return false;
+        }
         record.state = state;
         record.reason = reason;
+        return true;
     }
     pub fn cancel(self: *Broker, sender: u64, token_value: u64, seam: anytype) Error!*Record {
         const record = try self.mutable(sender, token_value);
@@ -210,9 +223,17 @@ pub const Broker = struct {
             try self.finish(record, .failed, .invalid_result, seam);
             return Error.invalid;
         }
+        const fence = seam.admit(record.worker) orelse {
+            try self.finish(record, .failed, .lifecycle, seam);
+            return Error.stale;
+        };
+        if (fence.generation != record.execution >> 8 or fence.faults == @import("std").math.maxInt(u32)) {
+            try self.finish(record, .failed, .lifecycle, seam);
+            return Error.stale;
+        }
         const result = packet.data;
         seam.validated(record.token, record.worker, record.rpc, record.attempt, record.input, result);
-        try self.finish(record, .completed, .ok, seam);
+        if (!try self.finishCandidate(record, .completed, .ok, fence, seam)) return Error.stale;
         record.result = result;
         record.verified = true;
         return record;

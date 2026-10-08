@@ -439,6 +439,61 @@ test "production lifecycle reconciliation fences an already dequeued result befo
         try testing.expect(broker.conserved(fake.domain().?));
     }
 }
+test "retirement after candidate admission cannot publish a settled receipt and preserves sibling" {
+    for ([_]bool{ false, true }) |restart| {
+        var broker = core.Broker.init(issuer, owner);
+        var fake: support.Fake = .{};
+        const affected = try broker.offer(owner, 1, 17, 1, &fake);
+        const sibling = try broker.offer(owner, 2, 31, 1, &fake);
+        _ = try broker.accept(owner, affected.token, 17, 1, &fake);
+        _ = try broker.accept(owner, sibling.token, 31, 1, &fake);
+        const admitted_attempt = affected.*;
+        const sibling_before = sibling.*;
+        const candidate = support.answer(affected);
+        if (restart) fake.restart_during_settle = true else fake.fault_during_settle = true;
+        try testing.expectError(core.Error.stale, broker.deliver(&candidate, &fake));
+        try testing.expectEqual(core.State.failed, affected.state);
+        try testing.expectEqual(core.Reason.lifecycle, affected.reason);
+        try testing.expect(!affected.verified and affected.result == 0);
+        try testing.expectEqual(@as(u8, 0), affected.backing_slots);
+        try testing.expectEqual(@as(u8, 0), affected.backing_pages);
+        try testing.expectEqual(admitted_attempt.token, affected.token);
+        try testing.expectEqual(admitted_attempt.rpc, affected.rpc);
+        try testing.expectEqual(admitted_attempt.attempt, affected.attempt);
+        try testing.expectEqual(admitted_attempt.execution, broker.snapshot(affected).endpoint);
+        try testing.expectEqual(sibling_before, sibling.*);
+        try testing.expectEqual(@as(u64, 1), fake.validated_calls);
+        try testing.expectEqual(@as(u64, 1), fake.settle_calls);
+        fake.restart_during_settle = false;
+        fake.fault_during_settle = false;
+        try testing.expectError(core.Error.stale, broker.deliver(&candidate, &fake));
+        const sibling_reply = support.answer(sibling);
+        _ = try broker.deliver(&sibling_reply, &fake);
+        try testing.expectEqual(core.State.completed, sibling.state);
+        try testing.expect(sibling.verified and broker.snapshot(sibling).valid());
+        try testing.expect(broker.conserved(fake.domain().?));
+        try testing.expectEqual(@as(u64, 2), fake.settle_calls);
+    }
+}
+test "candidate admission failure and saturated fault count fail closed before receipt publication" {
+    for ([_]bool{ false, true }) |saturated| {
+        var broker = core.Broker.init(issuer, owner);
+        var fake: support.Fake = .{};
+        const record = try broker.offer(owner, 1, 17, 1, &fake);
+        _ = try broker.accept(owner, record.token, 17, 1, &fake);
+        const before = record.*;
+        const candidate = support.answer(record);
+        if (saturated) fake.saturated_faults = true else fake.admission_failure = true;
+        try testing.expectError(core.Error.stale, broker.deliver(&candidate, &fake));
+        try testing.expectEqual(core.State.failed, record.state);
+        try testing.expectEqual(core.Reason.lifecycle, record.reason);
+        try testing.expect(!record.verified and record.result == 0);
+        try testing.expectEqual(before.execution, broker.snapshot(record).endpoint);
+        try testing.expectEqual(@as(u64, 0), fake.validated_calls);
+        try testing.expectEqual(@as(u64, 1), fake.settle_calls);
+        try testing.expect(broker.conserved(fake.domain().?));
+    }
+}
 test "cleanup attempts bounded failure retains honest resources after two failed checks" {
     var broker = core.Broker.init(issuer, owner);
     var fake: support.Fake = .{};

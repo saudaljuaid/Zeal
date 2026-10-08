@@ -196,6 +196,8 @@ class Obligation:
     retained: bool = True
     accepted: host.Event | None = None
     validation: host.Event | None = None
+    admission_stamp: tuple | None = None
+    admission_status: host.Event | None = None
     terminal: host.Event | None = None
     initial_reports: set = dataclasses.field(default_factory=set)
     dispatches: dict = dataclasses.field(default_factory=dict)
@@ -585,6 +587,15 @@ class Observer(host.Observer):
                        p.token == token and p.detail == record.attempt and p.request == record.rpc and
                        p.data == value and incoming.index < event.index]
             require(len(replies) == 1, "broker validation lacks unique actual authenticated current-attempt worker result delivery")
+            samples = [call for call in self.calls if call.fields["call"] == 14 and call.fields["result"] == 0 and
+                       call.fields.get("output_control") == record.worker.control and call.fields.get("output_phase") == 1 and
+                       replies[0].index < call.index < event.index]
+            require(samples, "broker validation lacks actual current-attempt kernel admission status after result delivery")
+            sample = samples[-1]
+            stamp = tuple(sample.fields["output_" + key] for key in ("generation", "faults", "restarts"))
+            require(stamp == (record.execution >> 8, record.worker.faults, record.worker.restarts),
+                    "broker admitted a result under a retired execution/lifecycle stamp")
+            record.admission_stamp, record.admission_status = stamp, sample
             require(record.rpc in record.dispatches and record.worker.ready and record.worker.own_pages == 2,
                     "broker verified an unexecuted or prematurely destroyed backing worker")
             record.validation, record.verified, record.result = event, True, value
@@ -636,6 +647,12 @@ class Observer(host.Observer):
                         host.signed(call.fields["result"]) == -3 and call.index < event.index for call in self.calls),
                     "worker control remained queryable after purported lifecycle reap")
             if state == COMPLETED:
+                samples = [call for call in self.calls if call.fields["call"] == 14 and call.fields["result"] == 0 and
+                           call.fields.get("output_control") == worker.control and call.fields.get("output_phase") == 4 and
+                           stops[0].index < call.index < reaps[0].index]
+                require(samples and record.admission_stamp is not None and all(
+                        tuple(call.fields["output_" + key] for key in ("generation", "faults", "restarts")) == record.admission_stamp
+                        for call in samples), "completed receipt crossed retirement between admission and checked stop/settlement")
                 require(record.validation is not None and record.validation.index < event.index and verified == 1 and reason == 0,
                         "completed receipt lacks independent validation before exact resource settlement")
                 if record.retries:
@@ -1548,6 +1565,11 @@ def negative_controls(output, code, scenario=24, manifest_path=None):
     changed = list(lines)
     changed[copied.line] = re.sub(r" cap=0x[0-9a-f]+\b", "", changed[copied.line])
     rejected("missing-copied-delivery-capability-field", "\n".join(changed) + "\n")
+    stopped_sample = next(event for event in events if event.name == "host-call" and event.fields["call"] == 14 and
+                          event.fields["result"] == 0 and event.fields.get("output_phase") == 4)
+    for field in ("output_generation", "output_faults", "output_restarts"):
+        rejected("counterfeit-completion-retirement-fence-" + field, alter(stopped_sample, field))
+
     for number, key in ((13, "arg0"), (13, "arg2"), (14, "arg1"), (17, "arg0"), (17, "arg2"), (19, "arg1")):
         copied_call = next(event for event in events if event.name == "host-call" and
                            event.fields["call"] == number and event.fields["result"] == 0)

@@ -204,6 +204,61 @@ test "dequeued owner cancellation precedes recovery rebind and dispatch for a ne
     try testing.expectEqual(@as(u32, 0), seam.domain().?.owned_pages);
     try testing.expectEqual(@as(u64, 1), seam.settle_calls);
 }
+test "result admission and post-stop settlement fence exact execution generation and fault restart counters" {
+    const worker: abi.CreateResult = .{ .instance = 0x240, .control = 0x350, .endpoint = 0x506, .channel = 0x510, .creation = 0, .slot = 5, .identity = 1001 };
+    var current: abi.CellStatus = std.mem.zeroes(abi.CellStatus);
+    current.instance = worker.instance;
+    current.control = worker.control;
+    current.endpoint = worker.endpoint;
+    current.generation = 5;
+    current.slot = worker.slot;
+    current.parent_endpoint = issuer;
+    current.template_id = 4;
+    current.depth = 2;
+    current.phase = 1;
+    current.own_pages = 2;
+    current.faults = 1;
+    current.restarts = 1;
+    const fence = dispatcher.admissionFence(worker, current, issuer).?;
+    try testing.expectEqual(@as(u64, 5), fence.generation);
+    var saturated = current;
+    saturated.faults = 0xffffffff;
+    try testing.expect(dispatcher.admissionFence(worker, saturated, issuer) == null);
+    for (0..10) |variation| {
+        var changed = current;
+        switch (variation) {
+            0 => changed.phase = 2,
+            1 => changed.instance ^= 1,
+            2 => changed.control ^= 1,
+            3 => changed.endpoint += 0x100,
+            4 => changed.generation += 1,
+            5 => changed.parent_endpoint += 0x100,
+            6 => changed.template_id = 2,
+            7 => changed.depth = 1,
+            8 => changed.own_pages = 0,
+            9 => changed.reserved_pages = 2,
+            else => unreachable,
+        }
+        try testing.expect(dispatcher.admissionFence(worker, changed, issuer) == null);
+    }
+    var stopped = current;
+    stopped.phase = 4;
+    stopped.own_pages = 0;
+    try testing.expect(dispatcher.fenceStable(worker, stopped, fence));
+    stopped.phase = 3;
+    try testing.expect(dispatcher.fenceStable(worker, stopped, fence));
+    for (0..3) |variation| {
+        var changed = stopped;
+        switch (variation) {
+            0 => changed.generation += 1,
+            1 => changed.faults += 1,
+            2 => changed.restarts += 1,
+            else => unreachable,
+        }
+        try testing.expect(dispatcher.backingReleased(worker, changed));
+        try testing.expect(!dispatcher.fenceStable(worker, changed, fence));
+    }
+}
 
 test "production protocol dispatch rejects every command kind length and reserved header boundary without consuming offers" {
     var table = core.Broker.init(issuer, owner);

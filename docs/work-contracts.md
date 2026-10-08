@@ -171,7 +171,14 @@ Worker result admission checks sender execution, token, state, RPC, attempt,
 operation/header and independently recomputed input result. Successful
 verification precedes real checked stop, zero-page terminal status, worker reap
 and stale-control confirmation. Only then does the broker publish COMPLETED
-with a verified result and zero backing. Pages return at stop; the kernel slot/
+with a verified result and zero backing. Admission records the actual execution
+generation, fault count and restart count. After checked stop has frozen the
+worker's execution, terminal status must retain the same tuple before successful
+publication. An intervening fault/restart produces FAILED/lifecycle, zero result
+and no verified receipt while checked cleanup still returns resources. Saturated
+fault counters fail admission closed. This fences retirement across the status
+sample and settlement without introducing a new kernel transaction object.
+Pages return at stop; the kernel slot/
 control state returns at worker reap; service metadata returns at contract reap.
 
 Cancellation uses real stop/reap, retiring runnable state, waits, restart plans,

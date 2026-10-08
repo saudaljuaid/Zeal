@@ -38,6 +38,17 @@ pub fn backingReleased(worker: abi.CreateResult, status: abi.CellStatus) bool {
         status.control == worker.control and status.own_pages == 0 and
         status.reserved_slots == 0 and status.reserved_pages == 0;
 }
+pub fn admissionFence(worker: abi.CreateResult, status: abi.CellStatus, parent: u64) ?core.Fence {
+    if (status.phase != 1 or status.instance != worker.instance or status.control != worker.control or
+        status.endpoint != worker.endpoint or status.generation != worker.endpoint >> 8 or status.slot != worker.slot or
+        status.parent_endpoint != parent or status.template_id != 4 or status.depth != 2 or status.own_pages != 2 or
+        status.reserved_slots != 0 or status.reserved_pages != 0 or status.faults == 0xffffffff) return null;
+    return .{ .generation = status.generation, .faults = status.faults, .restarts = status.restarts };
+}
+pub fn fenceStable(worker: abi.CreateResult, status: abi.CellStatus, fence: core.Fence) bool {
+    return fence.faults != 0xffffffff and backingReleased(worker, status) and status.generation == fence.generation and
+        status.faults == fence.faults and status.restarts == fence.restarts;
+}
 pub fn reconcile(table: *core.Broker, token: u64, status: abi.CellStatus, seam: anytype) core.Error!*const core.Record {
     return reconcileWorker(table, token, status, true, seam);
 }

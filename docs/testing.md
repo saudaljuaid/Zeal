@@ -227,3 +227,14 @@ controls applied to current real traces. Results are in
 hashes are in `build/research/results.json`. Trace exhaustion and marker-only
 traces fail. CI uses the same complete target and retains transcripts, native
 images, model evidence and witnesses on both success and failure.
+
+
+The hosting completion hook runs at root300's fully verified storage-cycle
+report boundary. It retains every readiness, quota and conservation check and
+avoids ending QEMU after a delivered storage reply but before its application
+byte-verification report. The preserved first CI failure and untouched baseline
+oracle reproduce that prior termination race; no storage assertion is relaxed.
+Successful native settlement additionally joins its READY admission
+generation/fault/restart stamp to the identical post-STOP terminal stamp before
+reap. Controlled production-seam and C cases exercise intervening fault/restart,
+including unchanged execution generation with an increased fault count.

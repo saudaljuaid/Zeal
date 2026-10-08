@@ -76,9 +76,19 @@ pub fn main() !void {
             'U' => { _ = broker.workerUnavailable(a, &fake) catch |err| { outcome = @errorName(err); }; },
             'X' => { broker.next_serial = a; broker.rpc_sequence.next = b; },
             'Y' => { fake.partial_settle = a == 1; fake.false_refund = a == 2; },
+            'V' => {
+                fake.fault_during_settle = a == 1;
+                fake.restart_during_settle = a == 2;
+                fake.admission_failure = a == 3;
+                fake.saturated_faults = a == 4;
+            },
             'B' => {
                 fake.partial_settle = false;
                 fake.false_refund = false;
+                fake.fault_during_settle = false;
+                fake.restart_during_settle = false;
+                fake.admission_failure = false;
+                fake.saturated_faults = false;
                 for (fake.objects) |object| if (object) |worker| {
                     if (!fake.settle(worker)) return error.RetirementCleanup;
                 };

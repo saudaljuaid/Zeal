@@ -71,6 +71,7 @@ class Model:
         self.calls = dict(create=0, send=0, settle=0, rebind=0, validated=0)
         self.retired_tokens = []
         self.cleanup_mode = 0
+        self.candidate_mode = 0
 
     def lookup(self, token):
         if token & 255 != 0x80 or not (token >> 9 & SERIAL_LIMIT) or not token >> 40 or not 1 <= (token >> 32) & 255 <= 8:
@@ -113,6 +114,9 @@ class Model:
         if op == "Y":
             self.cleanup_mode = a
             return "ok"
+        if op == "V":
+            self.candidate_mode = a
+            return "ok"
         if op == "B":
             self.calls["settle"] += len(self.allocations)
             self.retired_tokens.extend(item.token for item in self.obligations.values())
@@ -124,6 +128,7 @@ class Model:
                 self.owner = b
             self.next_serial, self.highwater, self.next_rpc = 1, 0, 1
             self.cleanup_mode = 0
+            self.candidate_mode = 0
             return "ok"
         if op == "X":
             self.next_serial, self.next_rpc = a, b
@@ -208,7 +213,13 @@ class Model:
                 return "stale"
             if b == 1:
                 return self.finish(item, "failure", 2) or "invalid"
+            if self.candidate_mode in (3, 4):
+                return self.finish(item, "failure", 6) or "stale"
             self.calls["validated"] += 1
+            if self.candidate_mode in (1, 2):
+                if self.candidate_mode == 2:
+                    self.endpoint_history[self.providers[item.provider]["slot"]] += 1
+                return self.finish(item, "failure", 6) or "stale"
             failure = self.finish(item, "success", 0)
             if failure:
                 return failure
@@ -486,6 +497,34 @@ class ContractModelTests(unittest.TestCase):
         step(("U", next_running, 0, 0))
         step(("D", next_running, 0, 0))
         self.compare("unavailable-worker", actions, expected)
+
+    def test_late_fault_after_candidate_admission_and_before_settlement(self):
+        model = Model()
+        actions, expected = [], []
+        def step(action):
+            actions.append(action)
+            result = model.apply(action)
+            model.invariants()
+            expected.append(model.report(result))
+        next_offer = 1
+        for retirement_mode in (1, 2, 3, 4):
+            step(("O", next_offer, 17, 0))
+            affected = model.obligations[model.transactions[next_offer]].token
+            next_offer += 1
+            step(("O", next_offer, 31, 0))
+            sibling = model.obligations[model.transactions[next_offer]].token
+            next_offer += 1
+            step(("A", affected, 0, 0))
+            step(("A", sibling, 0, 0))
+            step(("V", retirement_mode, 0, 0))
+            step(("D", affected, 0, 0))
+            step(("Q", sibling, 0, 0))
+            step(("V", 0, 0, 0))
+            step(("D", affected, 0, 0))
+            step(("D", sibling, 0, 0))
+            step(("R", affected, 0, 0))
+            step(("R", sibling, 0, 0))
+        self.compare("late-fault-settlement", actions, expected)
 
 
 if __name__ == "__main__":

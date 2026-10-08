@@ -177,14 +177,29 @@ const Service = struct {
         return null;
     }
     pub fn settle(self: *Service, child: core.Backing) bool {
-        _ = self;
-        if (syscall.stop(child.control) != 0) return false;
+        return self.retire(child, null).cleaned;
+    }
+    pub fn admit(self: *Service, child: core.Backing) ?core.Fence {
         var status: abi.CellStatus = undefined;
-        if (syscall.status(child.control, &status) != 0 or !dispatcher.backingReleased(child, status)) return false;
-        if (syscall.reap(child.control) != 0) return false;
-        if (syscall.status(child.control, &status) != @intFromEnum(abi.Error.stale)) return false;
+        if (syscall.status(child.control, &status) != 0) return null;
+        return dispatcher.admissionFence(child, status, self.info.endpoint);
+    }
+    pub fn settleCandidate(self: *Service, child: core.Backing, fence: core.Fence) core.Settlement {
+        return self.retire(child, fence);
+    }
+    fn retire(self: *Service, child: core.Backing, fence: ?core.Fence) core.Settlement {
+        _ = self;
+        const failed: core.Settlement = .{ .cleaned = false, .stable = false };
+        if (syscall.stop(child.control) != 0) return failed;
+        var status: abi.CellStatus = undefined;
+        if (syscall.status(child.control, &status) != 0 or !dispatcher.backingReleased(child, status)) return failed;
+        // Stop removed scheduling eligibility. Comparing the terminal counters
+        // catches retirement after admission, before any receipt can publish.
+        const stable = if (fence) |sample| dispatcher.fenceStable(child, status, sample) else true;
+        if (syscall.reap(child.control) != 0) return failed;
+        if (syscall.status(child.control, &status) != @intFromEnum(abi.Error.stale)) return failed;
         report(55, child.control, child.instance);
-        return true;
+        return .{ .cleaned = true, .stable = stable };
     }
     pub fn send(self: *Service, child: core.Backing, message: abi.Message) bool {
         const packet = wire.decodeWork(&message, self.info.endpoint, wire.request_operation) orelse blk: {
