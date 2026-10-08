@@ -269,9 +269,22 @@ test "production protocol dispatch rejects every command kind length and reserve
         message.length = length;
         try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).ignored, std.meta.activeTag(dispatcher.dispatch(&table, &message, &seam)));
     }
-    for ([_]u8{ 0, 10, 255 }) |command| {
+    // The envelope now recognizes the explicit byte-profile worker commands,
+    // but none is an owner request to this broker. Preserve their denial as
+    // an INVALID failure; genuinely unknown command bytes remain ignored.
+    for (@intFromEnum(wire.Command.input)..@intFromEnum(wire.Command.authorize_input) + 1) |command| {
+        var message = delivered(packet);
+        message.payload[9] = @intCast(command);
+        try fails(dispatcher.dispatch(&table, &message, &seam), error.invalid);
+    }
+    for ([_]u8{0}) |command| {
         var message = delivered(packet);
         message.payload[9] = command;
+        try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).ignored, std.meta.activeTag(dispatcher.dispatch(&table, &message, &seam)));
+    }
+    for (@intFromEnum(wire.Command.authorize_input) + 1..256) |command| {
+        var message = delivered(packet);
+        message.payload[9] = @intCast(command);
         try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).ignored, std.meta.activeTag(dispatcher.dispatch(&table, &message, &seam)));
     }
     for (12..16) |offset| {
