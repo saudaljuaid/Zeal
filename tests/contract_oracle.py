@@ -711,6 +711,27 @@ class Observer(host.Observer):
         else:
             raise AssertionError("unknown contract progress event " + event.name)
 
+    def bootstrap_ready_for_computation(self, record, work_delivery):
+        if record.execution in self.bootstrap:
+            return True
+        # A rebound worker can dequeue its already accepted WORK while the
+        # broker is finishing a bounded owner snapshot. The worker's boot ACK
+        # has been authenticated/enqueued first, but not yet dequeued there.
+        # Initial backed offers still require a completely delivered boot ACK.
+        if record.retries != 1 or record.attempt != 2 or not record.rebinds:
+            return False
+        acknowledgements = [e for e in self.enqueued if e.index < work_delivery.index and
+            (packet := self.packet_events.get(e.index)) is not None and
+            (packet.sender, packet.target, packet.operation, packet.request, packet.command, packet.kind,
+             packet.detail, packet.token, packet.data) ==
+            (record.execution, record.issuer, 16, 1, 9, 1, 0, 0, record.worker.instance) and
+            self.channels.get(e.fields["cap"]) == (record.execution, record.issuer, 16)]
+        if len(acknowledgements) != 1:
+            return False
+        packet = self.packet_events[acknowledgements[0].index]
+        return any(e.name == "host-ipc-deliver" and e.index > acknowledgements[0].index and
+                   Packet.from_event(e) == packet for e in self.events)
+
     def app(self, event):
         if event.name != "host-kernel-entry":
             endpoint, node = self.principal(event)
@@ -756,7 +777,7 @@ class Observer(host.Observer):
             record = self.obligation(packet.sender, packet.token)
             require(record.state == RUNNING and record.accepted is not None and record.accepted.index < received[0].index and
                     result == host.calculate(record.input) and packet.data == record.input and packet.detail == record.attempt and
-                    record.execution == endpoint and endpoint in self.bootstrap and (endpoint, rpc) not in self.computations,
+                    record.execution == endpoint and self.bootstrap_ready_for_computation(record, received[0]) and (endpoint, rpc) not in self.computations,
                     "worker computed before acceptance, twice, or under stale/wrong attempt/input")
             self.computations[(endpoint, rpc)] = event
             return

@@ -1,4 +1,5 @@
 import pathlib
+import dataclasses
 import sys
 import types
 import unittest
@@ -56,6 +57,56 @@ class IndependentContractEvidenceTests(unittest.TestCase):
         observed.offer_keys[(0x104, 2)] = types.SimpleNamespace(retained=True, profile=1, input=17)
         self.assertEqual(observed.request_error(request), 0)
         self.assertEqual(observed.request_error(oracle.Packet(0x104, 0x105, 15, 2, 1, 0, 1, 0, 18)), 2)
+
+    def retry_computation_fixture(self):
+        observed = oracle.Observer([], oracle.host.SealedRoots(0), {})
+        worker = types.SimpleNamespace(instance=0x1542, endpoint=0x506, template=4, depth=2,
+                                       parent_endpoint=0x105, identity=1006, slot=5)
+        token = (0x105 << 32) | (1 << 9) | 0x80
+        accepted = oracle.host.Event(1, "contract-accepted", {}, 1)
+        record = oracle.Obligation(0x105, token, 0x104, 1, 1, 17, worker, 0,
+                                   state=oracle.RUNNING, retries=1, attempt=2, rpc=7, execution=0x506, accepted=accepted)
+        record.rebinds = [oracle.host.Event(3, "contract-rebound", {"extra": 0x506}, 3)]
+        ack_fields = event(cell=5, identity=1006, generation=5, sender=0x506, target=0x105, cap=0x901,
+                           operation=16, request=1, command=0x00010901, argument=0, value=worker.instance,
+                           service_command=9, kind=1, detail=0, token=0, data=worker.instance).fields
+        ack = oracle.host.Event(4, "host-ipc-enqueue", ack_fields, 4)
+        ack_delivery = oracle.host.Event(9, "host-ipc-deliver", dict(ack_fields, cap=0), 9)
+        work_fields = event(cell=5, identity=1006, generation=5, sender=0x105, target=0x506, cap=0,
+                            request=7, command=0x02000701, argument=token, value=17,
+                            service_command=7, kind=0, detail=2, token=token, data=17).fields
+        work = oracle.host.Event(6, "host-ipc-deliver", work_fields, 6)
+        computed = oracle.host.Event(8, "host-computed", dict(cell=5, identity=1006, generation=5, tick=2,
+            endpoint=0x506, instance=worker.instance, template=4, depth=2, parent_endpoint=0x105,
+            value=7, extra=oracle.host.calculate(17)), 8)
+        observed.events = [ack, work, computed, ack_delivery]
+        observed.enqueued = [ack]
+        observed.delivered = [work]
+        observed.packet_events = {4: oracle.Packet.from_event(ack), 6: oracle.Packet.from_event(work)}
+        observed.channels[0x901] = (0x506, 0x105, 16)
+        observed.obligations[(0x105, token)] = record
+        observed.principal = lambda e, ready=True: (0x506, worker)
+        return observed, record, computed
+
+    def test_rebound_worker_may_compute_after_authenticated_ack_enqueue_before_broker_dequeue(self):
+        observed, record, computed = self.retry_computation_fixture()
+        observed.app(computed)
+        self.assertIn((0x506, 7), observed.computations)
+        self.assertNotIn(0x506, observed.bootstrap)
+
+    def test_pending_rebind_ack_does_not_waive_acceptance_attempt_or_delivery(self):
+        changes = ("initial", "no_accept", "cancelled", "wrong_attempt", "no_ack_delivery", "wrong_ack_instance", "wrong_cap")
+        for change in changes:
+            observed, record, computed = self.retry_computation_fixture()
+            if change == "initial": record.retries, record.attempt = 0, 1
+            elif change == "no_accept": record.accepted = None
+            elif change == "cancelled": record.state = oracle.CANCELLED
+            elif change == "wrong_attempt": observed.packet_events[6] = dataclasses.replace(observed.packet_events[6], detail=1)
+            elif change == "no_ack_delivery": observed.events.pop()
+            elif change == "wrong_ack_instance": observed.packet_events[4] = dataclasses.replace(observed.packet_events[4], data=record.worker.instance + 1)
+            elif change == "wrong_cap": observed.channels.clear()
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                observed.app(computed)
 
     def test_success_markers_exit_codes_and_exhaustion_cannot_replace_evidence(self):
         marker = "ZEAL boot abi=4 x86_64\nMANIFEST_ACCEPT version=2\nRESEARCH_PASS scenario=0x0000000000000018\n"
