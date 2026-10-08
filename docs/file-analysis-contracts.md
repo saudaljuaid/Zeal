@@ -213,7 +213,9 @@ three-tick sleeps. The existing broker attempt limit remains 160 receive windows
 These bounds are finite protocol costs, not wall-clock or CPU guarantees.
 
 Scenario 25 has 4,096 hosting trace events, 384 hosting reports and 8,192 storage
-trace events/reports. Those observation quotas include full raw wire fields and
+trace events/reports, plus 1,024 complete generic wait pairs per runtime slot.
+Wait quota exhaustion emits `WAIT_TRACE_EXHAUSTED` and fails; old profiles keep
+their 256-pair observation bound. Those observation quotas include full raw wire fields and
 checked copy delivery. Old scenario quotas/repetitions remain unchanged; exhaustion
 fails. Its main QEMU path uses binary `/alpha`, `/beta` and `/hello`, changes the
 source only while the independent root workload acknowledges a verified pause,

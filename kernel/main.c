@@ -38,7 +38,7 @@ static uint64_t sends[Z_CELL_COUNT], fault_sends[2], fault_reads[2];
 static unsigned run_ticks[Z_CELL_COUNT], boots[Z_CELL_COUNT], reset_reports, recovered;
 static bool contract_ok, finished;
 static unsigned wait_events[Z_CELL_COUNT], idle_events;
-static bool wait_traced[Z_CELL_COUNT];
+static bool wait_traced[Z_CELL_COUNT], wait_trace_failed;
 static unsigned storage_events, storage_reports;
 static unsigned refresh_events;
 static unsigned refresh_cell;
@@ -292,7 +292,11 @@ static void wait_event(const char *name, unsigned cell,
 static void trace_wait(unsigned cell)
 {
     /* Trace whole pairs and cap volume independently of hostile syscall rates. */
-    wait_traced[cell] = wait_events[cell] < 256;
+    unsigned limit = Z_SCENARIO == 25 ? 1024u : 256u;
+    wait_traced[cell] = wait_events[cell] < limit;
+    if (Z_SCENARIO == 25 && !wait_traced[cell] && !wait_trace_failed) {
+        wait_trace_failed = true; serial_puts("WAIT_TRACE_EXHAUSTED\n");
+    }
     if (wait_traced[cell]) {
         ++wait_events[cell]; wait_event("wait-arm", cell, &waits.entries[cell]);
         serial_puts("\n");
@@ -925,7 +929,7 @@ static void research_check(bool hosting_cycle_boundary)
          * cycle boundary; every required conservation/readiness check remains. */
         if (finished || !hosting_cycle_boundary || !hosting_complete ||
             hosting_storage_cycles < 2 || !hosting_post_cleanup_verified) return;
-        bool pass = hosting_storage_ready && hosting_events <= hosting_trace_limit() && hosting_reports < hosting_report_limit() &&
+        bool pass = hosting_storage_ready && !wait_trace_failed && hosting_events <= hosting_trace_limit() && hosting_reports < hosting_report_limit() &&
             storage_events <= storage_trace_limit() && storage_reports <= storage_trace_limit() &&
             z_runtime_check(&runtime);
         if (Z_SCENARIO == 25) {
