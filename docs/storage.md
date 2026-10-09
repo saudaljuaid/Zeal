@@ -164,6 +164,18 @@ FIFO inbox at the filesystem. A full inbox ends the pending transfer rather
 than overflowing it. Dependency absence and interrupted requests do not cause
 an unbounded blocking receive or busy polling.
 
+The independent hosted storage preservation workload consumes the same finite
+eight ten-tick receive budget across timeout wakeups while the filesystem and
+block endpoints remain unchanged. It checks both endpoints before send and after
+every wake, never resends an enqueued operation, and matches the original reply
+identity, sender, handle and offset. Snapshot clients use the same continuation
+rule for their exact issuer endpoint, described in [immutable inputs](storage-inputs.md).
+This handles service serialization and scheduling latency without treating a
+single ten-tick wait as the whole RPC deadline. Other receive errors, dependency
+replacement, full deferred inbox or budget exhaustion still end the operation.
+The shared block-transfer and console transaction state retain their first-timeout
+failure behavior. Resource ceilings and unknown-outcome semantics are unchanged.
+
 ## Interrupted operations and restart behavior
 
 A timeout or missing reply means the outcome may be unknown, not that a write

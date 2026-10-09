@@ -4,6 +4,7 @@ const wire = @import("storage_wire.zig");
 const storage = @import("storage.zig");
 const syscall = @import("syscall.zig");
 const runtime = @import("storage_runtime.zig");
+const receive = @import("native_receive.zig");
 
 pub const alpha = "Zeal alpha private file 01.";
 pub const beta = "Distinct beta bytes survive.";
@@ -30,27 +31,39 @@ pub const Workload = struct {
     handles: [3]u64 = .{ 0, 0, 0 },
 
     pub fn call(self: *Workload, operation: abi.Operation, handle: u64, offset: u32, count: u32, data: []const u8, name: []const u8) wire.Header {
-        const id = self.sequence.take() orelse {
+        var io: KernelIo = .{};
+        return self.callWith(operation, handle, offset, count, data, name, &io) orelse {
             require(false);
             unreachable;
         };
+    }
+
+    pub fn callWith(self: *Workload, operation: abi.Operation, handle: u64, offset: u32, count: u32, data: []const u8, name: []const u8, io: anytype) ?wire.Header {
+        if (self.filesystem == 0 or self.block == 0 or io.filesystem() != self.filesystem or io.block() != self.block) return null;
+        const id = self.sequence.take() orelse return null;
         var request = if (operation == .file_open) wire.openRequest(id, name) else wire.request(operation, id, handle, offset, count, data);
-        require(runtime.sendBounded(self.filesystem, &request, operation) == 0);
-        for (0..8) |_| {
+        if (io.send(self.filesystem, &request, operation) != 0) return null;
+        var pending: receive.Budget = .{ .endpoint = self.filesystem };
+        while (pending.canReceive()) {
+            if (self.analysis_mode and self.deferred.count == self.deferred.messages.len) return null;
             var message: abi.Message = undefined;
-            require(syscall.receiveWait(&message, 10) == 0);
-            require(syscall.lookup(.filesystem) == self.filesystem and syscall.lookup(.block) == self.block);
+            const result = io.receive(&message, receive.ticks);
+            if (io.block() != self.block) return null;
+            switch (pending.received(io.filesystem(), result)) {
+                .retry => continue,
+                .failed => return null,
+                .message => {},
+            }
             if (self.analysis_mode and message.operation == @intFromEnum(abi.Operation.hosting_request)) {
-                require(self.deferred.push(message));
+                if (!self.deferred.push(message)) return null;
                 continue;
             }
             if (wire.decodeReply(&message, .file_result, self.filesystem, id)) |reply| {
-                require(reply.offset == offset and (operation == .file_open or reply.handle == handle));
+                if (reply.offset != offset or (operation != .file_open and reply.handle != handle)) return null;
                 return reply;
             }
         }
-        require(false);
-        unreachable;
+        return null;
     }
 
     pub fn open(self: *Workload, name: []const u8) u64 {
@@ -89,6 +102,21 @@ pub const Workload = struct {
         self.readFile(self.handles[1], self.alpha_expected, pause);
         self.readFile(self.handles[2], beta, pause);
         syscall.reportValues(65, serial, 7);
+    }
+};
+
+const KernelIo = struct {
+    pub fn filesystem(_: *KernelIo) u64 {
+        return syscall.lookup(.filesystem);
+    }
+    pub fn block(_: *KernelIo) u64 {
+        return syscall.lookup(.block);
+    }
+    pub fn send(_: *KernelIo, endpoint: u64, request: *const abi.Message, operation: abi.Operation) i32 {
+        return runtime.sendBounded(endpoint, request, operation);
+    }
+    pub fn receive(_: *KernelIo, message: *abi.Message, ticks: u64) i32 {
+        return @intCast(syscall.receiveWait(message, ticks));
     }
 };
 

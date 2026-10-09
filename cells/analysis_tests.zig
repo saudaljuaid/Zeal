@@ -12,6 +12,8 @@ const snapshot_wire = @import("snapshot_wire.zig");
 const reader = @import("snapshot_client.zig");
 const analysis = @import("analysis_wire.zig");
 const worker_runtime = @import("analysis_runtime.zig");
+const staging = @import("analysis_staging.zig");
+const dispatcher = @import("contract_dispatch.zig");
 const support = @import("contract_test_support.zig");
 const core = support.core;
 const wire = support.wire;
@@ -98,6 +100,7 @@ const Fixture = struct {
 };
 const Seam = struct {
     fixture: *Fixture,
+    stages: staging.Staging = .{},
     fake: support.Fake = .{},
     bindings: [2]?snapshot.Ref = .{ null, null },
     workers: [2]worker_runtime.Worker = .{ .{ .parent = broker_endpoint }, .{ .parent = broker_endpoint } },
@@ -112,6 +115,9 @@ const Seam = struct {
     cancel_during_release: bool = false,
     cancel_in_rebind: bool = false,
     broker: ?*core.Broker = null,
+    pub fn stage(self: *Seam, table: *core.Broker, message: *const abi.Message) core.Error!?wire.Snapshot {
+        return self.stages.request(table, message, self);
+    }
     pub fn domain(self: *Seam) ?core.Domain {
         return self.fake.domain();
     }
@@ -631,4 +637,261 @@ test "pure offer highwater table serial and domain errors spend no input read or
     try testing.expectEqual(reads, seam.broker_reads);
     seam.fake.bad_domain = false;
     _ = try broker.cancel(owner, second.token, &seam);
+}
+
+fn stageRequest(table: *core.Broker, seam: *Seam, packet: wire.Packet, sender: u64) dispatcher.Dispatch {
+    var message = wire.encode(wire.request_operation, packet);
+    message.sender = sender;
+    return dispatcher.dispatch(table, &message, seam);
+}
+fn stageFailure(value: dispatcher.Dispatch, expected: core.Error) !void {
+    switch (value) {
+        .failure => |failure| try testing.expectEqual(expected, failure.reason),
+        else => return error.UnexpectedStageReply,
+    }
+}
+fn stageTuple(seam: *Seam, table: *const core.Broker, candidate: analysis.Result) !void {
+    var digest = wire.encode(wire.reply_operation, .{ .id = candidate.id, .command = .work, .kind = .response,
+        .detail = candidate.attempt, .token = candidate.token, .data = candidate.tuple.digest });
+    digest.sender = candidate.endpoint;
+    var counts = wire.encode(wire.reply_operation, .{ .id = candidate.id, .command = .analysis_tuple, .kind = .response,
+        .detail = candidate.attempt, .token = candidate.token, .data = candidate.tuple.counts() });
+    counts.sender = candidate.endpoint;
+    try testing.expectEqual(std.meta.Tag(staging.Deferred).ignored, std.meta.activeTag(seam.stages.push(table, &digest)));
+    try testing.expectEqual(std.meta.Tag(staging.Deferred).held, std.meta.activeTag(seam.stages.push(table, &counts)));
+}
+
+test "production staged dispatch authenticates owner input profile and pending identity without repeating work" {
+    var fixture = Fixture.init();
+    const input = try fixture.input("/alpha", "staged bytes\n");
+    var seam: Seam = .{ .fixture = &fixture };
+    var table = core.Broker.init(broker_endpoint, owner);
+    const record = try table.offerAnalysis(owner, 1, input.reference.token, input.reference.issuer, &seam);
+    try seam.bind(record);
+    const request: wire.Packet = .{ .id = 2, .command = .stage, .detail = 2, .token = record.token, .data = record.input };
+    try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).ignored, std.meta.activeTag(stageRequest(&table, &seam, request, owner + 256)));
+    var wrong = request;
+    wrong.data ^= 1;
+    try stageFailure(stageRequest(&table, &seam, wrong, owner), error.invalid);
+    wrong = request;
+    wrong.detail = 1;
+    try stageFailure(stageRequest(&table, &seam, wrong, owner), error.invalid);
+    wrong = request;
+    wrong.token += @as(u64, 256) << 32;
+    try stageFailure(stageRequest(&table, &seam, wrong, owner), error.stale);
+    try testing.expectEqual(@as(u64, 0), seam.fake.send_calls);
+    try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).pending, std.meta.activeTag(stageRequest(&table, &seam, request, owner)));
+    const assigned = record.*;
+    try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).pending, std.meta.activeTag(stageRequest(&table, &seam, request, owner)));
+    wrong = request;
+    wrong.id += 1;
+    try stageFailure(stageRequest(&table, &seam, wrong, owner), error.invalid);
+    try testing.expectEqual(assigned, record.*);
+    try testing.expectEqual(@as(u64, 1), seam.fake.send_calls);
+    for (0..18) |_| {
+        _ = seam.stages.advance(&table);
+        try testing.expect(seam.stages.ready(&table)[0] == null and seam.stages.ready(&table)[1] == null);
+    }
+    try stageFailure(stageRequest(&table, &seam, .{ .id = 4, .command = .stage, .token = record.token, .data = record.rpc }, owner), error.not_ready);
+    _ = try table.cancel(owner, record.token, &seam);
+    _ = seam.stages.advance(&table);
+    try fixture.close(input.reference);
+    try testing.expect(table.conserved(seam.domain().?));
+}
+
+test "staging readiness requires full real tuple pins only exact candidates and late cancellation preserves sibling FIFO progress" {
+    var fixture = Fixture.init();
+    const a = try fixture.input("/alpha", "active\nbytes");
+    const b = try fixture.input("/beta", "sibling\nbytes");
+    var seam: Seam = .{ .fixture = &fixture };
+    var table = core.Broker.init(broker_endpoint, owner);
+    const active = try table.offerAnalysis(owner, 1, a.reference.token, a.reference.issuer, &seam);
+    const sibling = try table.offerAnalysis(owner, 2, b.reference.token, b.reference.issuer, &seam);
+    try seam.bind(active);
+    try seam.bind(sibling);
+    const first: wire.Packet = .{ .id = 3, .command = .stage, .detail = 2, .token = active.token, .data = active.input };
+    const second: wire.Packet = .{ .id = 4, .command = .stage, .detail = 2, .token = sibling.token, .data = sibling.input };
+    try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).pending, std.meta.activeTag(stageRequest(&table, &seam, first, owner)));
+    try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).pending, std.meta.activeTag(stageRequest(&table, &seam, second, owner)));
+    const candidate = seam.execute(active).?;
+    const other = seam.execute(sibling).?;
+    var digest = wire.encode(wire.reply_operation, .{ .id = candidate.id, .command = .work, .kind = .response,
+        .detail = candidate.attempt, .token = candidate.token, .data = candidate.tuple.digest });
+    digest.sender = candidate.endpoint;
+    _ = seam.stages.push(&table, &digest);
+    for (0..9) |_| { _ = seam.stages.advance(&table); try testing.expect(seam.stages.ready(&table)[wire.tokenSlot(active.token).?] == null); }
+    var counts = wire.encode(wire.reply_operation, .{ .id = candidate.id, .command = .analysis_tuple, .kind = .response,
+        .detail = candidate.attempt, .token = candidate.token, .data = candidate.tuple.counts() });
+    counts.sender = candidate.endpoint;
+    for (0..4) |mutation| {
+        var forged = counts;
+        switch (mutation) { 0 => forged.sender += 256, 1 => forged.payload[0] += 1, 2 => forged.payload[11] += 1,
+            3 => wire.put64(&forged.payload, 16, sibling.token), else => unreachable }
+        try testing.expectEqual(std.meta.Tag(staging.Deferred).rejected, std.meta.activeTag(seam.stages.push(&table, &forged)));
+        try testing.expect(seam.stages.ready(&table)[wire.tokenSlot(active.token).?] == null);
+    }
+    try testing.expectEqual(std.meta.Tag(staging.Deferred).held, std.meta.activeTag(seam.stages.push(&table, &counts)));
+    try stageTuple(&seam, &table, other);
+    const ready = seam.stages.ready(&table);
+    for (ready) |ack| { try testing.expect(ack != null and ack.?.snapshot.state == .running and !ack.?.snapshot.verified); }
+    try testing.expectEqual(candidate.id, ready[wire.tokenSlot(active.token).?].?.snapshot.rpc);
+    try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).pending, std.meta.activeTag(stageRequest(&table, &seam, first, owner)));
+    try testing.expect(seam.stages.ready(&table)[wire.tokenSlot(active.token).?] != null);
+    // Full inbox pressure and FIFO contents remain independent of the two pins.
+    var inbox: @import("hosting_transport.zig").Inbox = .{};
+    for (0..8) |index| { var message = wire.encode(wire.request_operation, .{ .id = index + 1, .command = .status, .token = sibling.token }); message.sender = owner; try testing.expect(inbox.push(message)); }
+    try testing.expect(!inbox.push(digest));
+    for (0..24) |_| for (seam.stages.advance(&table)) |result| try testing.expect(result == null);
+    try testing.expectEqual(wire.State.running, sibling.state);
+    try testing.expectEqual(storage.Status.ok, fixture.server.snapshots.revoke(owner, a.reference, active.worker.endpoint));
+    _ = try table.cancel(owner, active.token, &seam);
+    const late = seam.stages.advance(&table)[wire.tokenSlot(active.token).?].?;
+    try testing.expectError(error.stale, table.deliverAnalysis(late, &seam));
+    try testing.expect(active.state == .cancelled and sibling.state == .running and !active.verified);
+    try stageFailure(stageRequest(&table, &seam, .{ .id = 5, .command = .stage, .token = sibling.token, .data = active.rpc }, owner), error.stale);
+    const released = stageRequest(&table, &seam, .{ .id = 6, .command = .stage, .token = sibling.token, .data = sibling.rpc }, owner);
+    try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).snapshot, std.meta.activeTag(released));
+    try stageFailure(stageRequest(&table, &seam, .{ .id = 7, .command = .stage, .token = sibling.token, .data = sibling.rpc }, owner), error.not_ready);
+    for (0..9) |_| for (seam.stages.advance(&table)) |result| if (result) |value| { _ = try table.deliverAnalysis(value, &seam); };
+    try testing.expect(sibling.verified and sibling.state == .completed and table.conserved(seam.domain().?));
+    for (0..8) |index| { const message = inbox.pop().?; try testing.expectEqual(@as(u64, index + 1), wire.get64(&message.payload, 0)); }
+    try testing.expect(inbox.pop() == null);
+    try fixture.close(a.reference);
+    try fixture.close(b.reference);
+    try testing.expectEqual(@as(usize, 0), fixture.server.snapshots.backing());
+    std.debug.print("staging gate metadata bytes={d}; staged pair bytes={d}; old collector bytes={d}\n",
+        .{ staging.gate_metadata_bytes, @sizeOf(analysis.StagePair), @sizeOf(analysis.Collector) });
+}
+
+test "staging cancellation before full result expiry and generation retirement cannot acknowledge or retain successor scope" {
+    for (0..3) |boundary| {
+        var fixture = Fixture.init();
+        const input = try fixture.input("/alpha", "retired\nbytes");
+        var seam: Seam = .{ .fixture = &fixture, .allow_retry = true };
+        var table = core.Broker.init(broker_endpoint, owner);
+        const record = try table.offerAnalysis(owner, 1, input.reference.token, input.reference.issuer, &seam);
+        try seam.bind(record);
+        const request: wire.Packet = .{ .id = 2, .command = .stage, .detail = 2, .token = record.token, .data = record.input };
+        _ = stageRequest(&table, &seam, request, owner);
+        const old = seam.execute(record).?;
+        if (boundary != 0) { try stageTuple(&seam, &table, old); try testing.expect(seam.stages.ready(&table)[wire.tokenSlot(record.token).?] != null); }
+        if (boundary == 0) {
+            var partial = wire.encode(wire.reply_operation, .{ .id = old.id, .command = .work, .kind = .response,
+                .detail = old.attempt, .token = old.token, .data = old.tuple.digest });
+            partial.sender = old.endpoint;
+            _ = seam.stages.push(&table, &partial);
+            _ = try table.cancel(owner, record.token, &seam);
+        } else if (boundary == 1) {
+            // Pin does not extend the runtime's existing160iteration expiry.
+            for (0..159) |_| for (seam.stages.advance(&table)) |candidate| try testing.expect(candidate == null);
+            _ = try table.expire(record.token, &seam);
+        } else { _ = try table.workerFault(record.worker.endpoint, &seam); }
+        const removed = seam.stages.advance(&table)[wire.tokenSlot(record.token).?];
+        if (boundary != 0) { try testing.expect(removed != null); try testing.expectError(error.stale, table.deliverAnalysis(removed.?, &seam)); }
+        try testing.expect(seam.stages.ready(&table)[wire.tokenSlot(record.token).?] == null);
+        if (boundary == 2) {
+            _ = try table.retry(record.token, &seam);
+            try testing.expect(record.worker.endpoint != old.endpoint and record.rpc != old.id and record.attempt == 2);
+            try stageFailure(stageRequest(&table, &seam, request, owner), error.not_ready);
+            _ = try table.deliverAnalysis(seam.execute(record).?, &seam);
+        } else { try stageFailure(stageRequest(&table, &seam, request, owner), error.not_ready); }
+        try testing.expectError(error.stale, table.deliverAnalysis(old, &seam));
+        try testing.expect(table.conserved(seam.domain().?));
+        try fixture.close(input.reference);
+    }
+}
+
+test "production staged pair collectors independently bind full copies and keep original per-RPC receive bounds" {
+    var fixture = Fixture.init();
+    const a = try fixture.input("/alpha", "pair alpha\n");
+    const b = try fixture.input("/beta", "pair beta\n");
+    var seam: Seam = .{ .fixture = &fixture };
+    var table = core.Broker.init(broker_endpoint, owner);
+    const first = try table.offerAnalysis(owner, 1, a.reference.token, a.reference.issuer, &seam);
+    const second = try table.offerAnalysis(owner, 2, b.reference.token, b.reference.issuer, &seam);
+    try seam.bind(first);
+    try seam.bind(second);
+    const packets: [2]wire.Packet = .{ .{ .id = 3, .command = .stage, .detail = 2, .token = first.token, .data = first.input },
+        .{ .id = 4, .command = .stage, .detail = 2, .token = second.token, .data = second.input } };
+    for (packets) |packet| _ = stageRequest(&table, &seam, packet, owner);
+    try stageTuple(&seam, &table, seam.execute(first).?);
+    try stageTuple(&seam, &table, seam.execute(second).?);
+    const ready = seam.stages.ready(&table);
+    var messages: [2][10]abi.Message = undefined;
+    for (ready, 0..) |ack, index| {
+        messages[index][0..8].* = ack.?.snapshot.messages(packets[index].id, .stage);
+        messages[index][8] = wire.encode(wire.reply_operation, .{ .id = packets[index].id, .command = .stage, .kind = .snapshot,
+            .detail = 8, .token = ack.?.snapshot.token, .data = ack.?.snapshot.input_issuer });
+        messages[index][9] = wire.encode(wire.reply_operation, .{ .id = packets[index].id, .command = .stage, .kind = .snapshot,
+            .detail = 9, .token = ack.?.snapshot.token, .data = ack.?.snapshot.input_length });
+        for (&messages[index]) |*message| message.sender = broker_endpoint;
+    }
+    var pair = analysis.StagePair.init(broker_endpoint, owner, packets);
+    // Twelve timeout/unrelated wakes plus twenty actual parts use exactly32.
+    for (0..12) |_| try testing.expect(pair.step());
+    for (0..10) |part| for (0..2) |index| {
+        try testing.expect(pair.step());
+        try testing.expect(pair.push(&messages[index][part]));
+        if (part != 9 or index != 1) try testing.expect(pair.take() == null);
+    };
+    try testing.expect(pair.take() != null and !pair.step());
+    try testing.expectEqual(@as(u8, 0), pair.remaining[1]);
+    var exhausted = analysis.StagePair.init(broker_endpoint, owner, packets);
+    for (messages[0]) |message| { try testing.expect(exhausted.step()); try testing.expect(exhausted.push(&message)); }
+    for (0..22) |_| try testing.expect(exhausted.step());
+    try testing.expect(!exhausted.step() and exhausted.take() == null and exhausted.remaining[1] == 0);
+    var partial = analysis.StagePair.init(broker_endpoint, owner, packets);
+    try testing.expect(partial.step() and partial.push(&messages[0][0]));
+    try testing.expect(!partial.push(&messages[0][0]));
+    var wrong = messages[1][0];
+    wrong.sender += 256;
+    var fenced = analysis.StagePair.init(broker_endpoint, owner, packets);
+    try testing.expect(fenced.step() and fenced.push(&wrong) and fenced.take() == null and fenced.collectors[1].base.count == 0);
+    wrong = messages[1][0];
+    wire.put64(&wrong.payload, 16, first.token);
+    try testing.expect(!fenced.push(&wrong));
+    _ = try table.cancel(owner, first.token, &seam);
+    _ = try table.cancel(owner, second.token, &seam);
+    for (seam.stages.advance(&table)) |candidate| if (candidate) |late| try testing.expectError(error.stale, table.deliverAnalysis(late, &seam));
+    try fixture.close(a.reference);
+    try fixture.close(b.reference);
+}
+
+
+test "staged predecessor reap and late traffic cannot clear or acknowledge a fresh reused slot" {
+    var fixture = Fixture.init();
+    const input = try fixture.input("/alpha", "predecessor\n");
+    var seam: Seam = .{ .fixture = &fixture };
+    var table = core.Broker.init(broker_endpoint, owner);
+    const first = try table.offerAnalysis(owner, 1, input.reference.token, input.reference.issuer, &seam);
+    try seam.bind(first);
+    const old_token = first.token;
+    _ = stageRequest(&table, &seam, .{ .id = 2, .command = .stage, .detail = 2, .token = first.token, .data = first.input }, owner);
+    const old = seam.execute(first).?;
+    try stageTuple(&seam, &table, old);
+    _ = seam.stages.ready(&table);
+    _ = try table.cancel(owner, old_token, &seam);
+    const late = seam.stages.advance(&table)[wire.tokenSlot(old_token).?].?;
+    try testing.expectError(error.stale, table.deliverAnalysis(late, &seam));
+    try fixture.close(input.reference);
+    try table.reap(owner, old_token);
+    const fresh = try fixture.input("/alpha", "replacement\n");
+    const successor = try table.offerAnalysis(owner, 3, fresh.reference.token, fresh.reference.issuer, &seam);
+    try seam.bind(successor);
+    _ = stageRequest(&table, &seam, .{ .id = 4, .command = .stage, .detail = 2, .token = successor.token, .data = successor.input }, owner);
+    const current = seam.execute(successor).?;
+    try stageTuple(&seam, &table, current);
+    seam.stages.release(old_token);
+    var stale = wire.encode(wire.reply_operation, .{ .id = old.id, .command = .work, .kind = .response,
+        .detail = old.attempt, .token = old.token, .data = old.tuple.digest });
+    stale.sender = old.endpoint;
+    try testing.expectEqual(std.meta.Tag(staging.Deferred).rejected, std.meta.activeTag(seam.stages.push(&table, &stale)));
+    const ready = seam.stages.ready(&table)[wire.tokenSlot(successor.token).?].?;
+    try testing.expectEqual(successor.token, ready.snapshot.token);
+    try testing.expectEqual(current.endpoint, ready.snapshot.endpoint);
+    try stageFailure(stageRequest(&table, &seam, .{ .id = 5, .command = .stage, .token = old_token, .data = old.id }, owner), error.stale);
+    _ = stageRequest(&table, &seam, .{ .id = 6, .command = .stage, .token = successor.token, .data = successor.rpc }, owner);
+    for (0..9) |_| for (seam.stages.advance(&table)) |candidate| if (candidate) |result| { _ = try table.deliverAnalysis(result, &seam); };
+    try testing.expect(successor.verified and table.conserved(seam.domain().?));
+    try fixture.close(fresh.reference);
 }

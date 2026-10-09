@@ -13,6 +13,10 @@ const owner: u64 = 0x104;
 const checker: u64 = 0x105;
 const worker: u64 = 0x106;
 
+test {
+    _ = @import("native_receive_tests.zig");
+}
+
 const Io = struct {
     block: storage.Block = storage.Block.init(),
     endpoint: u64 = 0x101,

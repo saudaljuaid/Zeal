@@ -93,6 +93,7 @@ semantics and never silently selects itself in old templates:
 | ANALYSIS_TUPLE 11 | second ordered result, length bits 0–15 and newline count bits 16–31; higher bits zero |
 | REBIND_INPUT 13 | broker-to-owner notice, exact replacement endpoint in data |
 | AUTHORIZE_INPUT 14 | owner-to-broker exact notice transaction/contract/endpoint acknowledgement after explicit object rebind |
+| STAGE 15 | owner request detail=2/data=offered input accepts profile 2 and pins its exact accepted candidate; detail=0/data=current RPC releases that same already-ready pin |
 
 INPUT, INPUT_LENGTH and WORK must agree on authenticated full parent endpoint,
 RPC, contract and attempt and arrive in order. Worker RPC high-water does not
@@ -122,10 +123,42 @@ full reader or tuple collector. A partial-prefix digest is not a declared result
 
 The broker uses the same two private result slots as the scalar runtime, selected
 through a union. Each byte-profile slot holds either a digest packet or a complete
-candidate tuple during eight bounded delivery windows. It cannot overwrite a
-sibling or current candidate. Retirement clears only the affected old attempt's
+candidate tuple during eight bounded delivery windows. Explicit STAGE acceptance
+adds one owner/issuer/token/input/execution/RPC/attempt gate per existing slot.
+The two gates add 160 bytes of broker-private metadata, fitting its unchanged
+four-page allocation; they add no queue entries, results, pages or capabilities.
+It cannot overwrite a sibling or current candidate. Retirement clears only the affected old attempt's
 slot before a replacement result can occupy it. Every candidate is rechecked
 against current state, endpoint, RPC and attempt at consumption.
+
+STAGE installs its gate synchronously after the same checked acceptance used by
+ACCEPT, before the broker can dequeue worker results. Its ten-part running
+snapshot is sent only after both authenticated result packets are actually
+retained by production result staging and checked lifecycle reconciliation still
+matches that exact scope. A digest prefix cannot acknowledge readiness. Exact
+same-request replay can recover a partial/lost acknowledgment without another
+dispatch; a different pending request cannot replace the gate. The fixed requester
+still fails finitely on unexpected partial-response exhaustion, rather than
+providing automatic general retry.
+
+A ready pin holds only its own candidate; FIFO traffic and unrelated contracts
+continue. It does not extend the existing 160 broker-iteration attempt expiry.
+Cancellation, expiry or generation retirement removes that pin. A complete
+retained candidate then goes through normal result admission and real rejection;
+a partial tuple does not count as a late result. Explicit release requires the
+same authenticated owner, full token and current RPC, a complete acknowledged
+candidate, and the unchanged endpoint/attempt. Reap cannot release a successor.
+
+The native cancellation exercise pipelines two STAGE calls. Each receive wake,
+including timeout or unrelated traffic, consumes one of the original 32 steps
+for every incomplete collection. The pair of collectors and retained readiness
+values occupies 456 transient bytes, compared with 128 bytes for one existing
+collector, plus two 32-byte request packets. It fits the unchanged root stack
+and private allocation. Both ten-part readiness replies must reach the
+owner before its actual filesystem revoke and active CANCEL. The sibling remains
+running under its own pin while cancellation commits, then the owner releases
+that exact sibling RPC for independent ordinary validation and settlement. No
+fixed tick delay establishes readiness or sibling cancellation precedence.
 
 A worker fault retires its IPC routes and parent routes. The broker reconciles
 real lifecycle status, retains the same immutable input and permits at most one
@@ -204,7 +237,14 @@ Kernel admission's extra runtime route metadata is 192 bytes. No universal
 zero-memory claim follows from returning temporary objects and rights.
 
 Snapshot RPC sends are at most four attempts before enqueue and eight ten-tick
-receive steps. Capture has at most sixteen block transfers. Analysis collection
+receive steps. A native timeout wakeup consumes a step and continues the same
+enqueued transaction while budget remains and the original filesystem issuer
+still matches; it never resends or substitutes a newer endpoint. Every wake,
+including unrelated traffic, uses that same budget. Other errors, generation
+change, full inbox and exhaustion end the RPC. The independent storage workload
+uses this continuation rule while also fencing its block endpoint. The existing
+block-transfer state still ends on its first timeout. Capture has at most sixteen
+block transfers. Analysis collection
 has at most sixteen data chunks and one EOF. Descriptor/result packet counts
 are fixed. Worker bootstrap waits at most 64 one-tick steps for explicit channels;
 replacement authorization has sixteen ten-tick receives. Requester snapshots

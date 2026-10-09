@@ -251,7 +251,13 @@ above 128, overflow and overlarge chunk counts cannot expose retained bytes.
 
 Each send has at most four attempts before enqueue, each transaction at most
 eight ten-tick receive attempts. Enqueued mutating requests are not silently
-retransmitted. Capture uses at most sixteen such block transactions. Inbox
+retransmitted. Native snapshot clients keep the same transaction pending after
+a timeout wakeup while attempts remain, and check the exact original filesystem
+endpoint before sending and after every wake. A replacement or absent endpoint,
+other receive error, full inbox, or exhausted attempt budget fails the RPC;
+the original reference issuer is never rebound. Unrelated messages and timeout
+wakeups consume the same eight-step budget. The block-transfer state still ends
+on its first timeout. Capture uses at most sixteen such block transactions. Inbox
 pressure ends the pending transfer and fails capture rather than overwriting
 traffic or polling forever. Analysis clients share their caller's existing
 eight-message inbox for unrelated traffic; they do not cycle those messages

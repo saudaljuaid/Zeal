@@ -65,10 +65,26 @@ pub const Results = struct {
         self.entries[slot] = .{ .complete = .{ .result = result, .remaining = 8 } };
         return true;
     }
+    pub fn peek(self: *const Results, token: u64) ?Result {
+        const slot = wire.tokenSlot(token) orelse return null;
+        return switch (self.entries[slot]) {
+            .complete => |item| if (item.result.token == token) item.result else null,
+            else => null,
+        };
+    }
+    pub fn take(self: *Results, token: u64) ?Result {
+        const result = self.peek(token);
+        self.release(token);
+        return result;
+    }
     pub fn advance(self: *Results) [2]?Result {
+        return self.advanceExcept(.{ false, false });
+    }
+    pub fn advanceExcept(self: *Results, pinned: [2]bool) [2]?Result {
         var ready: [2]?Result = .{ null, null };
         for (&self.entries, 0..) |*entry, index| switch (entry.*) {
             .complete => |*complete| {
+                if (pinned[index]) continue;
                 if (complete.remaining != 0) {
                     complete.remaining -= 1;
                     continue;
@@ -118,6 +134,45 @@ pub const Collector = struct {
         if (self.count != 2 or self.tuple >> 32 != 0) return null;
         const snapshot = self.base.takeAnalysis(self.issuer, @truncate(self.tuple), @truncate(self.tuple >> 16)) orelse return null;
         return snapshot;
+    }
+};
+
+// Two staged readiness calls share receive traffic without expanding either
+// original32step RPC budget. Every wake charges each incomplete collection.
+pub const StagePair = struct {
+    collectors: [2]Collector,
+    values: [2]?wire.Snapshot = .{ null, null },
+    remaining: [2]u8 = .{ 32, 32 },
+    pub fn init(issuer: u64, requester: u64, requests: [2]wire.Packet) StagePair {
+        var result: StagePair = undefined;
+        result.values = .{ null, null };
+        result.remaining = .{ 32, 32 };
+        for (requests, 0..) |packet, index| result.collectors[index] = .{ .base = .{ .issuer = issuer,
+            .requester = requester, .id = packet.id, .command = .stage, .token = packet.token } };
+        return result;
+    }
+    pub fn step(self: *StagePair) bool {
+        var pending = false;
+        for (self.values, self.remaining) |value, remaining| if (value == null) {
+            if (remaining == 0) return false;
+            pending = true;
+        };
+        if (!pending) return false;
+        for (&self.remaining, self.values) |*remaining, value| if (value == null) { remaining.* -= 1; };
+        return true;
+    }
+    pub fn push(self: *StagePair, message: *const abi.Message) bool {
+        const packet = wire.decode(message, self.collectors[0].base.issuer, wire.reply_operation) orelse return true;
+        if (packet.command != .stage) return true;
+        for (&self.collectors, 0..) |*collector, index| {
+            if (packet.id != collector.base.id) continue;
+            if (self.values[index] != null or !collector.push(message)) return false;
+            if (collector.count == 2) self.values[index] = collector.take() orelse return false;
+        }
+        return true;
+    }
+    pub fn take(self: *const StagePair) ?[2]wire.Snapshot {
+        return .{ self.values[0] orelse return null, self.values[1] orelse return null };
     }
 };
 

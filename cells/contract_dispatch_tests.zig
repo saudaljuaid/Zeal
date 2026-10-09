@@ -277,12 +277,14 @@ test "production protocol dispatch rejects every command kind length and reserve
         message.payload[9] = @intCast(command);
         try fails(dispatcher.dispatch(&table, &message, &seam), error.invalid);
     }
+    var stage_request = delivered(.{ .id = 2, .command = .stage, .detail = 2, .token = wire.token(1, 0, issuer).?, .data = 0x1a1 });
+    try fails(dispatcher.dispatch(&table, &stage_request, &seam), error.invalid);
     for ([_]u8{0}) |command| {
         var message = delivered(packet);
         message.payload[9] = command;
         try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).ignored, std.meta.activeTag(dispatcher.dispatch(&table, &message, &seam)));
     }
-    for (@intFromEnum(wire.Command.authorize_input) + 1..256) |command| {
+    for (@intFromEnum(wire.Command.stage) + 1..256) |command| {
         var message = delivered(packet);
         message.payload[9] = @intCast(command);
         try testing.expectEqual(std.meta.Tag(dispatcher.Dispatch).ignored, std.meta.activeTag(dispatcher.dispatch(&table, &message, &seam)));

@@ -286,7 +286,7 @@ class ContractPacket:
                    "version", "service_command", "kind", "detail", "token", "data", "result", "raw0", "raw1", "raw2", "raw3")
         require(f["length"] == 32 and f["operation"] in (15, 16) and f["request"] > 0,
                 "analysis contract wire has invalid transaction/extent/operation")
-        require(f["version"] == 1 and 1 <= f["service_command"] <= 14 and f["kind"] <= 3 and f["detail"] <= 255 and f["reserved"] == 0,
+        require(f["version"] == 1 and 1 <= f["service_command"] <= 15 and f["kind"] <= 3 and f["detail"] <= 255 and f["reserved"] == 0,
                 "analysis contract wire version/command/kind/detail/reserved bytes are invalid")
         packed = f["version"] | f["service_command"] << 8 | f["kind"] << 16 | f["detail"] << 24
         require((f["command"], f["argument"], f["value"]) == (packed, f["token"], f["data"]) and
@@ -1065,6 +1065,7 @@ class Contracts:
         self.computations, self.worker_count_reports, self.tuple_stages, self.receipt_checks = {}, {}, {}, []
         self.errors, self.lost, self.deferred, self.late = [], [], {}, []
         self.bootstrap = {}
+        self.staged_ready, self.stage_releases = {}, {}
         self.state_history = {}
         self.packets = kernel.packet_events
 
@@ -1105,7 +1106,9 @@ class Contracts:
         r = self.records.get(p.token)
         if not r or not r.retained or p.token >> 32 != p.target:
             return 3
-        if p.command == 2:
+        if p.command == 15 and p.detail == 0:
+            return 0 if p.kind == 0 and p.data == r.rpc and r.state == 2 and p.token in self.staged_ready else 10
+        if p.command in (2, 15):
             if p.detail != 2 or p.data != r.input:
                 return 2
             return 0 if r.state in (1, 2, 3, 4) else 10
@@ -1226,7 +1229,7 @@ class Contracts:
             r.initial_reports.add(event.name)
         elif event.name == "contract-accepted":
             accepts = self.prior(lambda e: e.name == "host-ipc-deliver" and (p := self.packets[e.index]).sender == r.owner and p.target == r.issuer and
-                                 p.operation == 15 and p.command == 2 and p.kind == 0 and p.detail == 2 and p.token == r.token and p.data == r.input,
+                                 p.operation == 15 and p.command in (2, 15) and p.kind == 0 and p.detail == 2 and p.token == r.token and p.data == r.input,
                                  event.index, r.born)
             require(r.state == 1 and value == r.input and len(r.initial_reports) == 7 and accepts,
                     "analysis started without explicit exact owner acceptance and full backed immutable offer")
@@ -1353,7 +1356,7 @@ class Contracts:
             r = self.record(p.token)
             if p.command in (10, 12):
                 accepts = self.prior(lambda e: e.name == "host-ipc-deliver" and (q := self.packets[e.index]).sender == r.owner and q.target == r.issuer and
-                                     q.command == 2 and q.operation == 15 and q.kind == 0 and q.detail == 2 and q.token == r.token and q.data == r.input,
+                                     q.command in (2, 15) and q.operation == 15 and q.kind == 0 and q.detail == 2 and q.token == r.token and q.data == r.input,
                                      event.index, r.born)
                 require(accepts and p.request > 0 and p.detail == (1 if r.state == 1 else r.attempt) and r.state in (1, 2),
                         "input descriptor preceded actual explicit exact acceptance/current attempt")
@@ -1391,7 +1394,17 @@ class Contracts:
                 expected = calculate(self.inputs.records[(r.input_issuer, r.input)].data)
                 require(p.data == expected[0] | expected[1] << 16, "worker raw length/newline result contradicted actual captured bytes")
                 r.tuples[(p.sender, p.request)] = digest, p, digest_event, event
-        elif p.operation == 16 and p.command in range(1, 7):
+        elif p.operation == 15 and p.command == 15:
+            r = self.record(p.token)
+            require(p.sender == r.owner and p.target == r.issuer and p.kind == 0 and p.detail in (0, 2),
+                    "staging control changed exact authenticated owner/issuer/shape")
+            if p.detail == 2:
+                require(r.state == 1 and p.data == r.input, "staged acceptance changed offered immutable input or reused live attempt")
+            else:
+                require(r.state == 2 and p.token in self.staged_ready and p.data == r.rpc and p.token not in self.stage_releases,
+                        "staging release preceded full readiness or changed current RPC/scope")
+                self.stage_releases[p.token] = event
+        elif p.operation == 16 and (p.command in range(1, 7) or p.command == 15):
             requests = self.prior(lambda e: e.name == "host-ipc-deliver" and (q := self.packets[e.index]).sender == p.target and q.target == p.sender and
                                   q.request == p.request and q.command == p.command and q.operation == 15, event.index)
             require(requests and p.sender == self.broker().endpoint and p.target == 0x104, "broker authoritative reply changed requester/transaction scope")
@@ -1407,6 +1420,14 @@ class Contracts:
                         "authoritative analysis snapshot answered wrong obligation/input generation")
                 key = p.sender, p.target, p.request, p.command, p.token
                 if p.detail == 0:
+                    if p.command == 15:
+                        require(r.state == 2 and p.token in self.deferred and self.deferred[p.token].index < event.index and
+                                (r.execution, r.rpc) in r.tuples, "staging acknowledgment preceded full authenticated held tuple/current running scope")
+                        if request.detail == 0:
+                            require(p.token in self.staged_ready and p.token in self.stage_releases and request.data == r.rpc,
+                                    "staging release acknowledgment changed exact ready gate")
+                        else:
+                            require(request.detail == 2 and request.data == r.input, "staging readiness answered a different input/request shape")
                     require(key not in self.groups, "authoritative snapshot restarted/duplicated part0")
                     self.groups[key] = [0, r.snapshot(), event]
                 require(key in self.groups and p.detail == self.groups[key][0] and p.detail < 10 and p.data == self.groups[key][1][p.detail],
@@ -1414,6 +1435,8 @@ class Contracts:
                 self.groups[key][0] += 1
                 if self.groups[key][0] == 10:
                     self.snapshots.append((self.groups[key][2], event, p, self.groups[key][1]))
+                    if p.command == 15 and request.detail == 2:
+                        self.staged_ready[p.token] = (requests[-1], self.groups[key][2], event, self.groups[key][1])
                     del self.groups[key]
             else:
                 require(p.kind == 1 and p.command == 6 and p.detail == 0 and p.data == 0 and
@@ -1506,6 +1529,38 @@ class Contracts:
         require(len(self.lost) == 2 and {item[1][2].command for item in self.lost} == {1, 5} and self.late and
                 all(r.requester_checks and r.requester_counts for r in self.records.values() if r.state == 4),
                 "analysis omitted authoritative loss recovery, late-result cancellation precedence, or requester receipt check")
+        # Readiness must reach the owner through actual authenticated copies
+        # before its real FS revoke/cancel. A progress report cannot substitute.
+        cancelled_stages = []
+        released_stages = []
+        for token, (request, first, last, fields) in self.staged_ready.items():
+            r = self.records[token]
+            delivered = [e for e in self.kernel.delivered if (p := self.packets[e.index]).sender == r.issuer and p.target == r.owner and
+                         p.command == 15 and p.request == self.packets[request.index].request and p.token == token and p.kind == 2 and
+                         first.index < e.index and p.detail < 10]
+            require(len(delivered) == 10 and {self.packets[e.index].detail for e in delivered} == set(range(10)) and
+                    fields[5:7] == (r.execution, r.rpc), "owner staging readiness lacked all ten copied parts or changed execution/RPC")
+            copied_ready = max(e.index for e in delivered)
+            if r.state == 5:
+                revokes = [item for item in self.inputs.controls if item[2].sender == r.owner and item[2].token == r.input and
+                           item[2].tail[0] == 4 and item[2].word == r.execution and item[4] == 0 and copied_ready < item[0].index < item[1].index < r.terminal.index]
+                cancels = self.prior(lambda e: e.name == "host-ipc-deliver" and (p := self.packets[e.index]).sender == r.owner and
+                                    p.target == r.issuer and p.command == 4 and p.token == token, r.terminal.index, copied_ready)
+                late = [e for e in self.late if e.fields["value"] == token and r.terminal.index < e.index]
+                require(revokes and cancels and revokes[-1][1].index < cancels[-1].index and late,
+                        "staged cancellation omitted ready-copy -> actual revoke -> owner cancel -> normal late rejection")
+                cancelled_stages.append(r)
+            elif r.state == 4:
+                release = self.stage_releases.get(token)
+                require(release and copied_ready < release.index < r.validation.index and r.requester_checks and r.requester_counts,
+                        "staged sibling lacked explicit current-RPC release before independent settlement")
+                released_stages.append((r, release))
+        require(len(cancelled_stages) == len(released_stages) == 1, "analysis omitted exact staged active/sibling controls")
+        active = cancelled_stages[0]
+        sibling, release = released_stages[0]
+        running = [item for item in self.snapshots if item[2].token == sibling.token and item[2].command == 3 and item[3][0] & 255 == 2 and
+                   active.terminal.index < item[0].index < item[1].index < release.index]
+        require(running and active.token != sibling.token, "staged cancellation changed unrelated running sibling before explicit release")
         return self
 
 ORIGINAL_ALPHA = b"Zeal\x00A\n\xfffile bytes\nold."
@@ -1605,6 +1660,7 @@ def verify(output, code, scenario=25, manifest_path=None):
                 successful_receipts=sum(r.state == 4 for r in contracts.records.values()), cancelled_contracts=sum(r.state == 5 for r in contracts.records.values()),
                 worker_computations=len(contracts.computations), requester_checks=len(contracts.receipt_checks),
                 authoritative_lost_replies=len(contracts.lost), privately_staged_late_results=len(contracts.late),
+                authenticated_staging_ready=len(contracts.staged_ready), explicit_staging_releases=len(contracts.stage_releases),
                 worker_restarts=len(kernel.restarts), explicit_rebind_authorizations=sum(len(r.authorizations) for r in contracts.records.values()),
                 root_private_pages=80, broker_private_pages=4, worker_private_pages=2, final_owned_slots=0, final_owned_pages=0,
                 final_reserved_slots=0, final_reserved_pages=0, final_available_slots=4, final_available_pages=48,
@@ -1680,12 +1736,55 @@ def negative_controls(output, code, scenario=25, manifest_path=None):
     for event in [e for e in events if e.name.startswith(("contract-", "analysis-")) and e.name != "contract-complete"][:80]:
         for field in ("value", "extra"):
             rejected(f"contradict-{event.name}-{event.index}-{field}", changed(event, {field: event.fields[field] ^ 1}))
+    stage_events = [e for e in events if e.name in ("host-ipc-enqueue", "host-ipc-deliver") and ContractPacket.from_event(e).command == 15]
+    for phase in ((15, 0, 2), (16, 2, 0), (16, 2, 9), (15, 0, 0)):
+        selected = [e for e in stage_events if (p := ContractPacket.from_event(e)) and (p.operation, p.kind, p.detail) == phase]
+        require(selected, "analysis staging controls omitted protocol phase " + str(phase))
+        for event in selected:
+            candidate = list(lines)
+            del candidate[event.line]
+            rejected(f"remove-staging-{event.index}", "\n".join(candidate) + "\n")
+        event = selected[0]
+        packet = ContractPacket.from_event(event)
+        for field in ("sender", "target", "request", "token", "data"):
+            rejected(f"staging-scope-{event.index}-{field}", changed(event, {field: event.fields[field] ^ 1}))
     def coordinate(selected, fields):
         result = list(lines)
         for e in selected:
             for name, value in fields.items():
                 result[e.line] = re.sub(rf"\b{name}=0x[0-9a-f]+\b", f"{name}=0x{value:016x}", result[e.line])
         return "\n".join(result) + "\n"
+
+    ready_packet = next(ContractPacket.from_event(e) for e in stage_events if ContractPacket.from_event(e).operation == 16 and
+                        ContractPacket.from_event(e).kind == 2 and ContractPacket.from_event(e).detail == 0)
+    # Coordinated wire edits retain raw/decoded agreement and authenticated
+    # copies, so these controls reach the staging joins themselves.
+    for part, delta in ((3, 256), (6, 1)):
+        selected = [e for e in stage_events if (p := ContractPacket.from_event(e)).operation == 16 and p.kind == 2 and
+                    p.request == ready_packet.request and p.token == ready_packet.token and p.detail == part]
+        require(len(selected) == 2, "staging coordinated control lacks matching enqueue/copy")
+        value = ContractPacket.from_event(selected[0]).data + delta
+        rejected("coordinated-staging-ready-part-" + str(part), coordinate(selected, {"data": value, "value": value, "raw3": value}))
+    candidate = list(lines)
+    for e in stage_events:
+        p = ContractPacket.from_event(e)
+        if p.token == ready_packet.token and p.request == ready_packet.request:
+            packed = (e.fields["raw1"] & ~0xFF00) | (2 << 8)
+            for name, value in dict(service_command=2, command=packed, raw1=packed).items():
+                candidate[e.line] = re.sub(rf"\b{name}=0x[0-9a-f]+\b", f"{name}=0x{value:016x}", candidate[e.line])
+    rejected("coordinated-staging-disguised-as-ordinary-accept", "\n".join(candidate) + "\n")
+    candidate = list(lines)
+    release_packet = next(ContractPacket.from_event(e) for e in stage_events if ContractPacket.from_event(e).operation == 15 and
+                          ContractPacket.from_event(e).detail == 0)
+    for e in stage_events:
+        p = ContractPacket.from_event(e)
+        if p.token == release_packet.token and p.request == release_packet.request:
+            packed = (e.fields["raw1"] & ~0xFF00) | (3 << 8)
+            values = dict(service_command=3, command=packed, raw1=packed)
+            if p.operation == 15: values.update(data=0, value=0, raw3=0)
+            for name, value in values.items():
+                candidate[e.line] = re.sub(rf"\b{name}=0x[0-9a-f]+\b", f"{name}=0x{value:016x}", candidate[e.line])
+    rejected("coordinated-staging-release-disguised-as-status", "\n".join(candidate) + "\n")
 
     first_capture = next(e for e in events if e.name == "snapshot-capture-owner")
     first_publication = next(e for e in events if e.name == "snapshot-published")

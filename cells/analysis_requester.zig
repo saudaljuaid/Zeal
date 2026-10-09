@@ -183,6 +183,37 @@ const Requester = struct {
             running.input_issuer == offered.input_issuer and running.input_length == offered.input_length and running.endpoint == offered.endpoint);
         return running;
     }
+    fn stagePair(self: *Requester, offered: [2]wire.Snapshot) [2]wire.Snapshot {
+        var packets: [2]wire.Packet = undefined;
+        for (offered, 0..) |item, index| packets[index] = .{ .id = self.nextId(), .command = .stage,
+            .detail = 2, .token = item.token, .data = item.input };
+        var pair = analysis.StagePair.init(self.broker.endpoint, self.info.endpoint, packets);
+        for (packets) |packet| {
+            var message = wire.encode(wire.request_operation, packet);
+            require(hosting.sendBounded(self.broker.endpoint, &message, self.broker.channel) == 0);
+        }
+        while (pair.step()) {
+            var message: abi.Message = undefined;
+            const received = self.receive(&message, 10);
+            if (received == @intFromEnum(abi.Error.timeout)) continue;
+            require(received == 0);
+            if (self.notice(&message)) continue;
+            require(pair.push(&message));
+            if (pair.take()) |ready| {
+                for (ready, offered) |value, item| require(value.state == .running and value.rpc != 0 and value.attempt == 1 and !value.verified and
+                    value.input == item.input and value.input_issuer == item.input_issuer and
+                    value.input_length == item.input_length and value.endpoint == item.endpoint);
+                return ready;
+            }
+        }
+        require(false);
+        unreachable;
+    }
+    fn releaseStage(self: *Requester, staged: wire.Snapshot) void {
+        const released = self.snapshotValue(.{ .id = self.nextId(), .command = .stage, .token = staged.token, .data = staged.rpc });
+        require(released.state == .running and released.rpc == staged.rpc and released.attempt == staged.attempt and
+            released.endpoint == staged.endpoint and released.input == staged.input and !released.verified);
+    }
     fn status(self: *Requester, token: u64) wire.Snapshot {
         return self.snapshotValue(.{ .id = self.nextId(), .command = .status, .token = token });
     }
@@ -320,13 +351,12 @@ pub fn run(info: abi.BootInfo) noreturn {
 
     const active = requester.offer(requester.capture(alpha, source.changed, false), false);
     const sibling = requester.offer(requester.capture(beta, @import("hosting_storage.zig").beta, false), false);
-    _ = requester.accept(sibling);
-    _ = requester.accept(active);
-    require(syscall.sleep(6) == 0);
+    const staged = requester.stagePair(.{ active, sibling });
     requester.control(active.input, active.endpoint, .revoke);
     requester.cancel(active);
     const live = requester.status(sibling.token);
     require(live.state == .running and live.endpoint == sibling.endpoint);
+    requester.releaseStage(staged[1]);
     requester.verifyReceipt(sibling, 1, false);
     require(requester.status(active.token).state == .cancelled);
     requester.retire(active);

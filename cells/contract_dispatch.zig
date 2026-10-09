@@ -5,6 +5,7 @@ const core = @import("contract_core.zig");
 const wire = core.wire;
 pub const Dispatch = union(enum) {
     ignored: void,
+    pending: wire.Packet,
     snapshot: struct { request: wire.Packet, value: wire.Snapshot, new_offer: bool = false },
     reaped: wire.Packet,
     failure: struct { request: wire.Packet, reason: core.Error },
@@ -72,6 +73,10 @@ pub fn dispatch(table: *core.Broker, message: *const abi.Message, seam: anytype)
     const envelope = wire.decode(message, table.requester, wire.request_operation) orelse return .{ .ignored = {} };
     const packet = wire.decodeRequest(message, table.requester) orelse return rejected(envelope, error.invalid);
     const sender = message.sender;
+    if (packet.command == .stage) {
+        const value = seam.stage(table, message) catch |reason| return rejected(packet, reason);
+        return if (value) |snapshot| .{ .snapshot = .{ .request = packet, .value = snapshot } } else .{ .pending = packet };
+    }
     if (packet.command == .reap) {
         table.reap(sender, packet.token) catch |reason| return rejected(packet, reason);
         return .{ .reaped = packet };
@@ -95,7 +100,7 @@ pub fn dispatch(table: *core.Broker, message: *const abi.Message, seam: anytype)
             break :blk found;
         },
         .cancel => table.cancel(sender, packet.token, seam) catch |reason| return rejected(packet, reason),
-        .reap, .work, .fault, .bootstrap, .input, .analysis_tuple, .input_length, .rebind_input, .authorize_input => unreachable,
+        .reap, .work, .fault, .bootstrap, .input, .analysis_tuple, .input_length, .rebind_input, .authorize_input, .stage => unreachable,
     };
     return .{ .snapshot = .{ .request = packet, .value = table.snapshot(record), .new_offer = new_offer } };
 }

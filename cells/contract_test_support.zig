@@ -14,6 +14,10 @@ pub const Fake = struct {
     alias_create: bool = false,
     admission_failure: bool = false, fault_during_settle: bool = false, restart_during_settle: bool = false,
     saturated_faults: bool = false,
+    pub fn stage(_: *Fake, _: *core.Broker, _: *const abi.Message) core.Error!?wire.Snapshot {
+        // This scalar seam has no byte-profile staging service.
+        return error.invalid;
+    }
     pub fn domain(self: *Fake) ?core.Domain {
         if (self.bad_domain) return null;
         var slots: u32 = 0;

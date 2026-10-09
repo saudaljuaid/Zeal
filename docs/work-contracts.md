@@ -222,7 +222,11 @@ Requester collection has sixteen finite ten-tick receive steps. Worker bootstrap
 acknowledgement uses sixteen one-tick receive steps; the existing cold-bootstrap
 gate permits 160 one-tick rebind waits. The broker has eight FIFO deferred inbox
 entries, two worker-result staging slots and an eight-iteration result window
-that allows owner control to commit before validation. Accepted attempts expire
+that allows owner control to commit before validation. Profile 2 additionally
+permits explicit owner-scoped pins over those same two slots, with authenticated
+full-tuple readiness and exact release; see [byte analysis](file-analysis-contracts.md).
+Pins retain the same expiry bound and add 160 bytes within the unchanged broker
+private allocation. Accepted attempts expire
 after 160 broker receive iterations. These are finite state-machine bounds, not
 CPU reservations, wall-clock leases or latency guarantees. Partial reply enqueue
 retains the owner-scoped record for resynchronization.

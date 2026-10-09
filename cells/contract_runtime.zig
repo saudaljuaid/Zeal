@@ -9,6 +9,7 @@ const hosting = @import("hosting_runtime.zig");
 const app = @import("hosting_app.zig");
 const transport = @import("contract_transport.zig");
 const analysis = @import("analysis_wire.zig");
+const staging = @import("analysis_staging.zig");
 const snapshot_client = @import("snapshot_client.zig");
 comptime {
     _ = @import("memory.zig");
@@ -127,7 +128,7 @@ const Service = struct {
     table: core.Broker,
     management: wire.Sequence = .{},
     inbox: transport.Inbox = .{},
-    deferred: union(enum) { scalar: transport.Replies, analysis: analysis.Results } = .{ .scalar = .{} },
+    deferred: union(enum) { scalar: transport.Replies, analysis: staging.Staging } = .{ .scalar = .{} },
     snapshot_rpc: snapshot_client.Client = .{},
     announced: [2]bool = .{ false, false },
     waiting: [2]u16 = .{ 0, 0 },
@@ -137,6 +138,10 @@ const Service = struct {
     fn tokenFor(self: *const Service, control: u64) u64 {
         for (self.table.records) |record| if (record.state != .free and record.worker.control == control) return record.token;
         return 0;
+    }
+    pub fn stage(self: *Service, table: *core.Broker, message: *const abi.Message) core.Error!?wire.Snapshot {
+        if (self.info.scenario != 25) return error.invalid;
+        return self.deferred.analysis.request(table, message, self);
     }
     pub fn domain(self: *Service) ?core.Domain {
         var status: abi.DomainStatus = undefined;
@@ -384,7 +389,7 @@ const Service = struct {
         const result = dispatcher.dispatch(&self.table, message, self);
         self.terminalEvidence();
         switch (result) {
-            .ignored => {},
+            .ignored, .pending => {},
             .failure => |failure| self.failureReply(failure.request, failure.reason),
             .snapshot => |reply| {
                 if (reply.new_offer) self.offerEvidence(self.table.status(self.info.parent_endpoint, reply.value.token) catch {
@@ -415,18 +420,10 @@ const Service = struct {
     }
     fn deferReply(self: *Service, message: abi.Message) void {
         if (self.info.scenario == 25) {
-            const envelope = wire.decode(&message, message.sender, wire.reply_operation) orelse return;
-            if (envelope.command != .work and envelope.command != .analysis_tuple) return;
-            const record = self.table.status(self.info.parent_endpoint, envelope.token) catch {
-                report(81, envelope.token, envelope.id);
-                return;
-            };
-            if (record.state != .running or record.worker.endpoint != message.sender or record.rpc != envelope.id or record.attempt != envelope.detail) {
-                report(81, envelope.token, envelope.id);
-                return;
-            }
-            if (self.deferred.analysis.push(&message)) |candidate| {
-                if (self.deferred.analysis.hold(candidate)) report(86, candidate.token, candidate.id) else report(81, candidate.token, candidate.id);
+            switch (self.deferred.analysis.push(&self.table, &message)) {
+                .ignored => {},
+                .held => |candidate| report(86, candidate.token, candidate.id),
+                .rejected => |packet| report(81, packet.token, packet.id),
             }
             return;
         }
@@ -466,8 +463,9 @@ const Service = struct {
             };
             if (previous == .running and record.state == .recovering) {
                 if (self.info.scenario == 25) {
-                    if (self.deferred.analysis.contains(record.token)) report(81, record.token, record.rpc);
-                    self.deferred.analysis.release(record.token);
+                    if (self.deferred.analysis.take(record.token)) |candidate| {
+                        _ = self.table.deliverAnalysis(candidate, self) catch { report(81, candidate.token, candidate.id); };
+                    }
                 }
                 report(82, record.token, endpoint);
             }
@@ -479,7 +477,8 @@ const Service = struct {
         // faulted attempt merely because its bounded private window matured.
         self.observeLifecycle(true);
         if (self.info.scenario == 25) {
-            for (self.deferred.analysis.advance()) |pending| {
+            for (self.deferred.analysis.ready(&self.table)) |pending| if (pending) |reply| self.response(reply.request, reply.snapshot);
+            for (self.deferred.analysis.advance(&self.table)) |pending| {
                 const candidate = pending orelse continue;
                 _ = self.table.deliverAnalysis(candidate, self) catch {
                     report(81, candidate.token, candidate.id);

@@ -7,6 +7,7 @@ const storage_wire = @import("storage_wire.zig");
 const wire = @import("snapshot_wire.zig");
 const snapshot = @import("snapshot.zig");
 const storage = @import("storage.zig");
+const receive = @import("native_receive.zig");
 
 pub const Client = struct {
     sequence: storage_wire.Sequence = .{},
@@ -34,14 +35,25 @@ pub const Client = struct {
         return self.controlTransactionWith(issuer, transaction, subject, peer, action, &inbox);
     }
 
-    pub fn controlTransactionWith(_: *Client, issuer: u64, transaction: u64, subject: u64, peer: u64, action: wire.Action, inbox: anytype) ?wire.ControlReply {
-        if (issuer == 0 or transaction == 0) return null;
+    pub fn controlTransactionWith(self: *Client, issuer: u64, transaction: u64, subject: u64, peer: u64, action: wire.Action, inbox: anytype) ?wire.ControlReply {
+        var io: KernelIo = .{};
+        return self.controlTransactionWithIo(issuer, transaction, subject, peer, action, inbox, &io);
+    }
+
+    pub fn controlTransactionWithIo(_: *Client, issuer: u64, transaction: u64, subject: u64, peer: u64, action: wire.Action, inbox: anytype, io: anytype) ?wire.ControlReply {
+        if (issuer == 0 or transaction == 0 or io.filesystem() != issuer) return null;
         var request = wire.control(transaction, subject, peer, action);
-        if (runtime.sendBounded(issuer, &request, .snapshot_control) != 0) return null;
-        for (0..8) |_| {
+        if (io.send(issuer, &request, .snapshot_control) != 0) return null;
+        var pending: receive.Budget = .{ .endpoint = issuer };
+        while (pending.canReceive()) {
             if (inbox.messages.len != 0 and inbox.count == inbox.messages.len) return null;
             var message: abi.Message = undefined;
-            if (syscall.receiveWait(&message, 10) != 0 or syscall.lookup(.filesystem) != issuer) return null;
+            const result = io.receive(&message, receive.ticks);
+            switch (pending.received(io.filesystem(), result)) {
+                .retry => continue,
+                .failed => return null,
+                .message => {},
+            }
             if (wire.decodeControlReply(&message, issuer, transaction, action)) |reply| return reply;
             // A stale service reply is discarded, never reinterpreted as work.
             if (message.operation != @intFromEnum(abi.Operation.snapshot_reply) and !inbox.push(message)) return null;
@@ -60,6 +72,9 @@ pub const Client = struct {
     pub fn readWith(self: *Client, reference: snapshot.Ref, offset: u16, count: u8, inbox: anytype) ?wire.ReadReply {
         return self.readOperationWith(.snapshot_read, reference, offset, count, 0, inbox);
     }
+    pub fn readWithIo(self: *Client, reference: snapshot.Ref, offset: u16, count: u8, inbox: anytype, io: anytype) ?wire.ReadReply {
+        return self.readOperationWithIo(.snapshot_read, reference, offset, count, 0, inbox, io);
+    }
     pub fn releaseWith(self: *Client, reference: snapshot.Ref, inbox: anytype) ?wire.ReadReply {
         return self.readOperationWith(.snapshot_release, reference, 0, 0, 0, inbox);
     }
@@ -71,14 +86,25 @@ pub const Client = struct {
         return self.releaseWithBound(reference, reader, &inbox);
     }
     fn readOperationWith(self: *Client, operation: abi.Operation, reference: snapshot.Ref, offset: u16, count: u8, reader: u64, inbox: anytype) ?wire.ReadReply {
+        var io: KernelIo = .{};
+        return self.readOperationWithIo(operation, reference, offset, count, reader, inbox, &io);
+    }
+    fn readOperationWithIo(self: *Client, operation: abi.Operation, reference: snapshot.Ref, offset: u16, count: u8, reader: u64, inbox: anytype, io: anytype) ?wire.ReadReply {
+        if (reference.issuer == 0 or io.filesystem() != reference.issuer) return null;
         const transaction = self.sequence.take() orelse return null;
         const expected: wire.Read = .{ .transaction = transaction, .reference = reference, .offset = offset, .count = count };
         var request = if (operation == .snapshot_release) wire.release(transaction, reference, reader) else wire.read(operation, transaction, reference, offset, count);
-        if (runtime.sendBounded(reference.issuer, &request, operation) != 0) return null;
-        for (0..8) |_| {
+        if (io.send(reference.issuer, &request, operation) != 0) return null;
+        var pending: receive.Budget = .{ .endpoint = reference.issuer };
+        while (pending.canReceive()) {
             if (inbox.messages.len != 0 and inbox.count == inbox.messages.len) return null;
             var message: abi.Message = undefined;
-            if (syscall.receiveWait(&message, 10) != 0 or syscall.lookup(.filesystem) != reference.issuer) return null;
+            const result = io.receive(&message, receive.ticks);
+            switch (pending.received(io.filesystem(), result)) {
+                .retry => continue,
+                .failed => return null,
+                .message => {},
+            }
             if (wire.decodeReadReply(&message, expected)) |reply| return reply;
             if (message.operation != @intFromEnum(abi.Operation.snapshot_reply) and !inbox.push(message)) return null;
         }
@@ -90,14 +116,30 @@ pub const Client = struct {
         return self.collectWith(reference, length, out, &inbox);
     }
     pub fn collectWith(self: *Client, reference: snapshot.Ref, length: u8, out: *[snapshot.byte_limit]u8, inbox: anytype) bool {
+        var io: KernelIo = .{};
+        return self.collectWithIo(reference, length, out, inbox, &io);
+    }
+    pub fn collectWithIo(self: *Client, reference: snapshot.Ref, length: u8, out: *[snapshot.byte_limit]u8, inbox: anytype, io: anytype) bool {
         var reader = Reader.init(reference, length) orelse return false;
         while (!reader.complete) {
             const planned = reader.next().?;
-            const reply = self.readWith(reference, planned.offset, planned.count, inbox) orelse return false;
+            const reply = self.readWithIo(reference, planned.offset, planned.count, inbox, io) orelse return false;
             if (!reader.accept(&reply)) return false;
         }
         out.* = reader.bytes;
         return true;
+    }
+};
+
+const KernelIo = struct {
+    pub fn filesystem(_: *KernelIo) u64 {
+        return syscall.lookup(.filesystem);
+    }
+    pub fn send(_: *KernelIo, endpoint: u64, request: *const abi.Message, operation: abi.Operation) i32 {
+        return runtime.sendBounded(endpoint, request, operation);
+    }
+    pub fn receive(_: *KernelIo, message: *abi.Message, ticks: u64) i32 {
+        return @intCast(syscall.receiveWait(message, ticks));
     }
 };
 

@@ -8,7 +8,7 @@ pub const contract_tag: u64 = 0x80;
 pub const serial_limit: u64 = (1 << 23) - 1;
 pub const generation_limit: u64 = (1 << 24) - 1;
 pub const snapshot_parts = 8;
-pub const Command = enum(u8) { offer = 1, accept, status, cancel, receipt, reap, work, fault, bootstrap, input, analysis_tuple, input_length, rebind_input, authorize_input };
+pub const Command = enum(u8) { offer = 1, accept, status, cancel, receipt, reap, work, fault, bootstrap, input, analysis_tuple, input_length, rebind_input, authorize_input, stage };
 pub const Kind = enum(u8) { request, response, snapshot, failure };
 pub const Packet = struct { id: u64, command: Command, kind: Kind = .request, detail: u8 = 0, token: u64 = 0, data: u64 = 0 };
 pub const State = enum(u8) { free, offered, running, recovering, completed, cancelled, failed };
@@ -55,7 +55,7 @@ pub fn encode(operation: u32, packet: Packet) abi.Message {
 }
 pub fn decode(message: *const abi.Message, endpoint: u64, operation: u32) ?Packet {
     if (endpoint == 0 or message.sender != endpoint or message.operation != operation or message.length != 32 or
-        message.payload[8] != version or message.payload[9] < 1 or message.payload[9] > @intFromEnum(Command.authorize_input) or
+        message.payload[8] != version or message.payload[9] < 1 or message.payload[9] > @intFromEnum(Command.stage) or
         message.payload[10] > @intFromEnum(Kind.failure) or get64(&message.payload, 0) == 0) return null;
     for (12..16) |index| if (message.payload[index] != 0) return null;
     return .{ .id = get64(&message.payload, 0), .command = @enumFromInt(message.payload[9]), .kind = @enumFromInt(message.payload[10]), .detail = message.payload[11], .token = get64(&message.payload, 16), .data = get64(&message.payload, 24) };
@@ -66,6 +66,7 @@ pub fn decodeRequest(message: *const abi.Message, endpoint: u64) ?Packet {
     switch (packet.command) {
         .offer => if ((packet.detail != profile and packet.detail != 2) or (packet.detail == profile and packet.token != 0) or (packet.detail == 2 and packet.token == 0)) return null,
         .accept => if ((packet.detail != profile and packet.detail != 2) or tokenSlot(packet.token) == null) return null,
+        .stage => if ((packet.detail != 0 and packet.detail != 2) or packet.data == 0 or tokenSlot(packet.token) == null) return null,
         .status => if (packet.detail != 0 or (packet.token == 0 and packet.data == 0) or
             (packet.token != 0 and (packet.data != 0 or tokenSlot(packet.token) == null))) return null,
         .cancel, .receipt, .reap => if (packet.detail != 0 or packet.data != 0 or tokenSlot(packet.token) == null) return null,
