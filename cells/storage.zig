@@ -17,6 +17,7 @@ pub const Status = enum(i32) {
     too_large = -6,
     no_space = -7,
     timeout = -8,
+    not_found = -9,
 };
 
 fn rangeEnd(offset: u32, count: u32) ?u32 {
@@ -173,6 +174,19 @@ pub const Fs = struct {
         };
         @memcpy(plan.name[0..name.len], name);
         return plan;
+    }
+
+    // Read-only lookup never publishes a missing name or consumes a handle.
+    // Existing create-on-open callers retain prepareOpen's original contract.
+    pub fn prepareOpenExisting(self: *const Fs, owner: u64, name: []const u8) OpenPlan {
+        if (owner == 0 or !validName(name)) return .{ .status = .invalid };
+        if (self.block == 0) return .{ .status = .stale };
+        for (self.files) |file| {
+            if (file.used and file.name_length == name.len and
+                @import("std").mem.eql(u8, file.name[0..file.name_length], name))
+                return self.prepareOpen(owner, name);
+        }
+        return .{ .status = .not_found };
     }
 
     // For a new file the caller must first acknowledge every zero chunk through the block service.

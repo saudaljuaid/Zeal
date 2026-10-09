@@ -117,7 +117,8 @@ bool z_manifest_validate(const void *data, size_t length,
     }
     struct z_manifest parsed = { .cell_count = cell_count, .grant_count = grant_count,
         .template_count = template_count, .domain_count = domain_count };
-    unsigned total_pages = 0, active = 0;
+    unsigned total_pages = 0, active = 0, consoles = 0;
+    bool console_configuration = false;
     for (unsigned i = 0; i < cell_count; ++i) {
         const uint8_t *record = bytes + sizeof(struct z_manifest_header) +
             i * sizeof(struct z_manifest_cell);
@@ -142,8 +143,12 @@ bool z_manifest_validate(const void *data, size_t length,
                 return fail(error, Z_MANIFEST_IDENTITY_ERROR);
         if (!valid_name(cell->name))
             return fail(error, Z_MANIFEST_NAME_ERROR);
-        if (cell->flags & ~((uint32_t)Z_MANIFEST_ACTIVE))
+        if (cell->flags & ~((uint32_t)(Z_MANIFEST_ACTIVE | Z_MANIFEST_CONSOLE)))
             return fail(error, Z_MANIFEST_RESERVED_ERROR);
+        if (cell->flags & Z_MANIFEST_CONSOLE) {
+            if (!(cell->flags & Z_MANIFEST_ACTIVE) || ++consoles > 1)
+                return fail(error, Z_MANIFEST_CONFIG_ERROR);
+        }
         active += !!(cell->flags & Z_MANIFEST_ACTIVE);
         if (cell->abi != Z_MANIFEST_ABI)
             return fail(error, Z_MANIFEST_ABI_ERROR);
@@ -165,11 +170,14 @@ bool z_manifest_validate(const void *data, size_t length,
             return fail(error, Z_MANIFEST_BUDGET_ERROR);
         if (cell->boot_config > Z_MANIFEST_CONFIG_MAX)
             return fail(error, Z_MANIFEST_CONFIG_ERROR);
+        console_configuration |= cell->boot_config == 26 || cell->boot_config == 27;
         if (cell->restart_limit != Z_MANIFEST_RESTART_LIMIT ||
             cell->restart_delay != Z_MANIFEST_RESTART_DELAY)
             return fail(error, Z_MANIFEST_LIFECYCLE_ERROR);
     }
     if (active == 0)
+        return fail(error, Z_MANIFEST_CONFIG_ERROR);
+    if (console_configuration && (consoles != 1 || template_count || domain_count))
         return fail(error, Z_MANIFEST_CONFIG_ERROR);
     for (unsigned i = 0; i < grant_count; ++i) {
         const uint8_t *record = bytes + sizeof(struct z_manifest_header) +
@@ -236,7 +244,7 @@ bool z_manifest_validate(const void *data, size_t length,
             image->length > config->image_budget ||
             !z_manifest_memory_pages(config->stack_budget, config->writable_budget, &stack, &heap))
             return fail(error, Z_MANIFEST_BUDGET_ERROR);
-        if (config->boot_config > Z_MANIFEST_CONFIG_MAX)
+        if (config->boot_config > 25)
             return fail(error, Z_MANIFEST_CONFIG_ERROR);
         if (config->restart_limit != Z_MANIFEST_RESTART_LIMIT ||
             config->restart_delay != Z_MANIFEST_RESTART_DELAY)
@@ -282,7 +290,7 @@ bool z_manifest_validate(const void *data, size_t length,
         if (domain->owner_identity != 400 || creator->image != 4 ||
             !(creator->flags & Z_MANIFEST_ACTIVE) || cell_count != Z_MANIFEST_CELL_MAX ||
             active != Z_MANIFEST_CELL_MAX || creator->boot_config < 21 ||
-            creator->boot_config > Z_MANIFEST_CONFIG_MAX ||
+            creator->boot_config > 25 ||
             domain->slot_limit == 0 || domain->slot_limit > Z_MANIFEST_DYNAMIC_SLOTS ||
             domain->page_limit == 0 || domain->page_limit > Z_MANIFEST_DYNAMIC_PAGES ||
             domain->max_depth == 0 || domain->max_depth > Z_MANIFEST_DEPTH_MAX ||

@@ -43,6 +43,20 @@ make run
 make test
 ```
 
+For a plain interactive serial console, run:
+
+```sh
+make interactive
+```
+
+At `zeal>`, type `help`, `version`, `info`, or `cat /hello`. QEMU receives real
+terminal input; Ctrl-C stops it. This configuration keeps running until the
+host terminates it. The console parser and file client execute in an isolated
+ring-3 cell, with explicit serial permission and bounded checked device calls.
+See [console contracts](docs/console.md) for syntax, editing, byte rendering,
+timeouts, limits and the finite real-input acceptance test. The default demo
+and every existing research scenario remain available.
+
 See [building](docs/building.md), [architecture](docs/architecture.md),
 [storage contracts](docs/storage.md), [wait contracts](docs/waits.md), and
 [hosting contracts](docs/hosting-policy.md), [management ABI](docs/hosting-abi.md),

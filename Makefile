@@ -21,17 +21,20 @@ ZFLAGS := -target x86_64-freestanding-none -mcpu=baseline-sse-sse2 -mno-red-zone
 CELLS := block filesystem client probe supervisor worker
 COBJS := $(COMMON)/ipc.o $(COMMON)/runtime.o $(COMMON)/arch.o \
          $(COMMON)/manifest.o $(COMMON)/memory.o $(COMMON)/wait.o $(COMMON)/hosting.o
+COBJS += $(COMMON)/console.o
 AOBJS := $(COMMON)/entry.o $(COMMON)/traps.o
 BOBJS := $(addprefix $(COMMON)/,$(addsuffix .o,$(CELLS)))
 HEADERS := $(wildcard include/zeal/*.h)
 
-.PHONY: all run test test-host test-qemu clean FORCE
+.PHONY: all run interactive test test-host test-qemu test-console clean FORCE
 all: $(BUILD)/zeal.img
 
 $(COMMON) $(BUILD):
 	mkdir -p $@
 
 $(COMMON)/ipc.o: kernel/ipc.c $(HEADERS) | $(COMMON)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(COMMON)/console.o: kernel/console.c $(HEADERS) | $(COMMON)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(COMMON)/hosting.o: kernel/hosting.c $(HEADERS) | $(COMMON)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -64,15 +67,17 @@ $(COMMON)/%.o: $(COMMON)/%.bin
 
 $(BUILD)/config: FORCE | $(BUILD)
 	$(PYTHON) -c 'from pathlib import Path; p=Path("$@"); s="$(SCENARIO) $(TEST) $(SOLO)\n"; p.write_text(s) if not p.exists() or p.read_text()!=s else None'
-MANIFEST_SOURCE := $(if $(filter 25,$(SCENARIO)),cells/analysis.toml,$(if $(filter 24,$(SCENARIO)),cells/contracts.toml,$(if $(filter 21 22 23,$(SCENARIO)),cells/hosting.toml,cells/manifest.toml)))
+MANIFEST_SOURCE := $(if $(filter 26 27,$(SCENARIO)),cells/console.toml,$(if $(filter 25,$(SCENARIO)),cells/analysis.toml,$(if $(filter 24,$(SCENARIO)),cells/contracts.toml,$(if $(filter 21 22 23,$(SCENARIO)),cells/hosting.toml,cells/manifest.toml))))
 $(BUILD)/manifest.bin: $(MANIFEST_SOURCE) tools/manifest.py $(BUILD)/config \
 	$(addprefix $(COMMON)/,$(addsuffix .bin,$(CELLS))) | $(BUILD)
 	$(PYTHON) tools/manifest.py $< $@ $(COMMON)/block.bin $(COMMON)/filesystem.bin \
 	  $(COMMON)/client.bin $(COMMON)/probe.bin $(COMMON)/supervisor.bin $(COMMON)/worker.bin --scenario $(SCENARIO) --solo $(SOLO)
 $(BUILD)/manifest_data.o: $(BUILD)/manifest.bin
 	cd $(BUILD) && $(LD) -r -b binary manifest.bin -o manifest_data.o
-$(BUILD)/main.o: kernel/main.c $(HEADERS) $(BUILD)/config
-	$(CC) $(CFLAGS) -DZ_SCENARIO=$(SCENARIO) -DZ_TEST=$(TEST) -DZ_SOLO=$(SOLO) -c $< -o $@
+$(BUILD)/build_id.h: FORCE tools/build_id.py | $(BUILD)
+	$(PYTHON) tools/build_id.py $@
+$(BUILD)/main.o: kernel/main.c $(HEADERS) $(BUILD)/config $(BUILD)/build_id.h
+	$(CC) $(CFLAGS) -include $(BUILD)/build_id.h -DZ_SCENARIO=$(SCENARIO) -DZ_TEST=$(TEST) -DZ_SOLO=$(SOLO) -c $< -o $@
 
 $(BUILD)/kernel.elf: $(AOBJS) $(COBJS) $(BUILD)/manifest_data.o $(BOBJS) $(BUILD)/main.o $(COMMON)/libpolicy.a arch/x86_64/kernel.ld
 	$(LD) -m elf_x86_64 --gc-sections -z noexecstack -T arch/x86_64/kernel.ld \
@@ -91,6 +96,11 @@ run: all
 	$(QEMU) $(QEMU_FLAGS) -machine pc -accel tcg -cpu max -m 64M -smp 1 \
 	  -drive file=$(BUILD)/zeal.img,format=raw,if=ide -display none -serial stdio \
 	  -monitor none -nic none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=4
+
+# QEMU serial stdio supplies the host terminal's real input in raw mode.
+# The normal console never exits itself or runs a compiled command script.
+interactive:
+	$(MAKE) BUILD=build/interactive SCENARIO=26 TEST=0 SOLO=-1 run
 
 $(COMMON)/libpolicy-host.a: policy/lib.rs policy/capability.rs policy/hosting.rs | $(COMMON)
 	$(RUSTC) --edition=2021 --crate-type staticlib -C panic=abort -C opt-level=2 $< -o $@
@@ -117,13 +127,17 @@ $(COMMON)/memory-tests: tests/memory.c kernel/memory.c kernel/manifest.c $(HEADE
 $(COMMON)/manifest-tests: tests/manifest.c kernel/manifest.c $(HEADERS)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
 	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude tests/manifest.c kernel/manifest.c -o $@
-test-host: $(COMMON)/hosting-tests $(COMMON)/policy-tests $(COMMON)/ipc-tests $(COMMON)/wait-tests $(COMMON)/memory-tests $(COMMON)/manifest-tests
+$(COMMON)/console-tests: tests/console.c kernel/console.c kernel/memory.c kernel/manifest.c $(HEADERS)
+	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fno-omit-frame-pointer \
+	  -fsanitize=address,undefined -fno-pie -no-pie -Iinclude tests/console.c kernel/console.c kernel/memory.c kernel/manifest.c -o $@
+test-host: $(COMMON)/hosting-tests $(COMMON)/policy-tests $(COMMON)/ipc-tests $(COMMON)/wait-tests $(COMMON)/memory-tests $(COMMON)/manifest-tests $(COMMON)/console-tests
 	timeout 60s $(COMMON)/policy-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/ipc-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/wait-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/memory-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/manifest-tests
 	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/hosting-tests
+	ASAN_OPTIONS=detect_leaks=1 timeout 60s $(COMMON)/console-tests
 	timeout 60s $(ZIG) test cells/protocol.zig
 	timeout 60s $(ZIG) test cells/storage_transport.zig
 	timeout 60s $(ZIG) test cells/hosting_tests.zig
@@ -131,9 +145,14 @@ test-host: $(COMMON)/hosting-tests $(COMMON)/policy-tests $(COMMON)/ipc-tests $(
 	timeout 60s $(ZIG) test cells/contract_dispatch_tests.zig
 	timeout 60s $(ZIG) test cells/snapshot_tests.zig
 	timeout 60s $(ZIG) test cells/analysis_tests.zig
+	timeout 60s $(ZIG) test cells/console_tests.zig
+	timeout 60s $(ZIG) test cells/console_storage_tests.zig
 	timeout 60s $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 test-qemu: all
 	timeout 900s $(PYTHON) tests/research.py
+	timeout 120s $(PYTHON) tests/console_acceptance.py
+test-console:
+	timeout 120s $(PYTHON) tests/console_acceptance.py
 test: test-host test-qemu
 clean:
 	rm -rf build .zig-cache zig-out

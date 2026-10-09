@@ -4,6 +4,7 @@
 #include <zeal/hosting.h>
 #include <zeal/memory.h>
 #include <zeal/wait.h>
+#include <zeal/console.h>
 
 #ifndef Z_SCENARIO
 #define Z_SCENARIO 0
@@ -14,6 +15,10 @@
 #ifndef Z_SOLO
 #define Z_SOLO -1
 #endif
+#ifndef Z_BUILD_ID
+#define Z_BUILD_ID "zeal-unversioned"
+#endif
+_Static_assert(sizeof(Z_BUILD_ID) <= Z_BUILD_ID_SIZE, "build identification must fit ABI field");
 
 extern const unsigned char _binary_block_bin_start[], _binary_block_bin_end[];
 extern const unsigned char _binary_filesystem_bin_start[], _binary_filesystem_bin_end[];
@@ -40,6 +45,7 @@ static bool contract_ok, finished;
 static unsigned wait_events[Z_CELL_COUNT], idle_events;
 static bool wait_traced[Z_CELL_COUNT], wait_trace_failed;
 static unsigned storage_events, storage_reports;
+static unsigned console_events;
 static unsigned refresh_events;
 static unsigned refresh_cell;
 static unsigned storage_stage;
@@ -272,7 +278,7 @@ static void trace_storage(const struct z_message *message, unsigned cell, uint64
     field("offset", storage_word(message->payload + 16, 4));
     field("result", storage_word(message->payload + 20, 4));
     field("data", storage_word(message->payload + 24, 8));
-    if (Z_SCENARIO == 25) {
+    if (Z_SCENARIO == 25 || Z_SCENARIO == 27) {
         field("sender", message->sender);
         field("raw0", storage_word(message->payload, 8)); field("raw1", storage_word(message->payload + 8, 8));
         field("raw2", storage_word(message->payload + 16, 8)); field("raw3", storage_word(message->payload + 24, 8));
@@ -322,7 +328,7 @@ static bool receive_copy(void *context, unsigned cell, uint64_t generation,
     if (message == NULL) return arch_cell_copy_valid(cell, destination, sizeof(*message));
     if (!arch_cell_copy_out(cell, destination, message, sizeof(*message))) return false;
     trace_host_ipc(message, cell, z_policy_handle(&broker.policies[cell], cell), 0, Z_OK, true);
-    if (Z_SCENARIO == 25) trace_storage(message, cell, z_policy_handle(&broker.policies[cell], cell), 0, Z_OK, true);
+    if (Z_SCENARIO == 25 || Z_SCENARIO == 27) trace_storage(message, cell, z_policy_handle(&broker.policies[cell], cell), 0, Z_OK, true);
     return true;
 }
 
@@ -351,6 +357,7 @@ static void complete_waits(void)
 static void panic(const char *reason) __attribute__((noreturn));
 static void panic(const char *reason)
 {
+    serial_trace_fatal();
     serial_puts("PANIC "); serial_puts(reason); serial_puts("\n"); arch_finish(2);
 }
 
@@ -381,6 +388,7 @@ static void load_manifest(void)
     enum z_manifest_error error;
     if (!z_manifest_validate(_binary_manifest_bin_start, length, catalog,
                              sizeof(catalog) / sizeof(catalog[0]), &manifest, &error)) {
+        serial_trace_fatal();
         serial_puts("MANIFEST_REJECT reason="); serial_puts(z_manifest_diagnostic(error));
         serial_puts("\n"); arch_finish(3);
     }
@@ -725,11 +733,126 @@ static int hosting_report(struct z_frame *frame)
     return Z_OK;
 }
 
+struct console_transfer {
+    unsigned cell;
+    size_t used;
+    uint8_t bytes[Z_CONSOLE_LIMIT];
+};
+
+static bool console_range(void *context, uint64_t address, size_t length, bool write)
+{
+    const struct console_transfer *transfer = context;
+    return arch_cell_range(transfer->cell, address, length, write);
+}
+
+static bool console_copy_in(void *context, void *destination, uint64_t source, size_t length)
+{
+    const struct console_transfer *transfer = context;
+    return arch_cell_copy_in(transfer->cell, destination, source, length);
+}
+
+static bool console_copy_out(void *context, uint64_t destination, const void *source, size_t length)
+{
+    const struct console_transfer *transfer = context;
+    return arch_cell_copy_out(transfer->cell, destination, source, length);
+}
+
+static bool console_read_byte(void *context, uint8_t *byte)
+{
+    struct console_transfer *transfer = context;
+    if (transfer->used >= Z_CONSOLE_LIMIT || !serial_try_read(byte)) return false;
+    transfer->bytes[transfer->used++] = *byte;
+    return true;
+}
+
+static bool console_write_byte(void *context, uint8_t byte)
+{
+    struct console_transfer *transfer = context;
+    if (transfer->used >= Z_CONSOLE_LIMIT || !serial_try_write(byte)) return false;
+    transfer->bytes[transfer->used++] = byte;
+    return true;
+}
+
+static const struct z_console_callbacks console_callbacks = {
+    console_range, console_copy_in, console_copy_out, console_read_byte, console_write_byte,
+};
+
+static bool console_entitled(unsigned cell)
+{
+    return cell < Z_ROOT_COUNT && runtime.records[cell].origin == Z_RUNTIME_ROOT &&
+        broker.policies[cell].phase == Z_POLICY_READY &&
+        (runtime.records[cell].config.flags & (Z_MANIFEST_ACTIVE | Z_MANIFEST_CONSOLE)) ==
+            (Z_MANIFEST_ACTIVE | Z_MANIFEST_CONSOLE);
+}
+
+static bool console_trace_credit(void)
+{
+    if (Z_SCENARIO != 27) return false;
+    if (console_events < 1024) { ++console_events; return true; }
+    if (console_events == 1024) { ++console_events; serial_puts("CONSOLE_TRACE_EXHAUSTED\n"); }
+    return false;
+}
+
+static int64_t console_syscall(struct z_frame *frame)
+{
+    struct console_transfer transfer = { .cell = current };
+    bool entitled = console_entitled(current);
+    int64_t result;
+    if (frame->rax == Z_SYSTEM_INFO) {
+        const struct z_manifest_cell *config = &runtime.records[current].config;
+        struct z_system_info info = {
+            .abi = Z_ABI_VERSION, .console_limit = Z_CONSOLE_LIMIT,
+            .image_budget = config->image_budget, .stack_budget = config->stack_budget,
+            .writable_budget = config->writable_budget, .console_entitled = entitled, .ticks = ticks,
+            .build_id = Z_BUILD_ID,
+        };
+        result = z_console_system_info(&console_callbacks, &transfer, &info,
+                                        frame->rdi, frame->rsi, frame->rdx);
+        if (console_trace_credit()) {
+            event("console-system-info", current); field("privilege", frame->cs & 3);
+            field("address", frame->rdi); field("size", frame->rsi); field("reserved", frame->rdx);
+            field("result", (uint64_t)result);
+            if (result == Z_OK) {
+                field("abi", info.abi); field("console_limit", info.console_limit);
+                field("image_budget", info.image_budget); field("stack_budget", info.stack_budget);
+                field("writable_budget", info.writable_budget); field("console_entitled", info.console_entitled);
+                field("observed_tick", info.ticks);
+                for (unsigned word = 0; word < Z_BUILD_ID_SIZE / 8; ++word) {
+                    char name[] = "build0"; name[5] = (char)('0' + word);
+                    field(name, storage_word(info.build_id + word * 8, 8));
+                }
+            }
+            serial_puts("\n");
+        }
+        return result;
+    }
+    if (frame->rax == Z_CONSOLE_READ)
+        result = z_console_read(&console_callbacks, &transfer, entitled, frame->rdi, frame->rsi, frame->rdx);
+    else
+        result = z_console_write(&console_callbacks, &transfer, entitled, frame->rdi, frame->rsi, frame->rdx);
+    /* These records are emitted through debugcon only in acceptance mode;
+     * each contains bytes actually consumed or emitted by the UART operation. */
+    if ((transfer.used || result < 0) && console_trace_credit()) {
+        event(frame->rax == Z_CONSOLE_READ ? "console-input" : "console-output", current);
+        field("privilege", frame->cs & 3); field("count", transfer.used);
+        field("requested", frame->rsi); field("result", (uint64_t)result);
+        field("address", frame->rdi); field("reserved", frame->rdx);
+        for (unsigned word = 0; word < 8; ++word) {
+            char name[] = "data0"; name[4] = (char)('0' + word);
+            field(name, storage_word(transfer.bytes + word * 8, 8));
+        }
+        serial_puts("\n");
+    }
+    return result;
+}
+
 static int64_t syscall(struct z_frame *frame)
 {
     struct z_message message;
     uint64_t argument = frame->rdi;
     switch (frame->rax) {
+    case Z_CONSOLE_READ: case Z_CONSOLE_WRITE: case Z_SYSTEM_INFO:
+        return console_syscall(frame);
     case Z_CREATE: case Z_CELL_STATUS: case Z_CELL_STOP: case Z_CELL_REAP:
     case Z_CELL_REBIND: case Z_CREATION_REVOKE: case Z_DOMAIN_STATUS:
         return hosting_management(frame);
@@ -813,6 +936,12 @@ static int64_t syscall(struct z_frame *frame)
         return result;
     }
     case Z_REPORT:
+        if ((Z_SCENARIO == 26 || Z_SCENARIO == 27) && runtime.records[current].role == Z_PROBE &&
+            (argument == 110 || argument == 111)) {
+            if (argument == 111 && frame->rsi != 2) return Z_INVALID;
+            event(argument == 110 ? "console-progress" : "console-denied-verified", current);
+            field("value", frame->rsi); serial_puts("\n"); return Z_OK;
+        }
         if (Z_SCENARIO >= 21 && Z_SCENARIO <= 25 &&
             ((argument >= 40 && argument <= 59) || argument == 64 || argument == 65 ||
              ((Z_SCENARIO == 24 || Z_SCENARIO == 25) && argument >= 70 && argument <= 87) ||
@@ -923,6 +1052,9 @@ static int64_t syscall(struct z_frame *frame)
 
 static void research_check(bool hosting_cycle_boundary)
 {
+    /* Interactive configurations live until the host terminates QEMU. The
+     * acceptance harness validates its finite transcript before QMP quit. */
+    if (Z_SCENARIO == 26 || Z_SCENARIO == 27) return;
     if (Z_SCENARIO >= 21 && Z_SCENARIO <= 25) {
         /* A PIT can arrive after an FS reply but before the client's byte
          * verification report. Complete only at the client's fully verified
@@ -1001,6 +1133,7 @@ struct z_frame *kernel_trap(struct z_frame *frame)
 {
     if ((frame->cs & 3) != 3) {
         if (frame->vector == 32) { advance_tick(); arch_eoi(); return frame; }
+        serial_trace_fatal();
         serial_puts("KERNEL_FAULT"); field("vector", frame->vector);
         field("rip", frame->rip); serial_puts("\n"); panic("trusted kernel fault");
     }
@@ -1044,7 +1177,8 @@ struct z_frame *kernel_trap(struct z_frame *frame)
 
 void kernel_main(void)
 {
-    serial_init(); serial_puts("ZEAL boot abi=4 x86_64\n");
+    serial_init(); serial_trace_mode(Z_SCENARIO == 26 || Z_SCENARIO == 27, Z_SCENARIO == 27);
+    serial_puts("ZEAL boot abi=4 x86_64\n");
     arch_init(); load_manifest(); z_broker_init(&broker);
     z_wait_init(&waits);
     z_broker_refresh_state_init(&root_refresh);
@@ -1072,6 +1206,7 @@ void kernel_main(void)
         }
         if (!arch_space_init(i, images[manifest.cells[i].image - 1],
                              image_lengths[manifest.cells[i].image - 1], &manifest.cells[i])) {
+            serial_trace_fatal();
             serial_puts("MANIFEST_REJECT reason=cell memory allocation cell="); serial_hex(i);
             serial_puts("\n"); arch_finish(3);
         }

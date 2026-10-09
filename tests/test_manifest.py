@@ -59,6 +59,27 @@ class ManifestCompilerTests(unittest.TestCase):
         self.assertEqual([manifest.struct.unpack_from("<I", storage, 40 + n * 64 + 8)[0]
                           for n in range(4)], [4] * 4)
 
+    def test_console_authority_is_explicit_single_root_and_nondelegable(self):
+        text = self.text.replace('name = "client"', 'name = "client"\nconsole = true', 1)
+        for scenario in (26, 27):
+            artifact = self.compile(text, scenario=scenario)
+            flags = [manifest.struct.unpack_from("<I", artifact, 40 + n * 64 + 12)[0] for n in range(4)]
+            self.assertEqual(flags, [1, 1, 5, 1])
+            self.assertEqual(manifest.struct.unpack_from("<I", artifact, 40 + 2 * 64 + 36)[0], scenario)
+            self.assertEqual(manifest.struct.unpack_from("<I", artifact, 40 + 3 * 64 + 36)[0], scenario)
+            self.assertEqual(len(artifact), 40 + 4 * 64 + 6 * 16)
+            self.rejects(self.text, scenario=scenario)
+            self.rejects(text, scenario=scenario, solo=2)
+        self.rejects(text.replace('name = "block"', 'name = "block"\nconsole = true', 1))
+        self.rejects(text.replace('console = true', 'console = 1', 1))
+        self.rejects(text.replace('console = true', 'console = "true"', 1))
+        self.rejects(self.text.replace('boot_config = 0', 'boot_config = 26', 1))
+        disabled = self.compile(text.replace('console = true', 'console = false', 1))
+        self.assertEqual(manifest.struct.unpack_from("<I", disabled, 40 + 2 * 64 + 12)[0], 1)
+        # A solo boot of another root drops the inactive entitlement.
+        artifact = self.compile(text, solo=0)
+        self.assertEqual(manifest.struct.unpack_from("<I", artifact, 40 + 2 * 64 + 12)[0], 0)
+
     def test_rejects_bad_versions_ids_names_images_entries_and_widths(self):
         for old, new in (("version = 2", "version = 1"),
                          ("identity = 100", "identity = 0"),

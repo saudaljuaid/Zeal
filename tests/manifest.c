@@ -153,6 +153,19 @@ static void page_rounding_boundaries(void)
     assert(!z_manifest_memory_pages(4096, 4096, &stack, NULL));
 }
 
+static void console_entitlement_boundaries(void)
+{
+    const size_t client = HEADER_SIZE + 2 * 64;
+    base_manifest(); put32(client + 12, Z_MANIFEST_ACTIVE | Z_MANIFEST_CONSOLE);
+    put32(client + 36, 26); assert(validate());
+    assert(parsed.cells[2].flags == (Z_MANIFEST_ACTIVE | Z_MANIFEST_CONSOLE));
+    put32(client + 36, 27); assert(validate());
+    put32(HEADER_SIZE + 12, Z_MANIFEST_ACTIVE | Z_MANIFEST_CONSOLE); assert(!validate());
+    base_manifest(); put32(client + 12, Z_MANIFEST_CONSOLE); assert(!validate());
+    base_manifest(); put32(client + 36, 26); assert(!validate());
+    base_manifest(); put32(client + 12, Z_MANIFEST_ACTIVE | 8); assert(!validate());
+}
+
 #define TEMPLATE_AT BASE_SIZE
 #define DOMAIN_AT (TEMPLATE_AT + 2 * 64)
 
@@ -205,6 +218,7 @@ static void sealed_template_and_domain_boundaries(void)
     reject_host_at(TEMPLATE_AT, 9); reject_host_at(TEMPLATE_AT + 4, 4);
     reject_host_at(TEMPLATE_AT + 4, 9); reject_host_at(TEMPLATE_AT + 8, 3);
     reject_host_at(TEMPLATE_AT + 12, 1); reject_host_at(TEMPLATE_AT + 60, 1);
+    reject_host_at(TEMPLATE_AT + 12, Z_MANIFEST_CONSOLE);
     reject_host_at(TEMPLATE_AT + 16, (uint32_t)Z_IMAGE_BASE + 1);
     reject_host_at(TEMPLATE_AT + 24, 63); reject_host_at(TEMPLATE_AT + 24, UINT32_MAX);
     reject_host_at(TEMPLATE_AT + 28, 0); reject_host_at(TEMPLATE_AT + 28, UINT32_MAX);
@@ -256,6 +270,7 @@ int main(void)
     cell_field_boundaries();
     grant_and_catalog_boundaries();
     page_rounding_boundaries();
+    console_entitlement_boundaries();
     sealed_template_and_domain_boundaries();
     puts("C manifest: v2 header, root, template/domain, budget, lifecycle, reference, rights and sealed catalog boundaries PASS");
     return 0;

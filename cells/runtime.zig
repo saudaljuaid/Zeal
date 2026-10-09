@@ -35,8 +35,10 @@ pub fn run(comptime role: abi.Role) noreturn {
     switch (role) {
         .block => @import("storage_runtime.zig").block(),
         .filesystem => filesystem(info.generation),
-        .client => client(info.scenario),
-        .probe => if (info.scenario == 25)
+        .client => if (info.scenario == 26 or info.scenario == 27) @import("console_runtime.zig").run() else client(info.scenario),
+        .probe => if (info.scenario == 26 or info.scenario == 27)
+            @import("console_runtime.zig").probe(info.scenario)
+        else if (info.scenario == 25)
             @import("analysis_requester.zig").run(info)
         else if (info.scenario == 24)
             @import("contract_requester.zig").run(info)

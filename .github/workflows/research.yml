@@ -52,4 +52,5 @@ jobs:
             build/research/analysis-code-disassembly/**/*
             build/research/analysis-code-disassembly/**/*
             build/research/scenario-*/footprint.json
+            build/console-acceptance/**/*
           if-no-files-found: warn

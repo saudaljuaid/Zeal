@@ -38,6 +38,7 @@ pub const Request = struct {
     offset: u32,
     count: u32,
     exact_count: bool,
+    opening: bool = false,
     phase: Phase = .sending,
     sends: u8 = 0,
     receives: u8 = 0,
@@ -82,7 +83,9 @@ pub const Request = struct {
             return null;
         }
         if (wire.decodeReply(message.?, self.reply_operation, self.endpoint, self.id)) |reply| {
-            if (reply.handle != self.handle or reply.offset != self.offset or
+            if ((!self.opening and reply.handle != self.handle) or
+                (self.opening and ((reply.value == 0 and reply.handle == 0) or
+                    (reply.value != 0 and reply.handle != 0))) or reply.offset != self.offset or
                 (reply.value >= 0 and (reply.value > self.count or
                     (self.exact_count and reply.value != self.count))))
             {

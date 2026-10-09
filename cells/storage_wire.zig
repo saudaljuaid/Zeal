@@ -10,7 +10,7 @@ pub const Header = struct {
     data: [storage.chunk_size]u8,
 };
 
-pub const Open = struct { id: u64, name: []const u8 };
+pub const Open = struct { id: u64, name: []const u8, existing: bool = false };
 
 fn put64(payload: *[abi.payload_size]u8, index: usize, value: u64) void {
     for (0..8) |byte| payload[index + byte] = @truncate(value >> @intCast(byte * 8));
@@ -54,17 +54,36 @@ pub fn openRequest(id: u64, name: []const u8) abi.Message {
     return message;
 }
 
+// Additive, exactly 32-byte open-existing request. Legacy variable-length
+// opens keep create-on-open semantics. Unused name bytes and reserved bytes
+// must be zero, so no overlong name is silently truncated.
+pub fn openExistingRequest(id: u64, name: []const u8) abi.Message {
+    var message = abi.Message.empty(.file_open);
+    if (!storage.validName(name)) return message;
+    message.length = 32;
+    put64(&message.payload, 0, id);
+    @memcpy(message.payload[8..][0..name.len], name);
+    message.payload[24] = @intCast(name.len);
+    message.payload[25] = 1;
+    return message;
+}
+
 pub fn reply(operation: abi.Operation, id: u64, handle: u64, offset: u32, result: i32, data: []const u8) abi.Message {
     return request(operation, id, handle, offset, @bitCast(result), data);
 }
 
 pub fn decodeOpen(message: *const abi.Message) ?Open {
-    if (message.sender == 0 or message.operation != @intFromEnum(abi.Operation.file_open) or
-        message.length < 10 or message.length > 8 + storage.name_limit) return null;
+    if (message.sender == 0 or message.operation != @intFromEnum(abi.Operation.file_open)) return null;
+    const existing = message.length == 32;
+    if (!existing and (message.length < 10 or message.length > 8 + storage.name_limit)) return null;
+    const length: usize = if (existing) message.payload[24] else message.length - 8;
+    if (length < 2 or length > storage.name_limit) return null;
+    if (existing and (message.payload[25] != 1 or !zero(message.payload[8 + length .. 24]) or
+        !zero(message.payload[26..32]))) return null;
     const id = get64(&message.payload, 0);
-    const name = message.payload[8..message.length];
+    const name = message.payload[8..][0..length];
     if (id == 0 or !storage.validName(name)) return null;
-    return .{ .id = id, .name = name };
+    return .{ .id = id, .name = name, .existing = existing };
 }
 
 fn header(message: *const abi.Message) Header {
@@ -110,7 +129,7 @@ pub fn decodeReply(message: *const abi.Message, operation: abi.Operation, sender
     if (sender == 0 or id == 0 or message.sender != sender or message.operation != @intFromEnum(operation) or
         message.length != 32 or (operation != .block_reply and operation != .file_result)) return null;
     const result = header(message);
-    if (result.id != id or result.value < -8 or result.value > storage.chunk_size) return null;
+    if (result.id != id or result.value < -9 or result.value > storage.chunk_size) return null;
     const used: usize = if (result.value > 0) @intCast(result.value) else 0;
     if (!zero(result.data[used..])) return null;
     return result;
@@ -224,7 +243,7 @@ test "late or counterfeit replies cannot complete a fresh request after timeout 
     try testing.expect(decodeReply(&forged, .file_result, 0x102, retry) == null);
     const valid = delivered(reply(.file_result, retry, 1, 0, 8, "verified"), 0x102);
     try testing.expect(decodeReply(&valid, .file_result, 0x102, retry) != null);
-    for ([_]i32{ -9, 9, 0x7fffffff, -0x7fffffff }) |value| {
+    for ([_]i32{ -10, 9, 0x7fffffff, -0x7fffffff }) |value| {
         const malformed = delivered(reply(.file_result, retry, 1, 0, value, ""), 0x102);
         try testing.expect(decodeReply(&malformed, .file_result, 0x102, retry) == null);
     }

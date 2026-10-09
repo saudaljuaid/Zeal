@@ -72,6 +72,18 @@ pub fn boot(info: *abi.BootInfo) i64 {
     return raw(@intFromEnum(abi.Call.boot), @intFromPtr(info), 0, 0);
 }
 
+pub fn consoleRead(bytes: []u8) i64 {
+    return raw(@intFromEnum(abi.Call.console_read), @intFromPtr(bytes.ptr), bytes.len, 0);
+}
+
+pub fn consoleWrite(bytes: []const u8) i64 {
+    return raw(@intFromEnum(abi.Call.console_write), @intFromPtr(bytes.ptr), bytes.len, 0);
+}
+
+pub fn systemInfo(info: *abi.SystemInfo) i64 {
+    return raw(@intFromEnum(abi.Call.system_info), @intFromPtr(info), @sizeOf(abi.SystemInfo), 0);
+}
+
 pub fn create(request: *const abi.CreateRequest, result: *abi.CreateResult) i64 {
     return raw(@intFromEnum(abi.Call.create), @intFromPtr(request), @sizeOf(abi.CreateRequest), @intFromPtr(result));
 }

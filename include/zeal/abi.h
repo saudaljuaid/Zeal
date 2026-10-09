@@ -24,17 +24,19 @@
 #define Z_WAIT_MAX_TICKS UINT64_C(1000)
 #define Z_TERMINATION_FAULT_BASE UINT32_C(0x10000)
 #define Z_TERMINATION_INITIALIZATION 5u
+#define Z_CONSOLE_LIMIT 64u
+#define Z_BUILD_ID_SIZE 48u
 
 enum z_call {
     Z_YIELD, Z_SEND, Z_RECV, Z_LOOKUP, Z_REPORT, Z_BOOT, Z_EXIT,
     Z_CAP_FIND, Z_CAP_DELEGATE, Z_CAP_QUERY, Z_CAP_REVOKE, Z_SLEEP, Z_RECV_WAIT,
     Z_CREATE, Z_CELL_STATUS, Z_CELL_STOP, Z_CELL_REAP, Z_CELL_REBIND,
-    Z_CREATION_REVOKE, Z_DOMAIN_STATUS
+    Z_CREATION_REVOKE, Z_DOMAIN_STATUS, Z_CONSOLE_READ, Z_CONSOLE_WRITE, Z_SYSTEM_INFO
 };
 enum z_error {
     Z_OK = 0, Z_INVALID = -1, Z_DENIED = -2, Z_STALE = -3,
     Z_AGAIN = -4, Z_BAD_ADDRESS = -5, Z_TOO_LARGE = -6, Z_NO_SPACE = -7,
-    Z_TIMEOUT = -8
+    Z_TIMEOUT = -8, Z_NOT_FOUND = -9
 };
 enum z_role { Z_BLOCK, Z_FS, Z_CLIENT, Z_PROBE, Z_SUPERVISOR, Z_WORKER };
 enum z_operation {
@@ -66,6 +68,13 @@ struct z_boot_info {
     uint32_t depth;
     uint32_t identity;
     uint32_t reserved;
+};
+
+/* Additive ABI v4 call; existing boot and IPC layouts remain unchanged. */
+struct z_system_info {
+    uint32_t abi, console_limit, image_budget, stack_budget, writable_budget, console_entitled;
+    uint64_t ticks;
+    uint8_t build_id[Z_BUILD_ID_SIZE];
 };
 
 struct z_create_request {
@@ -114,6 +123,9 @@ struct z_cap_info {
 _Static_assert(sizeof(struct z_message) == 48, "message ABI");
 _Static_assert(offsetof(struct z_message, payload) == 16, "message payload ABI");
 _Static_assert(sizeof(struct z_boot_info) == 80, "boot ABI");
+_Static_assert(sizeof(struct z_system_info) == 80, "system information ABI");
+_Static_assert(offsetof(struct z_system_info, ticks) == 24, "system information ticks ABI");
+_Static_assert(offsetof(struct z_system_info, build_id) == 32, "system information build ABI");
 _Static_assert(offsetof(struct z_boot_info, endpoint) == 24, "boot endpoint ABI");
 _Static_assert(offsetof(struct z_boot_info, template_id) == 64, "boot template ABI");
 _Static_assert(sizeof(struct z_create_request) == 32, "creation request ABI");

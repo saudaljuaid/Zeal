@@ -10,7 +10,8 @@ creation; it does not change the manifest or image catalog.
 and grants creation authority to root identity 400 in hosting scenarios 21–23. The separate `cells/contracts.toml` source grants
 root 400 templates 3/4 for the native contract branch in scenario 24; old
 scenario manifests and grants retain their behavior. Configuration 24 is a
-compatible additional branch; configuration 25 remains invalid.
+compatible additional branch. Configuration 25 is the explicit byte-analysis
+composition; configurations 26/27 select the console composition.
 Root identities 100, 200, and 300 remain the block, filesystem, and existing
 storage application. They receive no creation domains. Standalone root boots
 use the ordinary manifest, with one root active and all four root slots reserved.
@@ -38,8 +39,11 @@ the shared dynamic-domain policy, including descendant domains.
 | Template | 64 | u32 identity, image, abi, flags; u64 entry; u32 image_budget, stack_budget, writable_budget, boot_config, restart_limit, restart_delay, max_descendant_depth, child_template_mask, bootstrap_recipe, reserved |
 | Root domain | 32 | u32 owner_identity, template_mask, slot_limit, page_limit, max_depth, bootstrap_recipe, reserved0, reserved1 |
 
-The magic is `0x4c41455a`, version is 2, and cell ABI is 4. Root flags permit only
-bit 0, meaning active. Grant flags and template flags are zero. Names contain
+The magic is `0x4c41455a`, version is 2, and cell ABI is 4. Root flags permit
+bit 0 (active) and bit 2 (explicit console entitlement). At most one active
+root may receive `console = true`; templates and descendants have no console
+entitlement. See [console ABI and authority](console.md). Grant flags and
+template flags are zero. Names contain
 1–15 ASCII letters, digits, underscores, or hyphens followed by zero padding.
 Template identities are 1–8; mask bit `identity - 1` selects a template. A mask
 cannot reference a template absent from the sealed artifact.

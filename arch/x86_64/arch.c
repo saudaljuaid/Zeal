@@ -73,6 +73,7 @@ static uint64_t low_directory[512] __attribute__((aligned(PAGE_SIZE)));
 static struct cell_space spaces[Z_CELL_COUNT];
 static struct z_memory_pool memory_pool;
 static unsigned active_cell = Z_CELL_COUNT;
+static bool console_serial, trusted_console_trace;
 
 static inline void out8(uint16_t port, uint8_t value)
 {
@@ -371,8 +372,39 @@ void serial_init(void)
     out8(0x3fc, 0x0b);
 }
 
+void serial_trace_mode(bool console, bool trusted)
+{
+    console_serial = console;
+    trusted_console_trace = trusted;
+}
+
+void serial_trace_fatal(void)
+{
+    /* A normal console has no trusted trace sink, so terminal failure must
+     * become visible on COM1. Acceptance diagnostics retain debugcon routing. */
+    if (console_serial && !trusted_console_trace) console_serial = false;
+}
+
+bool serial_try_read(uint8_t *byte)
+{
+    if (byte == NULL || !(in8(0x3fd) & 1)) return false;
+    *byte = in8(0x3f8);
+    return true;
+}
+
+bool serial_try_write(uint8_t byte)
+{
+    if (!(in8(0x3fd) & 0x20)) return false;
+    out8(0x3f8, byte);
+    return true;
+}
+
 static void serial_putc(char character)
 {
+    if (console_serial) {
+        if (trusted_console_trace) out8(0xe9, (uint8_t)character);
+        return;
+    }
     for (unsigned attempt = 0; attempt < 1000000; ++attempt) {
         if (in8(0x3fd) & 0x20) {
             out8(0x3f8, (uint8_t)character);

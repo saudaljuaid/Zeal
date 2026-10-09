@@ -36,6 +36,11 @@ booting any cell.
 `RESEARCH_PASS`, and continues running. Stop QEMU with Ctrl-C. Nothing is written
 to a host disk. Use `make clean` to remove generated files.
 
+`make interactive` selects scenario 26, builds `build/interactive/zeal.img`, and
+opens the plain `zeal>` command console through real COM1 terminal input. It
+runs until host termination; `make test-console` separately checks finite real
+input acceptance twice. See [console contracts](console.md).
+
 Each service and the probe can also boot alone with the same manifest format,
 supervisor, and ABI:
 
@@ -59,8 +64,10 @@ separate block and filesystem restarts, then exits QEMU when `TEST=1`; the
 external oracle also verifies its structured storage evidence. The standalone
 wait probe verifies timer wakeups while the supervisor idles. These are
 independent cell boots inside the supervisor, rather than firmware images with
-separate hardware kernels. The `SCENARIO` option selects a fault probe; `TEST=1`
-exits QEMU after checking recovery. The research runner creates separate build
+separate hardware kernels. The `SCENARIO` option selects a configuration. In the
+original research cases, `TEST=1` exits QEMU after checking recovery. Console
+acceptance (27) uses acknowledged host QMP shutdown after collecting command
+exchanges. The research runner creates separate build
 directories for each configuration. The QEMU debug-exit device reports status
 1 on a successful test boot, so a direct `make ... TEST=1 run` can report that
 nonzero status; `make test` checks it together with the trace oracle.

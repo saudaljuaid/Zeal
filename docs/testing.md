@@ -6,6 +6,16 @@ summary under `build/research/results.json`. GitHub Actions runs the same
 `make test` target and retains the complete test transcript, emulator logs,
 results, and the boot image on both success and failure.
 
+Interactive console verification is also part of the complete gate. Production
+Zig input, parser, dispatch, rendering, partial-output and file-client seams
+run directly on the host; the C checked UART boundary runs under ASan/UBSan.
+Compiled C/Zig tests compare the additive 80-byte metadata ABI and manifest
+entitlement. The real serial acceptance performs two finite scenario-27 boots
+plus a normal scenario-26 usability check, preserving host bytes, plain output,
+separate trusted traces, QMP acknowledgment, images, source hashes and JSON under
+`build/console-acceptance`. Its independent observer requires filesystem/block
+causality and rejects missing/counterfeit evidence. See [console](console.md).
+
 ## Host checks
 
 Rust tests exercise lifecycle transitions and capability grant, delegation,

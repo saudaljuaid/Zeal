@@ -69,6 +69,12 @@ The same name can then be reopened. Closing an invalid or already closed
 handle returns `STALE`. Files are not deleted, so all occupied file slots stay
 occupied until a filesystem or dependency reset.
 
+The interactive console uses an additive open-existing mode on `file_open`.
+Its exact 32-byte request preserves the original variable-length create-on-open
+requests, but a missing name returns `NOT_FOUND=-9` without changing metadata,
+bytes, handles or counters. See [console contracts](console.md) for the packet
+layout, bounded collection and close behavior.
+
 Each accepted chunk is all-or-none at the block boundary. A sequence of chunks
 is not one atomic transaction: a later failure can leave a committed prefix,
 and clients must use each acknowledged count. Failed bounds, name, handle,
@@ -109,7 +115,7 @@ still-valid handle. Delegation never transfers file-handle ownership.
 
 The storage calls and 32-byte protocol payloads introduced by ABI v3 retain
 their layouts and operation numbers under ABI v4. The full rights mask now has
-sixteen operation bits, including two narrow hosting operations; storage grants
+twenty operation bits, including hosting and immutable-input operations; storage grants
 retain their original rights. Boot information is expanded in ABI v4. The legacy `/hello` operations and
 capability handoff remain supported.
 
@@ -119,8 +125,9 @@ capability handoff remain supported.
 | `file_open`, `file_chunk_read`, `file_write`, `file_close`, `file_result` | 10, 11, 12, 13, 14 |
 
 All integer fields are explicitly little-endian. Open contains a nonzero
-64-bit request identity followed by exactly 2–16 filename bytes; its payload
-length is 10–24. Other storage requests and replies have exact length 32:
+64-bit request identity followed by exactly 2–16 filename bytes; its legacy payload
+length is 10–24. The additive open-existing form is exactly 32 bytes as specified
+in [console contracts](console.md). Other storage requests and replies have exact length 32:
 
 | Payload bytes | Field |
 | --- | --- |
@@ -135,7 +142,8 @@ and zero padding. Close has zero offset, count, and data. Successful open and
 close return zero; open returns the issued handle. Read and write return a
 nonnegative byte count; read returns the bytes, while write returns zero data.
 Failures use the existing negative results: `INVALID=-1`, `DENIED=-2`,
-`STALE=-3`, `TOO_LARGE=-6`, `NO_SPACE=-7`, and `TIMEOUT=-8`. Supervisor enqueue
+`STALE=-3`, `TOO_LARGE=-6`, `NO_SPACE=-7`, `TIMEOUT=-8`, and additive
+`NOT_FOUND=-9` for missing open-existing names. Supervisor enqueue
 backpressure is `AGAIN=-4`, and checked-copy failures remain `BAD_ADDRESS=-5`.
 Malformed lengths, counts, identities, reserved fields, names, or padding are
 discarded without a storage mutation; a waiting caller eventually times out.

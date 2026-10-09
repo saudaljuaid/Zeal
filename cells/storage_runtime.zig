@@ -162,7 +162,7 @@ pub const Server = struct {
         if (request.operation == @intFromEnum(abi.Operation.file_open)) {
             const open = wire.decodeOpen(request) orelse return null;
             id = open.id;
-            const plan = self.fs.prepareOpen(request.sender, open.name);
+            const plan = if (open.existing) self.fs.prepareOpenExisting(request.sender, open.name) else self.fs.prepareOpen(request.sender, open.name);
             result = @intFromEnum(plan.status);
             if (plan.status == .ok) {
                 var cleared = true;

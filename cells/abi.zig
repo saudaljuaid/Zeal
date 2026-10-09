@@ -8,9 +8,11 @@ pub const version = 4;
 pub const operation_rights: u32 = 0xfffff;
 pub const wait_max_ticks: u64 = 1000;
 pub const delegate_right: u32 = 1 << 31;
+pub const console_limit: usize = 64;
+pub const build_id_size: usize = 48;
 
 pub const Role = enum(u32) { block, filesystem, client, probe, supervisor, worker };
-pub const Call = enum(u64) { yield, send, recv, lookup, report, boot, exit, find, delegate, query, revoke, sleep, recv_wait, create, status, stop, reap, rebind, creation_revoke, domain_status };
+pub const Call = enum(u64) { yield, send, recv, lookup, report, boot, exit, find, delegate, query, revoke, sleep, recv_wait, create, status, stop, reap, rebind, creation_revoke, domain_status, console_read, console_write, system_info };
 pub const Error = enum(i64) {
     ok = 0,
     invalid = -1,
@@ -21,6 +23,7 @@ pub const Error = enum(i64) {
     too_large = -6,
     no_space = -7,
     timeout = -8,
+    not_found = -9,
 };
 pub const Operation = enum(u32) {
     read = 1,
@@ -79,6 +82,17 @@ pub const BootInfo = extern struct {
     depth: u32,
     identity: u32,
     reserved: u32,
+};
+
+pub const SystemInfo = extern struct {
+    abi: u32,
+    console_limit: u32,
+    image_budget: u32,
+    stack_budget: u32,
+    writable_budget: u32,
+    console_entitled: u32,
+    ticks: u64,
+    build_id: [build_id_size]u8,
 };
 
 pub const instance_tag: u32 = 0x40;
@@ -170,6 +184,11 @@ pub const CapabilityInfo = extern struct {
 };
 
 comptime {
+    if (@intFromEnum(Call.console_read) != 20 or @intFromEnum(Call.console_write) != 21 or
+        @intFromEnum(Call.system_info) != 22 or @sizeOf(SystemInfo) != 80 or
+        @alignOf(SystemInfo) != 8 or @offsetOf(SystemInfo, "ticks") != 24 or
+        @offsetOf(SystemInfo, "build_id") != 32)
+        @compileError("console additive ABI differs from include/zeal/abi.h");
     if (version != 4 or @intFromEnum(Operation.file_result) != 14 or
         @intFromEnum(Operation.hosting_reply) != 16 or
         @intFromEnum(Operation.snapshot_control) != 17 or

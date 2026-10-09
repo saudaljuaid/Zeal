@@ -17,7 +17,7 @@ def schema_layout():
     required = {"MAGIC", "VERSION", "ABI", "CELL_MAX", "GRANT_MAX", "ARTIFACT_MAX", "PAGE_SIZE",
                 "IMAGE_MAX", "STACK_MIN", "STACK_MAX", "HEAP_MAX", "WRITABLE_MAX",
                 "POOL_PAGES", "ROOT_POOL_PAGES", "PAGES_PER_CELL", "CONFIG_MAX", "RESTART_LIMIT",
-                "RESTART_DELAY", "RIGHTS", "ACTIVE", "IMAGE_COUNT_MAX", "TEMPLATE_MAX", "DOMAIN_MAX",
+                "RESTART_DELAY", "RIGHTS", "ACTIVE", "CONSOLE", "IMAGE_COUNT_MAX", "TEMPLATE_MAX", "DOMAIN_MAX",
                 "DYNAMIC_SLOTS", "DYNAMIC_PAGES", "DEPTH_MAX", "BOOTSTRAP_RPC", "BOOTSTRAP_SNAPSHOT"}
     if not required <= constants.keys():
         raise ValueError(f"unsupported schema constants: {sorted(required - constants.keys())}")
@@ -136,9 +136,19 @@ def compile_manifest(source, output, image_paths, scenario=0, solo=-1):
         images[image_id] = (len(data), 0x40000000)
     image_fields = ("image", "abi", "entry", "image_budget", "stack_budget", "writable_budget", "boot_config", "restart_limit", "restart_delay")
     identities, records, creators = set(), [], {}
-    pages = 0
+    pages = console_roots = 0
+    console_configuration = scenario in (26, 27)
     for index, item in enumerate(cells):
-        fields(item, ("identity", "name") + image_fields, "root cell")
+        expected = ("identity", "name") + image_fields
+        if isinstance(item, dict) and "console" in item:
+            expected += ("console",)
+        fields(item, expected, "root cell")
+        console = item.get("console", False)
+        if type(console) is not bool:
+            raise ValueError("root console entitlement must be a boolean")
+        console_roots += console
+        if console_roots > 1:
+            raise ValueError("only one manifest root may own the console")
         ident = u(item["identity"], 32, "identity")
         image = u(item["image"], 32, "image")
         name = item["name"]
@@ -155,10 +165,13 @@ def compile_manifest(source, output, image_paths, scenario=0, solo=-1):
             config = item["boot_config"]
         values, own_pages = image_configuration(item, images, constants, config)
         image, abi, entry, budget, stack, writable, config, limit, delay = values
+        console_configuration |= config in (26, 27)
         pages += own_pages
         if pages > constants["ROOT_POOL_PAGES"]:
             raise ValueError("root budgets exceed the reserved 80-page allocation")
         flags = constants["ACTIVE"] if solo < 0 or index == solo else 0
+        if console and flags & constants["ACTIVE"]:
+            flags |= constants["CONSOLE"]
         creators[ident] = (image, config, flags)
         records.append(struct.pack(formats["cell"], ident, image, abi, flags, entry, budget,
                                    stack, writable, config, limit, delay, name.encode() + bytes(16 - len(name))))
@@ -187,9 +200,11 @@ def compile_manifest(source, output, image_paths, scenario=0, solo=-1):
         if not 1 <= ident <= constants["TEMPLATE_MAX"] or template_mask & (1 << (ident - 1)):
             raise ValueError("template identities must be unique and within 1..8")
         template_mask |= 1 << (ident - 1)
-        config = scenario if scenario >= 21 else item["boot_config"]
+        config = scenario if 21 <= scenario <= 25 else item["boot_config"]
         values, _ = image_configuration(item, images, constants, config)
         image, abi, entry, budget, stack, writable, config, limit, delay = values
+        if config > 25:
+            raise ValueError("console scenarios are not approved dynamic templates")
         if image <= constants["CELL_MAX"]:
             raise ValueError("templates require purpose-built dynamic sealed images")
         depth = u(item["max_descendant_depth"], 32, "template depth")
@@ -221,7 +236,7 @@ def compile_manifest(source, output, image_paths, scenario=0, solo=-1):
         if owner not in creators or mask == 0 or mask & ~template_mask:
             raise ValueError("domain references an unknown root or unapproved template")
         image, config, flags = creators[owner]
-        if owner != 400 or image != 4 or flags != constants["ACTIVE"] or not 21 <= config <= constants["CONFIG_MAX"] or owner in owners or not 1 <= slots <= constants["DYNAMIC_SLOTS"] or not 1 <= allowance <= constants["DYNAMIC_PAGES"] or not 1 <= depth <= constants["DEPTH_MAX"] or recipe not in (constants["BOOTSTRAP_RPC"], constants["BOOTSTRAP_SNAPSHOT"]):
+        if owner != 400 or image != 4 or not flags & constants["ACTIVE"] or not 21 <= config <= 25 or owner in owners or not 1 <= slots <= constants["DYNAMIC_SLOTS"] or not 1 <= allowance <= constants["DYNAMIC_PAGES"] or not 1 <= depth <= constants["DEPTH_MAX"] or recipe not in (constants["BOOTSTRAP_RPC"], constants["BOOTSTRAP_SNAPSHOT"]):
             raise ValueError("unsupported root creator, scenario, or descendant allowance")
         if recipe == constants["BOOTSTRAP_SNAPSHOT"] and (config != 25 or mask != 48):
             raise ValueError("snapshot domain requires explicit scenario25 template entitlement")
@@ -233,8 +248,10 @@ def compile_manifest(source, output, image_paths, scenario=0, solo=-1):
         if reserved_pages > constants["DYNAMIC_PAGES"] or reserved_slots > constants["DYNAMIC_SLOTS"] or pages + reserved_pages > constants["POOL_PAGES"]:
             raise ValueError("creation reservations exceed the bounded global slot/page allowance")
         domains_out.append(struct.pack(formats["domain"], owner, mask, slots, allowance, depth, recipe, 0, 0))
-    if scenario >= 21 and not domains_out:
+    if 21 <= scenario <= 25 and not domains_out:
         raise ValueError("hosting scenarios require an explicit root400 creation domain")
+    if console_configuration and (console_roots != 1 or domains_out or templates_out or solo != -1):
+        raise ValueError("console scenarios require one explicit root console entitlement and no hosting or solo fixture")
     groups = [("cell", records), ("grant", grants_out), ("template", templates_out), ("domain", domains_out)]
     size = struct.calcsize(formats["header"]) + sum(struct.calcsize(formats[name]) * len(rows) for name, rows in groups)
     if size > constants["ARTIFACT_MAX"]:

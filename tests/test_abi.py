@@ -306,6 +306,29 @@ int main(void) {
 
 
 class LanguageLayoutTests(unittest.TestCase):
+    def test_console_additive_layout_and_call_numbers(self):
+        expected = {"read": 20, "write": 21, "system_info": 22, "limit": 64,
+                    "not_found": -9, "size": 80, "align": 8, "abi": 0,
+                    "console_limit": 4, "image_budget": 8, "stack_budget": 12,
+                    "writable_budget": 16, "console_entitled": 20, "ticks": 24,
+                    "build_id": 32, "build_id_size": 48}
+        zig = shlex.split(os.environ.get("ZIG", "zig"))
+        self.assertEqual(self.run_json(zig + ["run", "cells/console_layout.zig"]), expected)
+        values = {"read": "Z_CONSOLE_READ", "write": "Z_CONSOLE_WRITE", "system_info": "Z_SYSTEM_INFO",
+                  "limit": "Z_CONSOLE_LIMIT", "not_found": "Z_NOT_FOUND", "size": "sizeof(struct z_system_info)",
+                  "align": "_Alignof(struct z_system_info)", "build_id_size": "Z_BUILD_ID_SIZE"}
+        for field in ("abi", "console_limit", "image_budget", "stack_budget", "writable_budget", "console_entitled", "ticks", "build_id"):
+            values[field] = f"offsetof(struct z_system_info, {field})"
+        fmt = "{" + ",".join(f'\\"{key}\\":%lld' for key in expected) + "}\\n"
+        source = '#include <stddef.h>\n#include <stdio.h>\n#include <zeal/abi.h>\nint main(void) { printf("' + fmt + '", ' + ", ".join(f"(long long)({values[key]})" for key in expected) + "); }\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path, binary = pathlib.Path(directory) / "console_abi.c", pathlib.Path(directory) / "console_abi"
+            path.write_text(source)
+            cc = shlex.split(os.environ.get("CC", "cc"))
+            subprocess.run(cc + ["-std=c11", "-Wall", "-Wextra", "-Werror", "-Iinclude", str(path), "-o", str(binary)],
+                           cwd=ROOT, timeout=20, check=True)
+            self.assertEqual(self.run_json([str(binary)]), expected)
+
     def test_rust_wait_abi_constants_match(self):
         source = (ROOT / "policy/lib.rs").read_text()
         for rust_name, key in (("Z_ABI_VERSION", "version"), ("Z_SLEEP", "sleep"),
