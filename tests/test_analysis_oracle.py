@@ -79,6 +79,86 @@ class IndependentAnalysisEvidenceTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 oracle.signed32(value)
 
+    def test_serialized_snapshot_outcomes_disambiguate_same_local_ids_after_overlapping_dequeues(self):
+        def event(index, name="storage-fs", **changed):
+            fields = dict(cell=1, identity=200, generation=1, tick=index, request=3, operation=18, result=8)
+            fields.update(changed)
+            return oracle.host.Event(index, name, fields, index)
+        def request(sender, token, index):
+            packet = oracle.SnapshotPacket(sender, 0x102, 18, 3, token, 0x102, bytes.fromhex("0800080000000000"))
+            return event(index, "snapshot-ipc-deliver"), packet
+        def reply(target, token, amount=8, operation=19, transaction=3, sender=0x102):
+            data = bytes(amount)
+            word = 8 | amount << 16 | int.from_bytes(data[:4], "little") << 32
+            tail = data[4:].ljust(4, b"\0") + b"\0\0\0\2"
+            return oracle.SnapshotPacket(sender, target, operation, transaction, token, word, tail)
+        first, first_request = request(0x506, 0x5A1, 1)
+        second, second_request = request(0x207, 0x6A2, 2)
+        first_outcome, second_outcome = event(3, result=7), event(5)
+        ledger = oracle.SnapshotOutcomes()
+        ledger.observe(first_outcome)
+        assigned = ledger.consume(first, first_request, event(4, "snapshot-ipc-enqueue"), reply(0x506, 0x5A1, 7))
+        self.assertEqual([first_outcome], assigned)
+        ledger.observe(second_outcome)
+        assigned = ledger.consume(second, second_request, event(6, "snapshot-ipc-enqueue"), reply(0x207, 0x6A2))
+        self.assertEqual([second_outcome], assigned)
+        ledger.finish()
+        self.assertEqual({3, 5}, ledger.used)
+        # The old delivery-interval key gives both outcomes to the second read.
+        self.assertEqual(2, len([e for e in (first_outcome, second_outcome) if second.index < e.index < 6]))
+        for mutation in ("missing", "duplicate", "orphan", "reordered", "id", "operation", "result", "generation", "identity", "ordinary_dispatch", "ordinary_reply", "client_scope", "reconsume"):
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                bad = oracle.SnapshotOutcomes()
+                report = event(3)
+                answer = reply(0x506, 0x5A1)
+                publication = event(4, "snapshot-ipc-enqueue")
+                if mutation == "missing":
+                    bad.consume(first, first_request, publication, answer)
+                    continue
+                if mutation == "id": report = event(3, request=4)
+                if mutation == "operation": report = event(3, operation=20)
+                if mutation == "result": report = event(3, result=7)
+                if mutation == "generation": report = event(3, generation=2)
+                if mutation == "identity": report = event(3, identity=201)
+                bad.observe(report)
+                if mutation == "duplicate": bad.observe(event(4))
+                if mutation == "orphan": bad.finish()
+                if mutation == "reordered": publication = event(2, "snapshot-ipc-enqueue")
+                if mutation == "ordinary_dispatch": bad.observe(event(4, operation=11))
+                if mutation == "ordinary_reply": bad.observe(event(4, "storage-ipc", operation=14))
+                if mutation == "client_scope": answer = reply(0x207, 0x5A1)
+                bad.consume(first, first_request, publication, answer)
+                if mutation == "reconsume": bad.consume(first, first_request, publication, answer)
+                bad.finish()
+
+    def test_snapshot_control_release_and_inventory_have_separate_exact_serialized_publication(self):
+        def event(index, name="storage-fs", **extra):
+            fields = dict(cell=1, identity=200, generation=1, tick=index)
+            fields.update(extra)
+            return oracle.host.Event(index, name, fields, index)
+        for operation in (17, 20):
+            with self.subTest(operation=operation):
+                ledger = oracle.SnapshotOutcomes()
+                incoming = oracle.SnapshotPacket(0x104, 0x102, operation, 1, 0x1A1, 0x102 if operation == 20 else 0, b"\5" + bytes(7))
+                if operation == 17:
+                    packet = oracle.SnapshotPacket(0x102, 0x104, 19, 1, 0x1A1, 0x101, bytes([0, 0, 5, 3, 0, 0, 0, 1]))
+                else:
+                    packet = oracle.SnapshotPacket(0x102, 0x104, 19, 1, 0x1A1, 0, bytes([0, 0, 0, 0, 0, 0, 0, 2]))
+                ledger.observe(event(2, request=1, operation=operation, result=0))
+                ledger.consume(event(1, "snapshot-ipc-deliver"), incoming, event(3, "snapshot-ipc-enqueue"), packet)
+                ledger.finish()
+        ledger = oracle.SnapshotOutcomes()
+        incoming = oracle.SnapshotPacket(0x104, 0x102, 17, 72, 1, 0, b"\10" + bytes(7))
+        packet = oracle.SnapshotPacket(0x102, 0x104, 19, 72, 0, 0x101, bytes([0, 0, 8, 0, 0, 0, 0, 1]))
+        with self.assertRaises(AssertionError):
+            ledger.observe(event(2, "snapshot-inventory", value=0, extra=0, identity=201))
+        ledger.observe(event(2, "snapshot-inventory", value=0, extra=0))
+        ledger.consume(event(1, "snapshot-ipc-deliver"), incoming, event(3, "snapshot-ipc-enqueue"), packet, inventory=True)
+        ledger.finish()
+        self.assertEqual({2}, ledger.inventory_used)
+        with self.assertRaises(AssertionError):
+            ledger.consume(event(1, "snapshot-ipc-deliver"), incoming, event(4, "snapshot-ipc-enqueue"), packet, inventory=True)
+
 
 if __name__ == "__main__":
     unittest.main()

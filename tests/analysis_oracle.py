@@ -828,6 +828,81 @@ class ImmutableInput:
     release: host.Event | None = None
 
 
+class SnapshotOutcomes:
+    """Bijection between serialized FS dispatch results and their publications.
+
+    An IPC delivery may enter the filesystem's private FIFO during another
+    dispatch. Client-local transaction IDs therefore cannot identify an outcome
+    by the entire delivery-to-reply interval. The synchronous service emits one
+    result, publishes that result, and only then dispatches another request.
+    """
+    def __init__(self, issuer=0x102):
+        self.issuer = issuer
+        self.pending = []
+        self.inventory = []
+        self.seen, self.used, self.replies = set(), set(), set()
+        self.inventory_seen, self.inventory_used = set(), set()
+
+    def observe(self, event):
+        if event.name in ("storage-fs", "snapshot-inventory") or event.name == "storage-ipc" and event.fields.get("operation") == 14:
+            event.need("identity")
+            require(event.fields["identity"] == 200, "filesystem outcome/publication changed authenticated service identity")
+        if event.name == "storage-fs":
+            event.need("request", "operation", "result")
+            require(endpoint(event) == self.issuer, "filesystem outcome changed authenticated service generation")
+            require(not self.pending and not self.inventory, "filesystem dispatched again before publishing its pending outcome")
+            if event.fields["operation"] in (17, 18, 20):
+                require(event.index not in self.seen, "filesystem snapshot outcome duplicated its observation")
+                self.seen.add(event.index)
+                self.pending.append(event)
+        elif event.name == "snapshot-inventory":
+            require(endpoint(event) == self.issuer and not self.pending and not self.inventory,
+                    "filesystem inventory overlapped an unpublished dispatch outcome")
+            require(event.index not in self.inventory_seen, "filesystem inventory duplicated its observation")
+            self.inventory_seen.add(event.index)
+            self.inventory.append(event)
+        elif event.name == "storage-ipc" and event.fields.get("operation") == 14:
+            require(endpoint(event) == self.issuer and not self.pending and not self.inventory,
+                    "filesystem ordinary reply crossed an unpublished snapshot outcome")
+
+    def consume(self, request, incoming, reply, packet, inventory=False):
+        require(packet.operation == 19 and packet.sender == self.issuer == incoming.target and
+                packet.target == incoming.sender and packet.transaction == incoming.transaction and
+                reply.index not in self.replies, "snapshot publication changed exact service/client/transaction or repeated consumption")
+        if inventory:
+            require(incoming.operation == 17 and incoming.control()[0] == 8 and not self.pending and len(self.inventory) == 1,
+                    "inventory reply lacks its unique separate serialized outcome")
+            result = self.inventory
+            self.inventory = []
+            used = self.inventory_used
+        else:
+            require(not self.inventory and len(self.pending) == 1, "snapshot publication lacks exactly one serialized dispatcher outcome")
+            result = self.pending
+            self.pending = []
+            used = self.used
+        outcome = result[0]
+        require(outcome.index not in used and request.index < outcome.index < reply.index and endpoint(outcome) == packet.sender,
+                "snapshot dispatcher result was reused, reordered, or outside the exact filesystem generation/request/publication")
+        if not inventory:
+            require(outcome.fields["request"] == incoming.transaction and outcome.fields["operation"] == incoming.operation,
+                    "snapshot dispatcher outcome changed client-local transaction or requested operation")
+            if incoming.operation == 17:
+                expected = packet.control_reply()[1]
+            else:
+                _, amount, status, _ = packet.read_reply()
+                expected = amount if status == 0 else status
+            require(signed32(outcome.fields["result"]) == expected,
+                    "serialized snapshot publication contradicts its exact dispatcher result")
+        used.add(outcome.index)
+        self.replies.add(reply.index)
+        return result
+
+    def finish(self):
+        require(not self.pending and not self.inventory and self.seen == self.used and self.inventory_seen == self.inventory_used and
+                len(self.replies) == len(self.used) + len(self.inventory_used),
+                "snapshot dispatcher outcomes/publications lack a complete one-to-one assignment")
+
+
 class Inputs:
     def __init__(self, events, kernel, source):
         self.events, self.kernel, self.source = events, kernel, source
@@ -838,13 +913,11 @@ class Inputs:
         self.obligations = {}
         self.maximum_transaction = defaultdict(int)
         self.state_history = {}
-        self.outcomes_by_key = defaultdict(list)
+        self.dispatch = SnapshotOutcomes()
         self.owners = defaultdict(list)
         self.publications = defaultdict(list)
         for e in events:
-            if e.name == "storage-fs":
-                self.outcomes_by_key[(e.fields["request"], e.fields["operation"])].append(e)
-            elif e.name == "snapshot-capture-owner":
+            if e.name == "snapshot-capture-owner":
                 self.owners[(e.fields["value"], e.fields["extra"])].append(e)
             elif e.name == "snapshot-published":
                 self.publications[(e.fields["value"], e.fields["extra"])].append(e)
@@ -857,6 +930,7 @@ class Inputs:
         enqueues = {e.index: SnapshotPacket.from_event(e) for e in self.kernel.snapshot_enqueued}
         deliveries = {e.index: SnapshotPacket.from_event(e) for e in self.kernel.snapshot_delivered}
         for event in self.events:
+            self.dispatch.observe(event)
             packet = deliveries.get(event.index)
             if packet and packet.operation in (17, 18, 20):
                 key = packet.sender, packet.transaction
@@ -966,11 +1040,11 @@ class Inputs:
                     if state == 0:
                         require(packet.token == packet.word == length == 0, "failed control invented or leaked unrelated input metadata")
                 if action == 8:
-                    inventories = [e for e in self.events if e.name == "snapshot-inventory" and request.index < e.index < event.index]
+                    inventories = self.dispatch.consume(request, incoming, event, packet, inventory=True)
                     require(len(inventories) == 1 and inventories[0].fields.get("value") == packet.token and inventories[0].fields.get("extra") == length,
                             "snapshot inventory reply contradicts actual service-owned inventory report")
                 else:
-                    outcomes = [e for e in self.outcomes_by_key[(incoming.transaction, 17)] if request.index < e.index < event.index]
+                    outcomes = self.dispatch.consume(request, incoming, event, packet)
                     require(len(outcomes) == 1 and signed32(outcomes[0].fields["result"]) == status, "snapshot control raw reply contradicts actual dispatcher result")
                 self.controls.append((request, event, incoming, packet, status))
             else:
@@ -980,7 +1054,7 @@ class Inputs:
                 require(packet.token == incoming.token and actual_offset == offset and amount <= count,
                         "snapshot read reply changed exact requested object/offset/count")
                 record = self.records.get(reference)
-                outcomes = [e for e in self.outcomes_by_key[(incoming.transaction, incoming.operation)] if request.index < e.index < event.index]
+                outcomes = self.dispatch.consume(request, incoming, event, packet)
                 require(len(outcomes) == 1 and signed32(outcomes[0].fields["result"]) == (amount if status == 0 else status), "snapshot read/release reply contradicts actual dispatcher result")
                 if status == 0:
                     require(record and record.retained and issuer == packet.sender and ((incoming.operation == 20 and record.state == 5) or
@@ -1036,6 +1110,7 @@ class Inputs:
                 self.creation_recoveries.append(e)
         require(len(self.creation_recoveries) == 1, "analysis omitted actual lost creation reply recovery by original owner transaction")
         require(len(self.retired_replays) == 1, "analysis omitted actual owner-scoped retired creation replay rejection")
+        self.dispatch.finish()
         return self
 
 
@@ -1655,7 +1730,8 @@ def verify(output, code, scenario=25, manifest_path=None):
                 serial_sha256=hashlib.sha256(output.encode()).hexdigest(), broker_image_sha256=images[3]["image_sha256"],
                 worker_image_sha256=images[4]["image_sha256"], runtime_creations=len(kernel.published),
                 immutable_inputs=len(inputs.records), maximum_input_records=inputs.maximum, maximum_snapshot_backing=inputs.maximum * 128,
-                captured_bytes=sum(len(r.data) for r in inputs.records.values()), snapshot_reads=len(inputs.reads),
+                captured_bytes=sum(len(r.data) for r in inputs.records.values()), snapshot_reads=len(inputs.reads), snapshot_dispatch_outcomes=len(inputs.dispatch.used),
+                snapshot_inventory_outcomes=len(inputs.dispatch.inventory_used),
                 contracts=len(contracts.records), maximum_contract_records=contracts.maximum,
                 successful_receipts=sum(r.state == 4 for r in contracts.records.values()), cancelled_contracts=sum(r.state == 5 for r in contracts.records.values()),
                 worker_computations=len(contracts.computations), requester_checks=len(contracts.receipt_checks),
@@ -1785,6 +1861,42 @@ def negative_controls(output, code, scenario=25, manifest_path=None):
             for name, value in values.items():
                 candidate[e.line] = re.sub(rf"\b{name}=0x[0-9a-f]+\b", f"{name}=0x{value:016x}", candidate[e.line])
     rejected("coordinated-staging-release-disguised-as-status", "\n".join(candidate) + "\n")
+
+    # Snapshot outcomes have client-local IDs. Keep all raw packet fields and
+    # authenticated copies intact while corrupting the serialized assignment.
+    for operation in (17, 18, 20):
+        marker = next(e for e in events if e.name == "storage-fs" and e.fields["operation"] == operation)
+        for field, delta in (("request", 1), ("operation", 1), ("result", 1), ("generation", 1), ("identity", 1)):
+            rejected(f"snapshot-dispatch-{operation}-changed-{field}", changed(marker, {field: marker.fields[field] + delta}))
+        candidate = list(lines)
+        del candidate[marker.line]
+        rejected(f"snapshot-dispatch-{operation}-missing", "\n".join(candidate) + "\n")
+        candidate = list(lines)
+        candidate.insert(marker.line + 1, candidate[marker.line])
+        rejected(f"snapshot-dispatch-{operation}-duplicate", "\n".join(candidate) + "\n")
+        publication = next(e for e in events if e.index > marker.index and e.name == "snapshot-ipc-enqueue" and
+                           SnapshotPacket.from_event(e).operation == 19)
+        candidate = list(lines)
+        candidate[marker.line], candidate[publication.line] = candidate[publication.line], candidate[marker.line]
+        rejected(f"snapshot-dispatch-{operation}-after-publication", "\n".join(candidate) + "\n")
+    first_result = next(e for e in events if e.name == "storage-fs" and e.fields["operation"] == 18)
+    different_result = next(e for e in events if e.name == "storage-fs" and e.fields["operation"] == 18 and
+                            e.fields["request"] != first_result.fields["request"] and e.fields["result"] != first_result.fields["result"])
+    candidate = list(lines)
+    candidate[first_result.line], candidate[different_result.line] = candidate[different_result.line], candidate[first_result.line]
+    rejected("snapshot-dispatch-swapped-local-id-results", "\n".join(candidate) + "\n")
+    marker = next(e for e in events if e.name == "storage-fs" and e.fields["operation"] == 18)
+    candidate = list(lines)
+    row = candidate.pop(marker.line)
+    candidate.append(row)
+    rejected("snapshot-dispatch-orphan-after-completion", "\n".join(candidate) + "\n")
+    inventory = next(e for e in events if e.name == "snapshot-inventory")
+    rejected("snapshot-inventory-changed-identity", changed(inventory, {"identity": inventory.fields["identity"] + 1}))
+    for duplicated in (False, True):
+        candidate = list(lines)
+        if duplicated: candidate.insert(inventory.line + 1, candidate[inventory.line])
+        else: del candidate[inventory.line]
+        rejected("snapshot-inventory-" + ("duplicate" if duplicated else "missing"), "\n".join(candidate) + "\n")
 
     first_capture = next(e for e in events if e.name == "snapshot-capture-owner")
     first_publication = next(e for e in events if e.name == "snapshot-published")

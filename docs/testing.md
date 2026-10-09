@@ -286,7 +286,15 @@ controls in `build/research/analysis-negative-controls.json`; any unexpectedly
 accepted counterfeit is retained under
 `build/research/analysis-counterfeit-witnesses` before the checker is repaired.
 The complete gate and evidence archive preserve these paths on success and
-failure. Scenario 25 explicitly budgets 4,096 privileged hosting/progress trace
+failure. Snapshot outcome checking assigns every actual filesystem dispatch
+result to exactly one ensuing authenticated reply in synchronous service
+publication order, retaining exact client generation, transaction, operation,
+result and request/result/reply ordering. Client-local IDs may overlap while
+requests wait in the filesystem's private FIFO. They do not identify a result
+across that entire waiting interval. Inventory uses its separate explicit
+report. Host cases and coherent trace controls reject missing, duplicate,
+orphaned, reordered, changed-result and wrong-generation outcomes while keeping
+all original byte, lifecycle, receipt, cancellation and conservation checks. Scenario 25 explicitly budgets 4,096 privileged hosting/progress trace
 credits, 384 progress reports, and 8,192 ordinary/snapshot IPC trace credits and
 service reports; earlier compositions retain their original trace budgets.
 Exhausted trace credit fails validation.
