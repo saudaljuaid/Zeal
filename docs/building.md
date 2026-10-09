@@ -39,7 +39,7 @@ to a host disk. Use `make clean` to remove generated files.
 `make interactive` selects scenario 26, builds `build/interactive/zeal.img`, and
 opens the plain `zeal>` command console through real COM1 terminal input. It
 runs until host termination; `make test-console` separately checks finite real
-input acceptance twice. See [console contracts](console.md).
+input acceptance twice and three additional writable profiles. See [console contracts](console.md).
 
 Each service and the probe can also boot alone with the same manifest format,
 supervisor, and ABI:

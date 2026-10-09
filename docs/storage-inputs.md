@@ -61,7 +61,7 @@ reads. Empty capture needs no byte transfer.
 The filesystem dispatches one service operation at a time on the single CPU.
 A capture runs synchronously to publication. Its nested block waits place
 unrelated dequeued traffic in the existing finite FIFO; they do not dispatch
-file writes, file closes or snapshot controls between capture chunks. After
+file writes, truncation, file closes or snapshot controls between capture chunks. After
 capture returns, ordinary dispatch drains the deferred traffic in FIFO order.
 This is the capture barrier: file writes ordered before capture are included;
 writes dispatched after capture change only the source. This does not make a
@@ -79,9 +79,10 @@ bytes without claiming that the earlier write rolled back.
 
 The capture also fences the complete block endpoint, source handle, file
 index, exact length and full 64-bit file revision at every append and final
-publication. A nonempty acknowledged file write increments that revision.
-Revision exhaustion rejects another nonempty write before touching block
-bytes. A dependency, handle, length or revision change makes the capture
+publication. A nonempty acknowledged file write or a length-changing truncation increments
+that revision. Revision exhaustion rejects either mutation before touching
+block bytes or publishing a new length. Already published immutable inputs
+retain their captured bytes through source truncation and subsequent regrowth. A dependency, handle, length or revision change makes the capture
 unusable. A failed or interrupted capture zeros its prefix and retains failed
 transaction metadata for authoritative recovery and explicit reap. Publication
 requires exactly the declared length; a successful prefix never publishes.

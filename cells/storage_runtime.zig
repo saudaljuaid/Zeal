@@ -105,6 +105,7 @@ pub const Server = struct {
 
     pub fn accepts(operation: u32) bool {
         return (operation >= @intFromEnum(abi.Operation.file_open) and operation <= @intFromEnum(abi.Operation.file_close)) or
+            operation == @intFromEnum(abi.Operation.file_list) or operation == @intFromEnum(abi.Operation.file_truncate) or
             operation == @intFromEnum(abi.Operation.snapshot_control) or
             operation == @intFromEnum(abi.Operation.snapshot_read) or operation == @intFromEnum(abi.Operation.snapshot_release);
     }
@@ -139,6 +140,12 @@ pub const Server = struct {
     // remain in the bounded deferred inbox until the entire capture returns.
     pub fn processWith(self: *Server, request: *const abi.Message, io: anytype) ?abi.Message {
         io.refresh(self);
+        if (request.operation == @intFromEnum(abi.Operation.file_list)) {
+            const parsed = wire.decodeRequest(request) orelse return null;
+            const entry = self.fs.entry(parsed.offset);
+            io.report(31, parsed.id, request.operation, wire.listMetadata(entry));
+            return wire.listReply(parsed.id, parsed.offset, entry);
+        }
         if (request.operation == @intFromEnum(abi.Operation.snapshot_control)) return self.controlWith(request, io);
         if (request.operation == @intFromEnum(abi.Operation.snapshot_release)) {
             const parsed = snapshot_wire.decodeRelease(request) orelse return null;
@@ -186,6 +193,8 @@ pub const Server = struct {
             offset = parsed.offset;
             if (request.operation == @intFromEnum(abi.Operation.file_close)) {
                 result = @intFromEnum(self.fs.close(request.sender, token));
+            } else if (request.operation == @intFromEnum(abi.Operation.file_truncate)) {
+                result = @intFromEnum(self.fs.truncate(request.sender, token, offset));
             } else {
                 const write = request.operation == @intFromEnum(abi.Operation.file_write);
                 const plan = if (write) self.fs.prepareWrite(request.sender, token, offset, @intCast(parsed.value)) else self.fs.prepareRead(request.sender, token, offset, @intCast(parsed.value));

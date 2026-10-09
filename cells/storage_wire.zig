@@ -11,6 +11,15 @@ pub const Header = struct {
 };
 
 pub const Open = struct { id: u64, name: []const u8, existing: bool = false };
+pub const ListEntry = struct {
+    id: u64,
+    index: u32,
+    status: i32 = 0,
+    length: u32 = 0,
+    readonly: bool = false,
+    name_length: u8 = 0,
+    name: [storage.name_limit]u8 = [_]u8{0} ** storage.name_limit,
+};
 
 fn put64(payload: *[abi.payload_size]u8, index: usize, value: u64) void {
     for (0..8) |byte| payload[index + byte] = @truncate(value >> @intCast(byte * 8));
@@ -72,6 +81,53 @@ pub fn reply(operation: abi.Operation, id: u64, handle: u64, offset: u32, result
     return request(operation, id, handle, offset, @bitCast(result), data);
 }
 
+pub fn listRequest(id: u64, index: u32) abi.Message {
+    return request(.file_list, id, 0, index, 0, &.{});
+}
+
+pub fn listMetadata(entry: storage.Entry) i32 {
+    if (entry.status != .ok) return @intFromEnum(entry.status);
+    return @intCast(@as(u32, entry.name_length) | (@as(u32, @intFromBool(entry.readonly)) << 8) |
+        (entry.length << 16));
+}
+
+// A list reply uses all 16 name bytes rather than the eight-byte chunk-data
+// field. Full sender, request identity and slot must match the pending query.
+pub fn listReply(id: u64, index: u32, entry: storage.Entry) abi.Message {
+    var message = abi.Message.empty(.file_result);
+    message.length = 32;
+    put64(&message.payload, 0, id);
+    put32(&message.payload, 8, index);
+    put32(&message.payload, 12, @bitCast(listMetadata(entry)));
+    if (entry.status == .ok) @memcpy(message.payload[16..32], &entry.name);
+    return message;
+}
+
+pub fn decodeListReply(message: *const abi.Message, sender: u64, id: u64, index: u32) ?ListEntry {
+    if (sender == 0 or id == 0 or message.sender != sender or
+        message.operation != @intFromEnum(abi.Operation.file_result) or message.length != 32 or
+        get64(&message.payload, 0) != id or get32(&message.payload, 8) != index) return null;
+    const metadata: i32 = @bitCast(get32(&message.payload, 12));
+    var result: ListEntry = .{ .id = id, .index = index };
+    if (metadata < 0) {
+        if (metadata < -9 or !zero(message.payload[16..32])) return null;
+        result.status = metadata;
+        return result;
+    }
+    const bits: u32 = @intCast(metadata);
+    if (index >= storage.file_limit or bits & ~@as(u32, 0x00ff01ff) != 0) return null;
+    const length = (bits >> 16) & 0xff;
+    const name_length: usize = bits & 0xff;
+    if (length > storage.file_size or name_length < 2 or name_length > storage.name_limit or
+        !storage.validName(message.payload[16..][0..name_length]) or
+        !zero(message.payload[16 + name_length .. 32])) return null;
+    result.length = length;
+    result.readonly = bits & 0x100 != 0;
+    result.name_length = @intCast(name_length);
+    @memcpy(&result.name, message.payload[16..32]);
+    return result;
+}
+
 pub fn decodeOpen(message: *const abi.Message) ?Open {
     if (message.sender == 0 or message.operation != @intFromEnum(abi.Operation.file_open)) return null;
     const existing = message.length == 32;
@@ -118,6 +174,12 @@ pub fn decodeRequest(message: *const abi.Message) ?Header {
         },
         @intFromEnum(abi.Operation.file_close) => {
             if (result.handle == 0 or result.offset != 0 or result.value != 0 or !zero(&result.data)) return null;
+        },
+        @intFromEnum(abi.Operation.file_truncate) => {
+            if (result.handle == 0 or result.value != 0 or !zero(&result.data)) return null;
+        },
+        @intFromEnum(abi.Operation.file_list) => {
+            if (result.handle != 0 or result.value != 0 or !zero(&result.data)) return null;
         },
         else => return null,
     }
@@ -253,4 +315,87 @@ test "late or counterfeit replies cannot complete a fresh request after timeout 
     try testing.expectEqual(@as(u64, 0xffffffffffffffff), sequence.take().?);
     try testing.expect(sequence.take() == null);
     try testing.expect(sequence.take() == null);
+}
+
+test "list reply carries bounded actual metadata and exact authenticated slot tuple" {
+    var file: storage.Entry = .{ .status = .ok, .length = 128, .readonly = true,
+        .name_length = 16 };
+    @memcpy(&file.name, "/123456789012345");
+    const request_message = delivered(listRequest(71, 3), 0x103);
+    const parsed = decodeRequest(&request_message).?;
+    try testing.expectEqual(@as(u64, 71), parsed.id);
+    try testing.expectEqual(@as(u32, 3), parsed.offset);
+    try testing.expectEqual(@as(u64, 0), parsed.handle);
+    const message = delivered(listReply(71, 3, file), 0x102);
+    const entry = decodeListReply(&message, 0x102, 71, 3).?;
+    try testing.expectEqual(@as(i32, 0), entry.status);
+    try testing.expectEqual(@as(u32, 128), entry.length);
+    try testing.expect(entry.readonly);
+    try testing.expectEqualStrings("/123456789012345", entry.name[0..entry.name_length]);
+    try testing.expect(decodeListReply(&message, 0x202, 71, 3) == null);
+    try testing.expect(decodeListReply(&message, 0x102, 72, 3) == null);
+    try testing.expect(decodeListReply(&message, 0x102, 71, 2) == null);
+    try testing.expect(decodeListReply(&message, 0, 71, 3) == null);
+    const missing = delivered(listReply(72, 1, .{ .status = .not_found }), 0x102);
+    const absent = decodeListReply(&missing, 0x102, 72, 1).?;
+    try testing.expectEqual(@as(i32, -9), absent.status);
+    try testing.expectEqual(@as(u32, 0), absent.length);
+    try testing.expectEqual(@as(u8, 0), absent.name_length);
+}
+
+test "list and truncate reject malformed reserved fields counts padding and counterfeit metadata" {
+    var list = delivered(listRequest(1, 0), 0x103);
+    var truncation = delivered(request(.file_truncate, 2, 123, 0, 0, &.{}), 0x103);
+    try testing.expect(decodeRequest(&list) != null);
+    try testing.expect(decodeRequest(&truncation) != null);
+    for ([_]u32{ 0, 31, 33, 0xffffffff }) |length| {
+        list.length = length;
+        truncation.length = length;
+        try testing.expect(decodeRequest(&list) == null);
+        try testing.expect(decodeRequest(&truncation) == null);
+    }
+    list.length = 32;
+    truncation.length = 32;
+    for ([_]u32{ 1, 8, 9, 0xffffffff }) |count| {
+        put32(&list.payload, 20, count);
+        put32(&truncation.payload, 20, count);
+        try testing.expect(decodeRequest(&list) == null);
+        try testing.expect(decodeRequest(&truncation) == null);
+    }
+    put32(&list.payload, 20, 0);
+    put32(&truncation.payload, 20, 0);
+    for (24..32) |at| {
+        list.payload[at] = 1;
+        truncation.payload[at] = 1;
+        try testing.expect(decodeRequest(&list) == null);
+        try testing.expect(decodeRequest(&truncation) == null);
+        list.payload[at] = 0;
+        truncation.payload[at] = 0;
+    }
+    put64(&list.payload, 8, 123);
+    put64(&truncation.payload, 8, 0);
+    try testing.expect(decodeRequest(&list) == null);
+    try testing.expect(decodeRequest(&truncation) == null);
+    var file: storage.Entry = .{ .status = .ok, .name_length = 6, .length = 14, .readonly = true };
+    @memcpy(file.name[0..6], "/hello");
+    const original = delivered(listReply(1, 0, file), 0x102);
+    for ([_]u32{ 0, 1, 17, 0x200 | 6, 129 << 16 | 6, 1 << 24 | 6, 0xfffffff6 }) |metadata| {
+        var bad = original;
+        put32(&bad.payload, 12, metadata);
+        try testing.expect(decodeListReply(&bad, 0x102, 1, 0) == null);
+    }
+    for ([_]u32{ 0, 31, 33, 0xffffffff }) |length| {
+        var bad = original;
+        bad.length = length;
+        try testing.expect(decodeListReply(&bad, 0x102, 1, 0) == null);
+    }
+    var bad = original;
+    bad.operation = @intFromEnum(abi.Operation.block_reply);
+    try testing.expect(decodeListReply(&bad, 0x102, 1, 0) == null);
+    bad = original;
+    bad.payload[31] = 1;
+    try testing.expect(decodeListReply(&bad, 0x102, 1, 0) == null);
+    bad = original;
+    bad.payload[17] = '/';
+    try testing.expect(decodeListReply(&bad, 0x102, 1, 0) == null);
 }

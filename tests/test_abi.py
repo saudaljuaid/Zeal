@@ -19,8 +19,8 @@ EXPECTED = {'version': 4,
  'sleep': 11,
  'recv_wait': 12,
  'delegate_right': 2147483648,
- 'operation_max': 20,
- 'operation_rights': 1048575,
+ 'operation_max': 22,
+ 'operation_rights': 4194303,
  'instance_tag': 64,
  'control_tag': 80,
  'domain_tag': 96,
@@ -169,7 +169,7 @@ int main(void) {
       (long long)(Z_SLEEP),
       (long long)(Z_RECV_WAIT),
       (long long)(Z_RIGHT_DELEGATE),
-      (long long)(Z_SNAPSHOT_RELEASE),
+      (long long)(Z_FILE_TRUNCATE),
       (long long)(Z_RIGHT_OPERATIONS),
       (long long)(Z_HOST_INSTANCE_TAG),
       (long long)(Z_HOST_CONTROL_TAG),
@@ -306,6 +306,27 @@ int main(void) {
 
 
 class LanguageLayoutTests(unittest.TestCase):
+    def test_file_entry_additive_layout_and_rights(self):
+        expected = {"list": 21, "truncate": 22, "list_right": 1048576,
+                    "truncate_right": 2097152, "size": 32, "align": 8,
+                    "request": 0, "index": 8, "metadata": 12, "name": 16}
+        zig = shlex.split(os.environ.get("ZIG", "zig"))
+        self.assertEqual(self.run_json(zig + ["run", "cells/storage_layout.zig"]), expected)
+        values = {"list": "Z_FILE_LIST", "truncate": "Z_FILE_TRUNCATE",
+                  "list_right": "Z_RIGHT(Z_FILE_LIST)", "truncate_right": "Z_RIGHT(Z_FILE_TRUNCATE)",
+                  "size": "sizeof(struct z_file_entry_reply)", "align": "_Alignof(struct z_file_entry_reply)"}
+        for field in ("request", "index", "metadata", "name"):
+            values[field] = f"offsetof(struct z_file_entry_reply, {field})"
+        fmt = "{" + ",".join(f'\\"{key}\\":%lld' for key in expected) + "}\\n"
+        source = '#include <stddef.h>\n#include <stdio.h>\n#include <zeal/abi.h>\nint main(void) { printf("' + fmt + '", ' + ", ".join(f"(long long)({values[key]})" for key in expected) + "); }\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path, binary = pathlib.Path(directory) / "file_entry_abi.c", pathlib.Path(directory) / "file_entry_abi"
+            path.write_text(source)
+            cc = shlex.split(os.environ.get("CC", "cc"))
+            subprocess.run(cc + ["-std=c11", "-Wall", "-Wextra", "-Werror", "-Iinclude", str(path), "-o", str(binary)],
+                           cwd=ROOT, timeout=20, check=True)
+            self.assertEqual(self.run_json([str(binary)]), expected)
+
     def test_console_additive_layout_and_call_numbers(self):
         expected = {"read": 20, "write": 21, "system_info": 22, "limit": 64,
                     "not_found": -9, "size": 80, "align": 8, "abi": 0,

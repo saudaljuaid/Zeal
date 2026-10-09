@@ -49,7 +49,9 @@ For a plain interactive serial console, run:
 make interactive
 ```
 
-At `zeal>`, type `help`, `version`, `info`, or `cat /hello`. QEMU receives real
+At `zeal>`, type `help`, `version`, `info`, `ls`, `cat /hello`,
+`write /note Hello Zeal`, or `append /note !`. `write /note` empties the file;
+a shorter replacement exposes only its new bytes. QEMU receives real
 terminal input; Ctrl-C stops it. This configuration keeps running until the
 host terminates it. The console parser and file client execute in an isolated
 ring-3 cell, with explicit serial permission and bounded checked device calls.

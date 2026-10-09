@@ -298,3 +298,28 @@ all original byte, lifecycle, receipt, cancellation and conservation checks. Sce
 credits, 384 progress reports, and 8,192 ordinary/snapshot IPC trace credits and
 service reports; earlier compositions retain their original trace budgets.
 Exhausted trace credit fails validation.
+
+
+## Writable interactive files
+
+The original two real-input console boots and all their counterfeits remain.
+Writable commands in both repeated boots and three additional finite
+scenario-27 profiles independently reconstruct block
+backing, file length publication, actual EOF and known-handle closure after
+creation, replacement, append and listing. Profiles split the 128-byte capacity,
+overflow, payload spaces and repeat/close work to retain the
+512-record storage trace ceiling rather than enlarging resources. UART commands
+are host input; the guest contains no acceptance command script. Acknowledged
+QMP shutdown proves finite completion. Normal scenario 26 remains running until
+host termination, with commands still usable after idle.
+
+Production console parser/dispatch and filesystem clients run through controlled
+host seams. Storage dispatcher/core tests cover shrink-only owner/generation/
+revision validation, hidden suffix and regrowth, immutable capture before/after
+truncation, mutation during capture, malformed packets, request/handle/file
+exhaustion, backpressure, lost acknowledgments, partial writes, unknown opens
+and close failures. Compiled C/Rust/Zig checks compare the additive 32-byte
+entry reply, operation 21/22 and rights mask; existing sanitized C IPC/manifest
+checks exercise explicit authority and delivery-time revocation. All earlier
+scenario-25 staging, late-result, sibling progress, delayed native receive and
+serialized full-tuple publication controls remain part of complete `make test`.

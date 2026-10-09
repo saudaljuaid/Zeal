@@ -17,7 +17,7 @@
 #define Z_QUEUE_DEPTH 8u
 #define Z_RIGHT(operation) (UINT32_C(1) << ((operation) - 1u))
 #define Z_RIGHT_DELEGATE UINT32_C(0x80000000)
-#define Z_RIGHT_OPERATIONS UINT32_C(0xfffff)
+#define Z_RIGHT_OPERATIONS UINT32_C(0x3fffff)
 #define Z_RIGHT_ALL (Z_RIGHT_OPERATIONS | Z_RIGHT_DELEGATE)
 #define Z_CAPACITY 32u
 #define Z_BOOT_GRANTS 16u
@@ -44,7 +44,7 @@ enum z_operation {
     Z_BLOCK_READ, Z_BLOCK_WRITE, Z_BLOCK_REPLY, Z_FILE_OPEN,
     Z_FILE_CHUNK_READ, Z_FILE_WRITE, Z_FILE_CLOSE, Z_FILE_RESULT,
     Z_HOST_REQUEST, Z_HOST_REPLY, Z_SNAPSHOT_CONTROL, Z_SNAPSHOT_READ,
-    Z_SNAPSHOT_REPLY, Z_SNAPSHOT_RELEASE
+    Z_SNAPSHOT_REPLY, Z_SNAPSHOT_RELEASE, Z_FILE_LIST, Z_FILE_TRUNCATE
 };
 
 struct z_message {
@@ -52,6 +52,16 @@ struct z_message {
     uint32_t operation;
     uint32_t length;
     uint8_t payload[Z_PAYLOAD_SIZE];
+};
+
+/* Additive file-list payload. Integers are encoded little-endian on the wire.
+ * metadata < 0 is an error; otherwise name length occupies bits 0..7,
+ * read-only status bit 8, and file length bits 16..23. Other bits are zero. */
+struct z_file_entry_reply {
+    uint64_t request;
+    uint32_t index;
+    int32_t metadata;
+    uint8_t name[16];
 };
 
 struct z_boot_info {
@@ -121,6 +131,10 @@ struct z_cap_info {
 };
 
 _Static_assert(sizeof(struct z_message) == 48, "message ABI");
+_Static_assert(sizeof(struct z_file_entry_reply) == 32, "file entry payload ABI");
+_Static_assert(offsetof(struct z_file_entry_reply, index) == 8, "file entry index ABI");
+_Static_assert(offsetof(struct z_file_entry_reply, metadata) == 12, "file entry metadata ABI");
+_Static_assert(offsetof(struct z_file_entry_reply, name) == 16, "file entry name ABI");
 _Static_assert(offsetof(struct z_message, payload) == 16, "message payload ABI");
 _Static_assert(sizeof(struct z_boot_info) == 80, "boot ABI");
 _Static_assert(sizeof(struct z_system_info) == 80, "system information ABI");

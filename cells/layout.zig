@@ -18,7 +18,7 @@ pub fn main() !void {
             @intFromEnum(abi.Call.sleep),
             @intFromEnum(abi.Call.recv_wait),
             abi.delegate_right,
-            @intFromEnum(abi.Operation.snapshot_release),
+            @intFromEnum(abi.Operation.file_truncate),
             abi.operation_rights,
             abi.instance_tag,
             abi.control_tag,

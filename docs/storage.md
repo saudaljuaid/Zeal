@@ -24,7 +24,7 @@ Names begin with `/`; every remaining byte must be ASCII `A–Z`, `a–z`, `0–
 `_`, `-`, or `.`. Names are case sensitive and have no terminator on the wire.
 An inner slash, NUL, space, non-ASCII byte, missing leading slash, or overlong
 name is invalid. This is a flat namespace: there are no directories, deletion,
-truncation, permissions framework, or persistent filesystem format.
+permissions framework, or persistent filesystem format.
 
 A cold block boot clears all 512 bytes and initializes bytes 0–13 to the
 14-byte string `Zeal survives.`. The filesystem starts with that read-only
@@ -75,6 +75,22 @@ requests, but a missing name returns `NOT_FOUND=-9` without changing metadata,
 bytes, handles or counters. See [console contracts](console.md) for the packet
 layout, bounded collection and close behavior.
 
+`file_truncate` is a separate shrink-only metadata operation on a known owned
+handle. The new length is an explicit offset, with zero count and data. A length
+above the current EOF is invalid; `/hello` is denied even for an unchanged
+length. A changed length advances the full content revision at the service's
+serialization point; revision exhaustion fails before publication. It does not
+zero hidden backing. Reads expose only the new length, and contiguous regrowth
+must write every newly visible byte through the block service. A prepared write
+retains the original revision, so it cannot publish after a competing truncation
+or write. No old suffix or another extent becomes visible through regrowth.
+
+`file_list` observes one fixed table slot, indexed 0–3. It returns the actual
+name, byte length and read-only flag, or an empty slot. It consumes no file
+handle or serial. Four separate requests are a bounded enumeration, with each
+reply describing its own serialized observation; they are not a global snapshot
+under concurrent creation, writes or truncation.
+
 Each accepted chunk is all-or-none at the block boundary. A sequence of chunks
 is not one atomic transaction: a later failure can leave a committed prefix,
 and clients must use each acknowledged count. Failed bounds, name, handle,
@@ -96,8 +112,8 @@ filesystem lifetime; dependency rebinding never resets the serial. Filesystem
 generations above `0xffffffff` cannot issue handles. Neither counter wraps
 into an old valid token.
 
-Possessing a file handle grants no IPC authority. Every open, read, write, and
-close requires its own operation right in the existing capability system.
+Possessing a file handle grants no IPC authority. Every open, read, write,
+close, list and truncate requires its own operation right in the existing capability system.
 The supervisor checks holder, target generation, and operation at send and
 again at queue delivery. A delegated legacy `file_read` grant cannot authorize
 `file_write`, raw block operations, or any other unrelated operation. Replies
@@ -115,7 +131,7 @@ still-valid handle. Delegation never transfers file-handle ownership.
 
 The storage calls and 32-byte protocol payloads introduced by ABI v3 retain
 their layouts and operation numbers under ABI v4. The full rights mask now has
-twenty operation bits, including hosting and immutable-input operations; storage grants
+twenty-two operation bits, including hosting and immutable-input operations; storage grants
 retain their original rights. Boot information is expanded in ABI v4. The legacy `/hello` operations and
 capability handoff remain supported.
 
@@ -123,6 +139,7 @@ capability handoff remain supported.
 | --- | --- |
 | `block_read`, `block_write`, `block_reply` | 7, 8, 9 |
 | `file_open`, `file_chunk_read`, `file_write`, `file_close`, `file_result` | 10, 11, 12, 13, 14 |
+| `file_list`, `file_truncate` | 21, 22 |
 
 All integer fields are explicitly little-endian. Open contains a nonzero
 64-bit request identity followed by exactly 2–16 filename bytes; its legacy payload
@@ -147,6 +164,19 @@ Failures use the existing negative results: `INVALID=-1`, `DENIED=-2`,
 backpressure is `AGAIN=-4`, and checked-copy failures remain `BAD_ADDRESS=-5`.
 Malformed lengths, counts, identities, reserved fields, names, or padding are
 discarded without a storage mutation; a waiting caller eventually times out.
+
+List requests use the standard request layout with zero handle/count/data and
+slot index in offset. The custom `FileEntryReply` is exactly 32 bytes, aligned
+to eight: request u64 at 0, slot index u32 at 8, signed metadata i32 at 12,
+zero-padded name[16] at 16. It uses the existing `file_result` operation 14.
+For a used slot, nonnegative metadata has name length in bits 0–7, read-only
+in bit 8, and file length in bits 16–23; every other bit is zero. An empty slot
+returns `NOT_FOUND=-9` and zero name. Other negative errors also have zero name. Decoders reject
+malformed names, padding, reserved bits and lengths above 128. Matching requires
+the full authenticated filesystem generation, request ID and exact index.
+Compiled C, Rust and Zig checks preserve the same size, alignment and offsets.
+Truncate replies retain the standard result layout: matching handle and new
+length offset, zero data, and result zero on success.
 
 The application and filesystem use separate monotonically increasing 64-bit
 request identities. Exhaustion is terminal. Reply matching requires the

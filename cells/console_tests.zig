@@ -98,6 +98,7 @@ test "parser accepts exactly implemented verbs and flat path contract" {
     try testing.expect(core.parse("help") == .help);
     try testing.expect(core.parse("  version  ") == .version);
     try testing.expect(core.parse(" info ") == .info);
+    try testing.expect(core.parse("  ls  ") == .ls);
     const command = core.parse("  cat  /hello  ");
     try testing.expect(command == .cat);
     try testing.expectEqualStrings("/hello", command.cat);
@@ -110,10 +111,10 @@ test "parser accepts exactly implemented verbs and flat path contract" {
 }
 
 test "malformed commands controls excessive arguments and invalid paths never dispatch" {
-    for ([_][]const u8{ "help x", "version x", "info x", "cat /hello x", "cat /hello x y" }) |line| try expectProblem(line, .excessive_arguments);
+    for ([_][]const u8{ "help x", "version x", "info x", "ls /hello", "cat /hello x", "cat /hello x y" }) |line| try expectProblem(line, .excessive_arguments);
     for ([_][]const u8{ "cat", "cat  " }) |line| try expectProblem(line, .missing_path);
     for ([_][]const u8{ "cat hello", "cat /", "cat /a/b", "cat /1234567890123456", "cat '/hello'", "cat /he;lo", "cat /he\\lo" }) |line| try expectProblem(line, .malformed_path);
-    for ([_][]const u8{ "Help", "unknown", "ls /hello", "help;version" }) |line| try expectProblem(line, .unknown_command);
+    for ([_][]const u8{ "Help", "unknown", "help;version" }) |line| try expectProblem(line, .unknown_command);
     for ([_][]const u8{ "help\t", "help\x00", "cat /hello\x1b", "help\xff" }) |line| try expectProblem(line, .invalid_input);
     const too_long = [_]u8{' '} ** (core.line_limit + 1);
     try expectProblem(&too_long, .line_overflow);
@@ -125,8 +126,13 @@ const Seam = struct {
     version_calls: usize = 0,
     info_calls: usize = 0,
     cat_calls: usize = 0,
+    list_calls: usize = 0,
+    replace_calls: usize = 0,
+    append_calls: usize = 0,
     path: [16]u8 = [_]u8{0} ** 16,
     path_length: usize = 0,
+    payload: [core.line_limit]u8 = [_]u8{0} ** core.line_limit,
+    payload_length: usize = 0,
 
     pub fn write(self: *Seam, bytes: []const u8) void {
         std.debug.assert(self.length + bytes.len <= self.output.len);
@@ -146,6 +152,26 @@ const Seam = struct {
         @memcpy(self.path[0..path.len], path);
         self.path_length = path.len;
         self.write("file service seam\n");
+    }
+    pub fn list(self: *Seam) void {
+        self.list_calls += 1;
+        self.write("actual file metadata seam\n");
+    }
+    fn capture(self: *Seam, path: []const u8, payload: []const u8) void {
+        @memcpy(self.path[0..path.len], path);
+        self.path_length = path.len;
+        @memcpy(self.payload[0..payload.len], payload);
+        self.payload_length = payload.len;
+    }
+    pub fn replace(self: *Seam, path: []const u8, payload: []const u8) void {
+        self.replace_calls += 1;
+        self.capture(path, payload);
+        self.write("replacement service seam\n");
+    }
+    pub fn append(self: *Seam, path: []const u8, payload: []const u8) void {
+        self.append_calls += 1;
+        self.capture(path, payload);
+        self.write("append service seam\n");
     }
     fn text(self: *const Seam) []const u8 {
         return self.output[0..self.length];
@@ -223,6 +249,75 @@ test "file rendering covers all bytes without emitting unsafe controls and prese
     var exact: Seam = .{};
     core.renderFile("a\\x1B\x1b\n\x00\xff", &exact);
     try testing.expectEqualStrings("a\\\\x1B\\x1B\n\\x00\\xFF", exact.text());
+}
+
+test "write and append preserve every byte after one payload separator including spaces" {
+    for ([_]struct { line: []const u8, expected: []const u8 }{
+        .{ .line = "write /note", .expected = "" },
+        .{ .line = "write /note ", .expected = "" },
+        .{ .line = "write /note  ", .expected = " " },
+        .{ .line = "  write   /note   Hello  Zeal  ", .expected = "  Hello  Zeal  " },
+        .{ .line = "write /note \\\"$x *\\\\", .expected = "\\\"$x *\\\\" },
+    }) |case| {
+        const parsed = core.parse(case.line);
+        try testing.expect(parsed == .write);
+        try testing.expectEqualStrings("/note", parsed.write.path);
+        try testing.expectEqualStrings(case.expected, parsed.write.text);
+    }
+    for ([_]struct { line: []const u8, expected: []const u8 }{
+        .{ .line = "append /note ", .expected = "" },
+        .{ .line = "append /note   ! ", .expected = "  ! " },
+    }) |case| {
+        const parsed = core.parse(case.line);
+        try testing.expect(parsed == .append);
+        try testing.expectEqualStrings("/note", parsed.append.path);
+        try testing.expectEqualStrings(case.expected, parsed.append.text);
+    }
+    for ([_][]const u8{ "write", "  write  " }) |line| try expectProblem(line, .write_usage);
+    for ([_][]const u8{ "append", "append ", "append /note" }) |line| try expectProblem(line, .append_usage);
+    for ([_][]const u8{ "write missing text", "append /a/b text", "write /1234567890123456 data" }) |line| try expectProblem(line, .malformed_path);
+}
+
+test "actual dispatcher and editor invoke new operations while rejecting overflow prefixes" {
+    var app: core.App = .{};
+    var seam: Seam = .{};
+    app.start(&seam);
+    try testing.expectEqual(@as(usize, 4), feed(&app, &seam, "ls\nwrite /note Hello  Zeal \r\nappend /note !\nwrite /note\n"));
+    try testing.expectEqual(@as(usize, 1), seam.list_calls);
+    try testing.expectEqual(@as(usize, 2), seam.replace_calls);
+    try testing.expectEqual(@as(usize, 1), seam.append_calls);
+    try testing.expectEqual(@as(usize, 0), seam.payload_length);
+    core.execute("write /note   preserved  ", &seam);
+    try testing.expectEqualStrings("  preserved  ", seam.payload[0..seam.payload_length]);
+    _ = feed(&app, &seam, "write /note ");
+    for (12..core.line_limit + 1) |_| _ = feed(&app, &seam, "x");
+    _ = feed(&app, &seam, "\x08\x7f\nappend /note\nls\n");
+    try testing.expectEqual(@as(usize, 3), seam.replace_calls);
+    try testing.expectEqual(@as(usize, 1), seam.append_calls);
+    try testing.expectEqual(@as(usize, 2), seam.list_calls);
+    try testing.expect(std.mem.indexOf(u8, seam.text(), core.problemText(.line_overflow)) != null);
+    try testing.expect(std.mem.endsWith(u8, seam.text(), "actual file metadata seam\nzeal> "));
+}
+
+test "production outcome formatting distinguishes acknowledged prefix unknown open and close failure" {
+    const Mutation = @import("console_storage.zig").MutationResult;
+    var seam: Seam = .{};
+    core.mutationResult("write", "/note", Mutation{ .length = 10 }, &seam);
+    core.mutationResult("append", "/note", Mutation{ .status = -6 }, &seam);
+    core.mutationResult("write", "/note", Mutation{ .status = -8, .length = 8, .changed = true, .unknown = true, .close_status = -3 }, &seam);
+    core.mutationResult("write", "/new", Mutation{ .status = -8, .changed = true, .unknown = true, .open_unknown = true }, &seam);
+    core.renderEntry("/hello", 14, true, &seam);
+    core.renderEntry("/note", 128, false, &seam);
+    try testing.expectEqualStrings(
+        "write: /note: 10 bytes acknowledged\n" ++
+            "append: /note: file or transfer exceeds its limit (0 bytes acknowledged; incomplete)\n" ++
+            "write: /note: filesystem service timeout (8 bytes acknowledged; incomplete; file may have changed; outcome unknown)\n" ++
+            "write: close: stale handle or service generation changed (handle may remain open)\n" ++
+            "write: /new: filesystem service timeout (0 bytes acknowledged; incomplete; file may have changed; outcome unknown)\n" ++
+            "write: open result unknown; handle may remain open\n" ++
+            "/hello 14 bytes read-only\n/note 128 bytes writable\n",
+        seam.text(),
+    );
 }
 
 const OutputSeam = struct {

@@ -648,7 +648,7 @@ mod tests {
             assert_eq!(table.check(&states, client, child, fs, right), DENIED as i32);
             assert_eq!(table.delegate(&states, fs, parent, client, right), DENIED);
         }
-        for rights in [0, DELEGATE, 1 << 20, 1 << 30, u32::MAX] {
+        for rights in [0, DELEGATE, 1 << 22, 1 << 30, u32::MAX] {
             assert!(!valid_rights(rights));
             assert_eq!(table.find(&states, client, fs, rights), INVALID);
         }

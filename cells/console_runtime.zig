@@ -104,20 +104,6 @@ const Io = struct {
         self.write("\n");
         self.write("global statistics: unavailable\n");
     }
-    fn errorText(status: i32) []const u8 {
-        return switch (status) {
-            -1 => "invalid request or path",
-            -2 => "access denied",
-            -3 => "stale handle or service generation changed",
-            -4 => "filesystem service unavailable",
-            -5 => "invalid user address",
-            -6 => "file or transfer exceeds its limit",
-            -7 => "filesystem handles or request identities exhausted",
-            -8 => "filesystem service timeout",
-            -9 => "file not found",
-            else => "filesystem service failed",
-        };
-    }
     pub fn cat(self: *Io, name: []const u8) void {
         var bytes: [storage.file_size]u8 = undefined;
         var transport: FileIo = .{};
@@ -129,14 +115,33 @@ const Io = struct {
             self.write("cat: ");
             self.write(name);
             self.write(": ");
-            self.write(errorText(result.status));
+            self.write(core.errorText(result.status));
             self.write("\n");
         }
-        if (result.close_status != 0) {
-            self.write("cat: close: ");
-            self.write(errorText(result.close_status));
-            self.write(" (handle may remain open)\n");
+        if (result.open_unknown) core.unknownOpen("cat", self);
+        core.closeFailure("cat", result.close_status, self);
+    }
+    pub fn replace(self: *Io, name: []const u8, text: []const u8) void {
+        var transport: FileIo = .{};
+        const result = self.files.replace(name, text, &transport);
+        core.mutationResult("write", name, result, self);
+    }
+    pub fn append(self: *Io, name: []const u8, text: []const u8) void {
+        var transport: FileIo = .{};
+        const result = self.files.append(name, text, &transport);
+        core.mutationResult("append", name, result, self);
+    }
+    pub fn list(self: *Io) void {
+        var transport: FileIo = .{};
+        const result = self.files.list(&transport);
+        if (result.status != 0) {
+            self.write("ls: ");
+            self.write(core.errorText(result.status));
+            self.write("\n");
+            return;
         }
+        for (result.entries[0..result.length]) |entry|
+            core.renderEntry(entry.name[0..entry.name_length], entry.length, entry.readonly, self);
     }
 };
 

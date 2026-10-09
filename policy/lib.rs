@@ -7,8 +7,18 @@ mod hosting;
 
 // ABI v4 adds bounded hosting management and narrow RPC operation rights.
 pub const Z_ABI_VERSION: u32 = 4;
-pub const Z_OPERATION_MAX: u32 = 20;
-pub const Z_RIGHT_OPERATIONS: u32 = 1048575;
+pub const Z_OPERATION_MAX: u32 = 22;
+pub const Z_RIGHT_OPERATIONS: u32 = 4194303;
+pub const Z_FILE_LIST: u32 = 21;
+pub const Z_FILE_TRUNCATE: u32 = 22;
+
+#[repr(C)]
+pub struct FileEntryReply {
+    pub request: u64,
+    pub index: u32,
+    pub metadata: i32,
+    pub name: [u8; 16],
+}
 pub const Z_SLEEP: u64 = 11;
 pub const Z_RECV_WAIT: u64 = 12;
 pub const Z_TIMEOUT: i64 = -8;
@@ -249,6 +259,13 @@ mod tests {
         assert_eq!((Z_ABI_VERSION, Z_SLEEP, Z_RECV_WAIT, Z_TIMEOUT, Z_WAIT_MAX_TICKS),
                    (4, 11, 12, -8, 1000));
         assert_eq!(Z_RIGHT_OPERATIONS, (1 << Z_OPERATION_MAX) - 1);
+        assert_eq!((Z_FILE_LIST, Z_FILE_TRUNCATE), (21, 22));
+        assert_eq!(size_of::<FileEntryReply>(), 32);
+        assert_eq!(align_of::<FileEntryReply>(), 8);
+        assert_eq!(offset_of!(FileEntryReply, request), 0);
+        assert_eq!(offset_of!(FileEntryReply, index), 8);
+        assert_eq!(offset_of!(FileEntryReply, metadata), 12);
+        assert_eq!(offset_of!(FileEntryReply, name), 16);
         assert_eq!(size_of::<State>(), 32);
         assert_eq!(align_of::<State>(), 8);
         assert_eq!(offset_of!(State, generation), 0);

@@ -71,4 +71,4 @@ rights = ["file_result"]
 [[grant]]
 holder = 300
 target = 200
-rights = ["file_open", "file_chunk_read", "file_close"]
+rights = ["file_open", "file_chunk_read", "file_write", "file_close", "file_list", "file_truncate"]

@@ -25,7 +25,9 @@ const Io = struct {
     fail_at: ?usize = null,
     restart_at: ?usize = null,
     mutate_at: ?usize = null,
+    truncate_at: ?usize = null,
     defer_at: ?usize = null,
+    defer_truncate_at: ?usize = null,
     pressure_at: ?usize = null,
     retire_at: ?usize = null,
     lose_write_reply: bool = false,
@@ -57,6 +59,11 @@ const Io = struct {
                 queued.sender = owner;
                 if (!server.inbox.push(queued)) return null;
             }
+            if (self.defer_truncate_at == self.reads) {
+                var queued = storage_wire.request(.file_truncate, 902, self.source, 0, 0, &.{});
+                queued.sender = owner;
+                if (!server.inbox.push(queued)) return null;
+            }
             if (self.fail_at == self.reads) return null;
             if (self.restart_at == self.reads) {
                 self.endpoint = 0x201;
@@ -69,6 +76,7 @@ const Io = struct {
                 _ = self.block.write(plan.address, "!");
                 _ = server.fs.commitWrite(plan);
             }
+            if (self.truncate_at == self.reads) _ = server.fs.truncate(owner, self.source, 8);
         }
         var data = [_]u8{0} ** 8;
         const result = if (operation == .block_read) self.block.read(address, count, &data) else self.block.write(address, bytes);
@@ -174,6 +182,54 @@ test "capture barrier defers real writable source mutation and immutable bytes r
     try testing.expectEqual(storage.Status.ok, fixture.server.fs.close(owner, handle));
     try testing.expectEqual(storage.Status.ok, fixture.capture(handle, 21).status);
     try testing.expectEqual(@as(u64, 2), fixture.server.snapshots.next_serial);
+}
+
+test "capture barrier defers production truncation and retained immutable bytes survive empty replacement and regrowth" {
+    var fixture = Fixture.init();
+    const original = "abcdefghABCDEFGHijklmnop";
+    const handle = try fixture.file("/alpha", original);
+    const other = try fixture.file("/beta", "other unchanged");
+    fixture.io.source = handle;
+    fixture.io.defer_truncate_at = 2;
+    const captured = fixture.capture(handle, 201);
+    try testing.expectEqual(storage.Status.ok, captured.status);
+    try testing.expectEqual(@as(usize, 1), fixture.server.inbox.count);
+    try testing.expectEqual(@as(u32, original.len), fixture.server.fs.files[1].length);
+    const request_message = fixture.server.inbox.pop().?;
+    var truncation = fixture.server.processWith(&request_message, &fixture.io).?;
+    truncation.sender = 0x102;
+    try testing.expectEqual(@as(i32, 0), storage_wire.decodeReply(&truncation, .file_result, 0x102, 902).?.value);
+    try testing.expectEqual(@as(u32, 0), fixture.server.fs.prepareRead(owner, handle, 0, 8).count);
+    const replacement = fixture.process(storage_wire.request(.file_write, 203, handle, 0, 2, "Hi"), owner).?;
+    try testing.expectEqual(@as(i32, 2), storage_wire.decodeReply(&replacement, .file_result, 0x102, 203).?.value);
+    try testing.expectEqual(@as(u32, 2), fixture.server.fs.files[1].length);
+    try testing.expectEqual(@as(u32, 0), fixture.server.fs.prepareRead(owner, handle, 2, 8).count);
+    for (0..3) |index| {
+        const offset: u16 = @intCast(index * 8);
+        const bytes = fixture.read(captured.reference, offset, 8, owner);
+        try testing.expectEqual(storage.Status.ok, bytes.status);
+        try testing.expectEqualSlices(u8, original[offset..][0..8], &bytes.data);
+    }
+    try testing.expectEqual(@as(u8, 0), fixture.read(captured.reference, original.len, 8, owner).count);
+    try testing.expectEqual(@as(u32, 15), fixture.server.fs.prepareRead(owner, other, 0, 8).count + fixture.server.fs.prepareRead(owner, other, 8, 8).count);
+    try testing.expectEqualSlices(u8, "other unchanged", fixture.io.block.bytes[256..271]);
+}
+
+test "source truncate during capture fences revision and length before publishing and clears captured prefix" {
+    var fixture = Fixture.init();
+    const handle = try fixture.file("/alpha", "abcdefghABCDEFGHijklmnop");
+    const before_revision = fixture.server.fs.files[1].revision;
+    fixture.io.truncate_at = 2;
+    const captured = fixture.capture(handle, 211);
+    try testing.expectEqual(storage.Status.stale, captured.status);
+    try testing.expectEqual(snapshot.State.failed, captured.state);
+    try testing.expectEqual(before_revision + 1, fixture.server.fs.files[1].revision);
+    try testing.expectEqual(@as(u32, 8), fixture.server.fs.files[1].length);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 128), &fixture.server.snapshots.records[0].bytes);
+    try testing.expectEqual(@as(usize, 0), fixture.server.snapshots.backing());
+    const status = fixture.control(212, 211, 0, .status, owner);
+    try testing.expectEqual(storage.Status.stale, status.status);
+    try testing.expectEqual(captured.reference.token, status.reference.token);
 }
 
 test "lost prior block write acknowledgement captures actual overwrite but excludes unacknowledged growth" {

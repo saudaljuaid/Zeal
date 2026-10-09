@@ -73,6 +73,16 @@ pub const File = struct {
     revision: u64 = 1,
 };
 
+// One slot's metadata at its serialized service-dispatch point. A sequence of
+// four entry requests is bounded enumeration, not a whole-table snapshot.
+pub const Entry = struct {
+    status: Status = .invalid,
+    length: u32 = 0,
+    readonly: bool = false,
+    name_length: u8 = 0,
+    name: [name_limit]u8 = [_]u8{0} ** name_limit,
+};
+
 pub const Handle = struct {
     used: bool = false,
     owner: u64 = 0,
@@ -104,6 +114,7 @@ pub const Transfer = struct {
     end: u32 = 0,
     block: u64 = 0,
     write: bool = false,
+    revision: u64 = 0,
 };
 
 pub const Fs = struct {
@@ -153,8 +164,8 @@ pub const Fs = struct {
         }
         const file = found_file orelse available_file orelse return .{ .status = .no_space };
         var slot: ?usize = null;
-        for (self.handles, 0..) |entry, index| {
-            if (!entry.used) {
+        for (self.handles, 0..) |handle_entry, index| {
+            if (!handle_entry.used) {
                 slot = index;
                 break;
             }
@@ -220,6 +231,32 @@ pub const Fs = struct {
         return .ok;
     }
 
+    pub fn entry(self: *const Fs, index: u32) Entry {
+        if (index >= file_limit) return .{ .status = .invalid };
+        if (self.block == 0) return .{ .status = .stale };
+        const file = self.files[index];
+        if (!file.used) return .{ .status = .not_found };
+        return .{ .status = .ok, .length = file.length, .readonly = file.readonly,
+            .name_length = file.name_length, .name = file.name };
+    }
+
+    // Explicit shrink-only metadata operation. The hidden suffix stays outside
+    // EOF; contiguous acknowledged writes are the only way to regrow it.
+    // Owner/generation checks and revisions also fence coherent input capture.
+    pub fn truncate(self: *Fs, owner: u64, token: u64, length: u32) Status {
+        const active = self.handle(owner, token) orelse return .stale;
+        if (self.block == 0) return .stale;
+        const file = &self.files[active.file];
+        if (file.readonly) return .denied;
+        if (length > file_size) return .too_large;
+        if (length > file.length) return .invalid;
+        if (length == file.length) return .ok;
+        if (file.revision == 0xffffffffffffffff) return .no_space;
+        file.revision += 1;
+        file.length = length;
+        return .ok;
+    }
+
     pub fn prepareRead(self: *const Fs, owner: u64, token: u64, offset: u32, count: u32) Transfer {
         const active = self.handle(owner, token) orelse return .{ .status = .stale };
         if (self.block == 0) return .{ .status = .stale };
@@ -260,6 +297,7 @@ pub const Fs = struct {
             .end = end,
             .block = self.block,
             .write = true,
+            .revision = self.files[active.file].revision,
         };
     }
 
@@ -268,6 +306,7 @@ pub const Fs = struct {
             transfer.count > chunk_size or transfer.end > file_size) return .stale;
         const active = self.handle(transfer.owner, transfer.token) orelse return .stale;
         if (active.file != transfer.file or self.files[active.file].readonly or
+            self.files[active.file].revision != transfer.revision or
             transfer.address < @as(u32, active.file) * file_size) return .stale;
         const offset = transfer.address - @as(u32, active.file) * file_size;
         const check = self.prepareWrite(transfer.owner, transfer.token, offset, transfer.count);
@@ -562,4 +601,97 @@ test "independent handle model agrees over generated owners slots close and depe
             }
         }
     }
+}
+
+test "serialized bounded entry queries reflect actual lengths names and immutable status without allocating" {
+    var fs = Fs.init(1);
+    _ = fs.rebindBlock(0x101);
+    var block = Block.init();
+    const before = fs;
+    const hello_entry = fs.entry(0);
+    try testing.expectEqual(Status.ok, hello_entry.status);
+    try testing.expectEqualStrings("/hello", hello_entry.name[0..hello_entry.name_length]);
+    try testing.expect(hello_entry.readonly);
+    try testing.expectEqual(@as(u32, hello.len), hello_entry.length);
+    for (1..file_limit) |index| try testing.expectEqual(Status.not_found, fs.entry(@intCast(index)).status);
+    try testing.expectEqual(Status.invalid, fs.entry(file_limit).status);
+    try testing.expectEqualDeep(before, fs);
+    const token = try opened(&fs, &block, 0x103, "/live");
+    const empty = fs.entry(1);
+    try testing.expectEqual(@as(u32, 0), empty.length);
+    try writeAll(&fs, &block, 0x103, token, 0, "actual bytes");
+    const grown = fs.entry(1);
+    try testing.expectEqual(@as(u32, 12), grown.length);
+    try testing.expect(!grown.readonly);
+    try testing.expectEqualStrings("/live", grown.name[0..grown.name_length]);
+    // Separate queries intentionally observe separate serialized states.
+    try testing.expectEqual(@as(u32, 0), empty.length);
+    try testing.expectEqual(Status.ok, fs.truncate(0x103, token, 2));
+    try testing.expectEqual(@as(u32, 2), fs.entry(1).length);
+    _ = fs.rebindBlock(0);
+    try testing.expectEqual(Status.stale, fs.entry(0).status);
+}
+
+test "shrink empty replacement and full extent regrowth expose only acknowledged bytes followed by EOF" {
+    var fs = Fs.init(1);
+    _ = fs.rebindBlock(0x101);
+    var block = Block.init();
+    const note = try opened(&fs, &block, 0x103, "/note");
+    const other = try opened(&fs, &block, 0x104, "/other");
+    try writeAll(&fs, &block, 0x104, other, 0, "other remains");
+    const original = [_]u8{'X'} ** 128;
+    try writeAll(&fs, &block, 0x103, note, 0, &original);
+    const revision = fs.files[1].revision;
+    const before = block.bytes;
+    try testing.expectEqual(Status.ok, fs.truncate(0x103, note, 2));
+    try testing.expectEqual(revision + 1, fs.files[1].revision);
+    try testing.expectEqualSlices(u8, &before, &block.bytes);
+    try testing.expectEqual(@as(u32, 2), fs.prepareRead(0x103, note, 0, 8).count);
+    try testing.expectEqual(@as(u32, 0), fs.prepareRead(0x103, note, 2, 8).count);
+    try testing.expectEqual(Status.invalid, fs.prepareWrite(0x103, note, 3, 0).status);
+    try testing.expectEqual(Status.ok, fs.truncate(0x103, note, 0));
+    try testing.expectEqual(@as(u32, 0), fs.prepareRead(0x103, note, 0, 8).count);
+    try testing.expectEqual(Status.invalid, fs.truncate(0x103, note, 1));
+    const replacement = [_]u8{'R'} ** 128;
+    try writeAll(&fs, &block, 0x103, note, 0, "Hi");
+    try testing.expectEqualSlices(u8, "Hi", block.bytes[128..130]);
+    try testing.expectEqual(@as(u32, 2), fs.prepareRead(0x103, note, 0, 8).count);
+    try testing.expectEqual(@as(u32, 0), fs.prepareRead(0x103, note, 2, 8).count);
+    try writeAll(&fs, &block, 0x103, note, 2, replacement[2..]);
+    try testing.expectEqual(@as(u32, 128), fs.files[1].length);
+    try testing.expectEqualSlices(u8, replacement[2..], block.bytes[130..256]);
+    try testing.expectEqual(@as(u32, 0), fs.prepareRead(0x103, note, 128, 0).count);
+    try testing.expectEqualSlices(u8, "other remains", block.bytes[256..269]);
+    try testing.expectEqualSlices(u8, hello, block.bytes[0..hello.len]);
+}
+
+test "truncate denies immutable cross-owner stale and regrowth requests before mutation and fences old write plans" {
+    var fs = Fs.init(1);
+    _ = fs.rebindBlock(0x101);
+    var block = Block.init();
+    const note = try opened(&fs, &block, 0x103, "/note");
+    const hello_token = try opened(&fs, &block, 0x103, "/hello");
+    try writeAll(&fs, &block, 0x103, note, 0, "abcdefgh");
+    const before = fs;
+    for ([_]u64{ 0, 0x104, 0x203 }) |owner|
+        try testing.expectEqual(Status.stale, fs.truncate(owner, note, 0));
+    try testing.expectEqual(Status.denied, fs.truncate(0x103, hello_token, 0));
+    try testing.expectEqual(Status.denied, fs.truncate(0x103, hello_token, hello.len));
+    try testing.expectEqual(Status.invalid, fs.truncate(0x103, note, 9));
+    try testing.expectEqual(Status.too_large, fs.truncate(0x103, note, 129));
+    try testing.expectEqualDeep(before, fs);
+    const pending = fs.prepareWrite(0x103, note, 0, 1);
+    try testing.expectEqual(Status.ok, fs.truncate(0x103, note, 2));
+    try testing.expectEqual(Status.stale, fs.commitWrite(pending));
+    try testing.expectEqual(@as(u32, 2), fs.files[1].length);
+    fs.files[1].revision = 0xffffffffffffffff;
+    try testing.expectEqual(Status.no_space, fs.truncate(0x103, note, 1));
+    try testing.expectEqual(@as(u32, 2), fs.files[1].length);
+    try testing.expectEqual(Status.ok, fs.truncate(0x103, note, 2));
+    try testing.expectEqual(Status.ok, fs.close(0x103, note));
+    try testing.expectEqual(Status.stale, fs.truncate(0x103, note, 0));
+    const reused = try opened(&fs, &block, 0x103, "/note");
+    try testing.expectEqual(Status.stale, fs.truncate(0x103, note, 0));
+    _ = fs.rebindBlock(0x201);
+    try testing.expectEqual(Status.stale, fs.truncate(0x103, reused, 0));
 }

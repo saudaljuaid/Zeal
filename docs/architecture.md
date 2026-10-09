@@ -118,7 +118,7 @@ queueing a copied message. Cells still validate protocol senders and payloads,
 but those checks do not replace supervisor enforcement.
 
 The capability table holds 32 entries and the manifest may define 16 initial
-grants. Rights cover the sixteen defined message operations; a separate high
+grants. Rights cover the twenty-two defined message operations; a separate high
 bit permits delegation. Delegation requires a live capability held by the caller
 with that bit set. New rights must be a subset of the parent, and the delegated
 target and generation remain the parent's target. A holder cannot amplify
@@ -188,7 +188,10 @@ The flat filesystem has four fixed 128-byte extents, including read-only
 `/hello`, 16-byte maximum names, and eight open handles. Create-or-open, explicit
 offset read/write, and close use ABI v4's bounded 32-byte payloads. Creation
 zeros an entire free extent through the block service before publishing it;
-writes grow length only after the matching block acknowledgment. Gaps are
+writes grow length only after the matching block acknowledgment. Additive
+`file_list` and shrink-only `file_truncate` operations support the interactive
+console through explicit operation rights. Truncation increments the file
+revision and stale prepared writes cannot publish across that revision. Gaps are
 unsupported and multi-chunk operations can leave an acknowledged prefix.
 
 Handles bind the exact owner endpoint and its generation to a filesystem

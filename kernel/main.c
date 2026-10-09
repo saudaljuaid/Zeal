@@ -266,8 +266,9 @@ static const struct z_runtime_callbacks runtime_callbacks = {
 
 static void trace_storage(const struct z_message *message, unsigned cell, uint64_t target, uint64_t cap, int result, bool delivered)
 {
+    bool console_file_operation = message->operation == Z_FILE_LIST || message->operation == Z_FILE_TRUNCATE;
     bool snapshot_operation = Z_SCENARIO == 25 && message->operation >= Z_SNAPSHOT_CONTROL && message->operation <= Z_SNAPSHOT_RELEASE;
-    if ((!snapshot_operation && (message->operation < Z_BLOCK_READ || message->operation > Z_FILE_RESULT)) ||
+    if ((!snapshot_operation && !console_file_operation && (message->operation < Z_BLOCK_READ || message->operation > Z_FILE_RESULT)) ||
         !storage_trace_credit(&storage_events)) return;
     event(snapshot_operation ? (delivered ? "snapshot-ipc-deliver" : result == Z_OK ? "snapshot-ipc-enqueue" : "snapshot-ipc-reject") :
           (delivered ? "storage-ipc-deliver" : result == Z_OK ? "storage-ipc" : "storage-reject"), cell);

@@ -5,7 +5,7 @@ pub const stack_size: usize = 0x4000;
 pub const memory_base: usize = 0x40030000;
 pub const payload_size = 32;
 pub const version = 4;
-pub const operation_rights: u32 = 0xfffff;
+pub const operation_rights: u32 = 0x3fffff;
 pub const wait_max_ticks: u64 = 1000;
 pub const delegate_right: u32 = 1 << 31;
 pub const console_limit: usize = 64;
@@ -46,6 +46,8 @@ pub const Operation = enum(u32) {
     snapshot_read,
     snapshot_reply,
     snapshot_release,
+    file_list,
+    file_truncate,
 };
 
 pub fn right(operation: Operation) u32 {
@@ -66,6 +68,13 @@ pub const Message = extern struct {
             .payload = [_]u8{0} ** payload_size,
         };
     }
+};
+
+pub const FileEntryReply = extern struct {
+    request: u64,
+    index: u32,
+    metadata: i32,
+    name: [16]u8,
 };
 
 pub const BootInfo = extern struct {
@@ -195,7 +204,11 @@ comptime {
         @intFromEnum(Operation.snapshot_read) != 18 or
         @intFromEnum(Operation.snapshot_reply) != 19 or
         @intFromEnum(Operation.snapshot_release) != 20 or
-        operation_rights != (right(.snapshot_release) << 1) - 1)
+        @intFromEnum(Operation.file_list) != 21 or @intFromEnum(Operation.file_truncate) != 22 or
+        operation_rights != (right(.file_truncate) << 1) - 1 or
+        @sizeOf(FileEntryReply) != 32 or @alignOf(FileEntryReply) != 8 or
+        @offsetOf(FileEntryReply, "index") != 8 or @offsetOf(FileEntryReply, "metadata") != 12 or
+        @offsetOf(FileEntryReply, "name") != 16)
         @compileError("storage operation ABI differs from include/zeal/abi.h");
     if (@intFromEnum(Call.sleep) != 11 or @intFromEnum(Call.recv_wait) != 12 or
         @intFromEnum(Error.timeout) != -8 or wait_max_ticks != 1000)
